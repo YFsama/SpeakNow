@@ -1,0 +1,37 @@
+# ---- Node / 前端 ----
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm/
+
+# ---- Rust / Tauri ----
+src-tauri/target/
+# Tauri 构建时自动生成的权限 schema（由 tauri.conf.json 派生）
+src-tauri/gen/schemas/
+
+# ---- 日志与运行时产物 ----
+*.log
+
+# ---- 本地开发临时文件 ----
+*.tmp
+*.bak
+*.corrupt
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 环境与密钥（绝不提交）----
+.env
+.env.*
+*.pem
+*.key
+
+# 本地误克隆/误初始化的空壳仓库（如 SpeakNow/），不纳入版本控制
+/SpeakNow/

@@ -1,0 +1,39 @@
+name: Release
+
+# 推送 v* 标签时触发：构建 NSIS 安装包并创建 GitHub Release（草稿）
+# 用法：git tag v0.4.5 && git push origin main --tags
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm install
+
+      - name: 构建并上传 Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'SpeakNow ${{ github.ref_name }}'
+          releaseBody: '变更内容见 CHANGELOG.md'
+          releaseDraft: true
+          prerelease: false

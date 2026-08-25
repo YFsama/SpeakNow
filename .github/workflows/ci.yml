@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm install
+
+      - name: TypeScript 类型检查
+        run: npx tsc --noEmit
+
+      - name: Rust 编译检查（含示例）
+        run: cargo check --lib --examples
+        working-directory: src-tauri
+
+      - name: Rust 单元测试
+        run: cargo test
+        working-directory: src-tauri

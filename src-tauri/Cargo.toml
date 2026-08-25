@@ -1,0 +1,71 @@
+[package]
+name = "speaknow"
+version = "0.4.5"
+description = "语音输入助手：全局快捷键 → 大模型 ASR 转写 → AI 纠错优化 → 自动输入到任意输入框"
+authors = ["SpeakNow Contributors"]
+license = "MIT"
+repository = "https://github.com/YFsama/SpeakNow"
+readme = "README.md"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "speaknow_lib"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.15"
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "fs", "io-util"] }
+anyhow = "1"
+arboard = "3"
+base64 = "0.22"
+byteorder = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+enigo = "0.6"
+rand = "0.9"
+tokenizers = "0.21"
+zhconv = "0.4.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.61"
+features = [
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_System_Com",
+  "Win32_System_Variant",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_System_Ole",
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Threading",
+  "Win32_Security",
+  "Win32_System_DataExchange",
+]

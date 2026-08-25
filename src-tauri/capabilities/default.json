@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "SpeakNow 主窗口与悬浮窗的默认权限",
+  "windows": ["main", "overlay"],
+  "permissions": ["core:default", "core:window:allow-set-size"]
+}
