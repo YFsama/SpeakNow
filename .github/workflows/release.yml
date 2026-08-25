@@ -1,10 +1,20 @@
 name: Release
 
-# 推送 v* 标签时触发：构建 NSIS 安装包并创建 GitHub Release（草稿）
-# 用法：git tag v0.4.5 && git push origin main --tags
+# 全自动发布：main 分支上出现尚未发布的版本号（src-tauri/tauri.conf.json 的 version）时，
+# 自动构建 NSIS 安装包 → 打 tag → 发布正式 GitHub Release，发布说明取自 CHANGELOG.md 对应小节。
+#
+# 日常发版：把 src-tauri/tauri.conf.json、package.json 的版本号与 CHANGELOG.md 一起提交推送 main 即可。
+# 构建失败重试：Actions → Release → Run workflow（Release 尚未创建时会重新构建）。
+# 重新发布已发版本：先在 GitHub 上删除对应 Release 和 tag，再手动 Run workflow。
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
+
+# 串行执行，避免连续推送时多个构建争抢同一个 Release
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -17,23 +27,60 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+
+      - name: 检查版本是否需要发布
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="v${VERSION}"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "v${VERSION} 已有 Release，本次推送跳过构建。"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "检测到待发布版本 ${TAG}，开始构建。"
+          fi
+
+      - name: 提取 CHANGELOG 更新说明
+        id: changelog
+        if: steps.check.outputs.published == 'false'
+        shell: bash
+        run: |
+          node scripts/extract-changelog.mjs "${{ steps.check.outputs.tag }}" > release-body.md
+          {
+            echo "body<<CHANGELOG_EOF"
+            cat release-body.md
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.published == 'false'
 
       - uses: swatinem/rust-cache@v2
+        if: steps.check.outputs.published == 'false'
         with:
           workspaces: src-tauri
 
       - name: 安装前端依赖
-        run: npm install
+        if: steps.check.outputs.published == 'false'
+        run: npm ci
 
-      - name: 构建并上传 Release
+      - name: 构建并发布 Release
+        if: steps.check.outputs.published == 'false'
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'SpeakNow ${{ github.ref_name }}'
-          releaseBody: '变更内容见 CHANGELOG.md'
-          releaseDraft: true
+          tagName: ${{ steps.check.outputs.tag }}
+          releaseName: SpeakNow ${{ steps.check.outputs.tag }}
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: false
           prerelease: false
