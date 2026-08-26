@@ -1,19 +1,43 @@
-name: CI
+name: CI & Release
 
+# Every push/PR runs checks (typecheck, cargo check, unit tests).
+# Publishing is fully automated: when a push to main carries a version
+# (src-tauri/tauri.conf.json) that has no GitHub Release yet, the publish job
+# builds the NSIS installer, creates the tag, and publishes a Release with
+# notes taken from the matching CHANGELOG.md section.
+#
+# Releasing a version:
+#   1. bump `version` in src-tauri/tauri.conf.json and package.json
+#   2. add the matching `## vX.Y.Z` section to CHANGELOG.md
+#   3. commit and push to main
+# Retrying a failed release: Actions -> CI & Release -> Run workflow.
+# Re-releasing an existing version: delete its Release and tag first, then Run workflow.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; only the publish job gets write access
+permissions:
+  contents: read
+
+# Latest run per ref wins: a newer push restarts checks/builds on the newest code
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -21,16 +45,93 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: 安装前端依赖
-        run: npm install
+      - name: Install frontend dependencies
+        run: npm ci
 
-      - name: TypeScript 类型检查
+      - name: TypeScript typecheck
         run: npx tsc --noEmit
 
-      - name: Rust 编译检查（含示例）
-        run: cargo check --lib --examples
+      - name: Rust compile check (incl. examples)
+        run: cargo check --locked --lib --examples
         working-directory: src-tauri
 
-      - name: Rust 单元测试
-        run: cargo test
+      - name: Rust unit tests
+        run: cargo test --locked
         working-directory: src-tauri
+
+  publish:
+    needs: check
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether this version needs publishing
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="v${VERSION}"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists, skipping."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "New version ${TAG} detected, building."
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        if: steps.version.outputs.published == 'false'
+        shell: bash
+        run: |
+          node scripts/extract-changelog.mjs "${{ steps.version.outputs.tag }}" > release-body.md
+          # The closing heredoc delimiter must sit on its own line: $(cat) strips
+          # trailing newlines and printf adds exactly one back, so this stays
+          # correct regardless of the script output.
+          {
+            printf '## Changes\n\n'
+            cat release-body.md
+            printf '\n---\nFull changelog: https://github.com/%s/blob/main/CHANGELOG.md\n' "$GITHUB_REPOSITORY"
+          } > release-notes.md
+          printf 'body<<CHANGELOG_EOF\n%s\nCHANGELOG_EOF\n' "$(cat release-notes.md)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.published == 'false'
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.published == 'false'
+
+      - uses: swatinem/rust-cache@v2
+        if: steps.version.outputs.published == 'false'
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        if: steps.version.outputs.published == 'false'
+        run: npm ci
+
+      - name: Build and publish GitHub Release
+        if: steps.version.outputs.published == 'false'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tagName: ${{ steps.version.outputs.tag }}
+          releaseName: SpeakNow ${{ steps.version.outputs.tag }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: false
+          prerelease: false
