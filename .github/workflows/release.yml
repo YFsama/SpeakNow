@@ -55,11 +55,9 @@ jobs:
         shell: bash
         run: |
           node scripts/extract-changelog.mjs "${{ steps.check.outputs.tag }}" > release-body.md
-          {
-            echo "body<<CHANGELOG_EOF"
-            cat release-body.md
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
+          # heredoc 分隔符必须独占一行：$(cat) 会吞掉结尾换行，再由 printf 补一个，
+          # 无论脚本输出是否带换行都不会把分隔符粘到正文上
+          printf 'body<<CHANGELOG_EOF\n%s\nCHANGELOG_EOF\n' "$(cat release-body.md)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.check.outputs.published == 'false'

@@ -23,4 +23,6 @@ const rest = lines.slice(start + 1);
 const end = rest.findIndex((line) => line.startsWith('## v'));
 const body = (end === -1 ? rest : rest.slice(0, end)).join('\n').trim();
 
-process.stdout.write(body || '变更内容见 CHANGELOG.md');
+// console.log 保证末尾带换行：$GITHUB_OUTPUT 的 heredoc 分隔符必须独占一行，
+// 输出缺换行会把结束分隔符粘到正文最后一行，导致 runner 报「Matching delimiter not found」
+console.log(body || '变更内容见 CHANGELOG.md');
