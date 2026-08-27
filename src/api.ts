@@ -127,8 +127,9 @@ export const exportText = (filename: string, content: string) =>
   invoke<string>('export_text', { filename, content });
 export const confirmEdit = (text: string) => invoke('confirm_edit', { text });
 export const cancelReview = () => invoke('cancel_review');
-export const optimizeText = (text: string) =>
-  invoke<string>('optimize_text', { text });
+/** 审阅窗口重新优化；mode 可覆盖本次模式（correct / polish / prompt），结果流式逐字回填 */
+export const optimizeText = (text: string, mode?: string) =>
+  invoke<string>('optimize_text', { text, mode: mode ?? null });
 
 /** 外接显示（硬件字幕屏）服务状态 */
 export interface DisplayStatus {

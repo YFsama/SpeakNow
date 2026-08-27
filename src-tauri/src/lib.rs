@@ -889,9 +889,14 @@ fn cancel_review(app: AppHandle) {
     pipeline::emit_status(&app, "idle", "", false);
 }
 
-/// 预览编辑：对编辑框内容重新调用 AI 优化
+/// 预览编辑：对编辑框内容重新调用 AI 优化（流式，结果逐字回到编辑框）。
+/// mode 可选覆盖本次优化模式（correct / polish / prompt），缺省用已保存配置。
 #[tauri::command]
-async fn optimize_text(app: AppHandle, text: String) -> Result<String, String> {
+async fn optimize_text(
+    app: AppHandle,
+    text: String,
+    mode: Option<String>,
+) -> Result<String, String> {
     let cfg = app
         .state::<Ctx>()
         .config
@@ -900,9 +905,15 @@ async fn optimize_text(app: AppHandle, text: String) -> Result<String, String> {
         .clone()
         .unwrap_or_default();
     if !cfg.llm.enabled || cfg.llm.base_url.trim().is_empty() {
-        return Err("AI 优化未启用".into());
+        return Err("AI 优化未启用，请先在「AI 优化」页开启并保存".into());
     }
-    llm::optimize(&cfg.llm, &text)
+    let mut llm_cfg = cfg.llm.clone();
+    if let Some(m) = mode.as_deref() {
+        if matches!(m, "correct" | "polish" | "prompt") {
+            llm_cfg.mode = m.to_string();
+        }
+    }
+    llm::optimize_streaming(&llm_cfg, &text, &app, None, None)
         .await
         .map_err(|e| format!("{e:#}"))
 }

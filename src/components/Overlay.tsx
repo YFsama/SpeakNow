@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
-import type { MetaPayload, Stage } from '../types';
+import type { Config, MetaPayload, Stage } from '../types';
 import {
   cancelReview,
   confirmEdit,
@@ -18,6 +18,12 @@ const BAR_COUNT = 26;
 const COUNTDOWN_MS = 3200;
 const WIN_NORMAL = { w: 520, h: 320 };
 const WIN_REVIEW = { w: 560, h: 420 };
+
+const MODE_LABELS: Record<string, string> = {
+  correct: '仅纠错',
+  polish: '纠错 + 润色',
+  prompt: '编程指令',
+};
 
 /* ---- WebAudio 合成提示音（无资源文件依赖） ---- */
 let audioCtx: AudioContext | null = null;
@@ -164,6 +170,12 @@ export default function Overlay() {
   const [editText, setEditText] = useState('');
   const [optimizing, setOptimizing] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  /* 审阅窗口：原文（恢复用）、重优化模式覆盖、操作反馈、AI 配置 */
+  const [reviewRaw, setReviewRaw] = useState('');
+  const [reoptMode, setReoptMode] = useState('');
+  const [notice, setNotice] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [llmEnabled, setLlmEnabled] = useState(false);
+  const [llmMode, setLlmMode] = useState('correct');
   /* AI 流式输出：正文逐字累计 + 思考型模型的推理片段 */
   const [llmText, setLlmText] = useState('');
   const [llmThinking, setLlmThinking] = useState('');
@@ -171,16 +183,18 @@ export default function Overlay() {
   const stageRef = useRef<Stage>('idle');
   stageRef.current = stage;
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  /* 重新优化期间把流式增量直接写回审阅编辑框 */
+  const reoptStreamRef = useRef(false);
 
   /* 悬浮窗固定深色玻璃风（不随浅色主题变白）；仅缩放跟随配置 */
   useEffect(() => {
-    const apply = () => {
-      getConfig().then((c) => {
-        document.body.style.zoom = String(c.general.fontScale || 1);
-      });
+    const apply = (c: Config) => {
+      document.body.style.zoom = String(c.general.fontScale || 1);
+      setLlmEnabled(c.llm.enabled && !!c.llm.baseUrl.trim());
+      setLlmMode(c.llm.mode);
     };
-    apply();
-    const un = listen('sn-config-changed', apply);
+    getConfig().then(apply);
+    const un = listen('sn-config-changed', () => getConfig().then(apply));
     return () => {
       un.then((f) => f());
     };
@@ -191,6 +205,8 @@ export default function Overlay() {
     const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
       if (e.payload.kind === 'content' && e.payload.text !== undefined) {
         setLlmText(e.payload.text);
+        // 审阅窗口「重新优化」：流式结果逐字回填编辑框
+        if (reoptStreamRef.current) setEditText(e.payload.text);
       } else if (e.payload.kind === 'reasoning' && e.payload.delta) {
         setLlmThinking((t) => (t + e.payload.delta).slice(-160));
       }
@@ -284,7 +300,9 @@ export default function Overlay() {
       'sn-review',
       (e) => {
         setEditText(e.payload.text);
+        setReviewRaw(e.payload.raw);
         setUsedLlm(e.payload.llmUsed);
+        setNotice(null);
       },
     );
     const un7 = listen<number>('sn-level', (e) => {
@@ -329,7 +347,7 @@ export default function Overlay() {
   };
 
   const onConfirm = async () => {
-    if (!editText.trim() || confirming) return;
+    if (!editText.trim() || confirming || optimizing) return;
     setConfirming(true);
     try {
       await confirmEdit(editText);
@@ -341,15 +359,26 @@ export default function Overlay() {
   const onReoptimize = async () => {
     if (optimizing || !editText.trim()) return;
     setOptimizing(true);
+    setNotice(null);
+    reoptStreamRef.current = true;
     try {
-      const t = await optimizeText(editText);
+      const t = await optimizeText(editText, reoptMode || undefined);
       setEditText(t);
-    } catch {
-      /* 失败静默，保留原文 */
+      setNotice({ ok: true, msg: '已重新优化' });
+    } catch (e) {
+      setNotice({ ok: false, msg: `重新优化失败：${String(e)}` });
     } finally {
+      reoptStreamRef.current = false;
       setOptimizing(false);
     }
   };
+
+  /* 审阅窗口操作反馈自动消退 */
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 3500);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   if (stage === 'idle') return <div className="h-screen w-screen" />;
 
@@ -628,6 +657,7 @@ export default function Overlay() {
                 value={editText}
                 rows={7}
                 spellCheck={false}
+                readOnly={optimizing}
                 onChange={(e) => setEditText(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
@@ -638,16 +668,49 @@ export default function Overlay() {
                     void cancelReview();
                   }
                 }}
-                className="w-full resize-none rounded-lg border border-white/10 bg-black/30 px-3 py-2.5 text-[13.5px] leading-7 text-slate-100 outline-none transition hover:border-white/[0.18] focus:border-sky-500/60 focus:ring-2 focus:ring-sky-500/15"
+                className={`w-full resize-none rounded-lg border bg-black/30 px-3 py-2.5 text-[13.5px] leading-7 text-slate-100 outline-none transition focus:ring-2 focus:ring-sky-500/15 ${
+                  optimizing
+                    ? 'border-indigo-400/40 focus:border-indigo-400/60'
+                    : 'border-white/10 hover:border-white/[0.18] focus:border-sky-500/60'
+                }`}
               />
-              <div className="mt-2.5 flex items-center gap-2">
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                {llmEnabled && (
+                  <select
+                    value={reoptMode}
+                    onChange={(e) => setReoptMode(e.target.value)}
+                    disabled={optimizing}
+                    title="重新优化时使用的模式"
+                    className="cursor-pointer rounded-full border border-white/10 bg-black/25 px-2.5 py-[7px] text-[11.5px] text-slate-300 outline-none transition hover:border-white/25 disabled:opacity-50"
+                  >
+                    <option value="" style={{ background: '#1b1e33' }}>
+                      跟随设置（{MODE_LABELS[llmMode] ?? '仅纠错'}）
+                    </option>
+                    {Object.entries(MODE_LABELS).map(([v, label]) => (
+                      <option key={v} value={v} style={{ background: '#1b1e33' }}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {llmEnabled && (
+                  <button
+                    type="button"
+                    disabled={optimizing || !editText.trim()}
+                    onClick={onReoptimize}
+                    className="rounded-full border border-white/10 bg-black/25 px-3.5 py-1.5 text-[12px] text-slate-300 transition hover:border-white/25 disabled:opacity-50"
+                  >
+                    {optimizing ? '✨ AI 生成中…' : '✨ 重新优化'}
+                  </button>
+                )}
                 <button
                   type="button"
-                  disabled={optimizing || !editText.trim()}
-                  onClick={onReoptimize}
-                  className="rounded-full border border-white/10 bg-black/25 px-3.5 py-1.5 text-[12px] text-slate-300 transition hover:border-white/25 disabled:opacity-50"
+                  disabled={optimizing || !reviewRaw || editText === reviewRaw}
+                  onClick={() => setEditText(reviewRaw)}
+                  title="放弃 AI 与手动修改，回到原始转写"
+                  className="rounded-full border border-white/10 bg-black/25 px-3.5 py-1.5 text-[12px] text-slate-400 transition hover:border-white/25 disabled:opacity-40"
                 >
-                  {optimizing ? '优化中…' : '✨ 重新优化'}
+                  恢复原文
                 </button>
                 <button
                   type="button"
@@ -658,13 +721,22 @@ export default function Overlay() {
                 </button>
                 <button
                   type="button"
-                  disabled={!editText.trim() || confirming}
+                  disabled={!editText.trim() || confirming || optimizing}
                   onClick={onConfirm}
                   className="ml-auto rounded-lg bg-gradient-to-r from-sky-500 to-indigo-500 px-4 py-1.5 text-[12px] font-medium text-white shadow-lg shadow-sky-500/25 transition hover:brightness-110 active:scale-[0.97] disabled:opacity-50"
                 >
                   {confirming ? '输入中…' : '↵ 输入'}
                 </button>
               </div>
+              {notice && (
+                <div
+                  className={`mt-1.5 line-clamp-2 text-[11px] leading-4 ${
+                    notice.ok ? 'text-emerald-300' : 'text-red-300'
+                  }`}
+                >
+                  {notice.msg}
+                </div>
+              )}
             </div>
           )}
 

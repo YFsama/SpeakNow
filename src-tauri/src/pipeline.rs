@@ -437,10 +437,20 @@ pub async fn process_audio(
         emit_status(&app, "optimizing", "AI 纠错与优化中…", false);
         let t_llm = Instant::now();
         let first_token = AtomicU64::new(0);
-        match llm::optimize_streaming(&cfg.llm, &raw, &app, Some(&first_token)).await {
+        // 优化期间开始新录音则立即中止流式读取：省流量，也不再扰动新一轮悬浮窗
+        let stale_app = app.clone();
+        let stale = move || stale_app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen;
+        match llm::optimize_streaming(&cfg.llm, &raw, &app, Some(&first_token), Some(&stale)).await
+        {
             Ok(t) if !t.trim().is_empty() => final_text = t,
             Ok(_) => {}
             Err(e) => {
+                // 被新录音取代：直接放弃本代结果，不再回退输入旧文本
+                if app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen {
+                    crate::trace_pipeline(&app, &format!("AI 优化中止（{e:#}），本代已过期"));
+                    finish_status(&app, "done", "已跳过（已被新的录音取代）", 2000, false);
+                    return;
+                }
                 eprintln!("[speaknow] AI 优化失败: {e:#}");
                 emit_status(&app, "optimizing", "AI 优化失败，使用原始识别结果…", false);
                 thread::sleep(Duration::from_millis(600));
@@ -467,6 +477,13 @@ pub async fn process_audio(
             &app,
             &format!("耗时对比｜识别 {asr_ms}ms｜优化 {llm_ms}ms（首字 {llm_first_ms}ms）｜合计 {}ms", asr_ms + llm_ms),
         );
+    }
+
+    // AI 优化耗时较久，期间可能已开始新录音：本代结果作废，不再进入输入/预览
+    if llm_active && gen != app.state::<Ctx>().run_gen.load(Ordering::SeqCst) {
+        crate::trace_pipeline(&app, "AI 优化完成但已过期，跳过输入");
+        finish_status(&app, "done", "已跳过（已被新的录音取代）", 2000, false);
+        return;
     }
 
     if from_ui {
