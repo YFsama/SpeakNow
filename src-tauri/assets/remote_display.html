@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SpeakNow · 外接字幕屏</title>
+<style>
+  :root { --fs: 16px; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { font-size: var(--fs); }
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -10%, #141a2e 0%, #0b0c12 55%, #07080d 100%);
+    color: #e2e8f0;
+    padding: 2rem;
+    user-select: none;
+  }
+  .card {
+    width: 100%;
+    max-width: 56rem;
+    border-radius: 1.5rem;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.03);
+    backdrop-filter: blur(18px);
+    box-shadow: 0 24px 80px rgba(0,0,0,0.55);
+    padding: 1.6rem 2rem 1.8rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: "";
+    position: absolute; inset: 0 0 auto 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--glow, rgba(56,189,248,0.5)), transparent);
+    opacity: 0.9;
+    transition: background 0.4s;
+  }
+  .top { display: flex; align-items: center; gap: 0.7rem; }
+  .logo {
+    width: 2.2rem; height: 2.2rem; border-radius: 0.7rem; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, #0ea5e9, #6366f1);
+    box-shadow: 0 6px 18px rgba(56,189,248,0.35);
+  }
+  .logo svg { width: 1.25rem; height: 1.25rem; }
+  .top .name { font-weight: 600; font-size: 1.05rem; color: #f1f5f9; }
+  .top .sub { font-size: 0.72rem; color: #64748b; margin-top: 1px; }
+  .stage {
+    margin-left: auto; display: flex; align-items: center; gap: 0.45rem;
+    padding: 0.35rem 0.8rem; border-radius: 999px;
+    font-size: 0.8rem; font-weight: 500;
+    background: rgba(255,255,255,0.05); color: #94a3b8;
+    border: 1px solid rgba(255,255,255,0.08);
+    transition: all 0.3s;
+  }
+  .stage .dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #64748b; }
+  body[data-stage="recording"] .stage { background: rgba(239,68,68,0.12); color: #fca5a5; border-color: rgba(239,68,68,0.3); }
+  body[data-stage="recording"] .stage .dot { background: #ef4444; animation: pulse 1.1s infinite; }
+  body[data-stage="recording"] { --glow: rgba(239,68,68,0.55); }
+  body[data-stage="transcribing"] .stage { background: rgba(56,189,248,0.12); color: #7dd3fc; border-color: rgba(56,189,248,0.3); }
+  body[data-stage="transcribing"] .stage .dot { background: #38bdf8; animation: pulse 1.1s infinite; }
+  body[data-stage="transcribing"] { --glow: rgba(56,189,248,0.55); }
+  body[data-stage="optimizing"] .stage { background: rgba(99,102,241,0.14); color: #a5b4fc; border-color: rgba(99,102,241,0.32); }
+  body[data-stage="optimizing"] .stage .dot { background: #818cf8; animation: pulse 1.1s infinite; }
+  body[data-stage="optimizing"] { --glow: rgba(99,102,241,0.6); }
+  body[data-stage="review"] .stage { background: rgba(245,158,11,0.12); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+  body[data-stage="review"] .stage .dot { background: #f59e0b; animation: pulse 1.1s infinite; }
+  body[data-stage="review"] { --glow: rgba(245,158,11,0.5); }
+  body[data-stage="done"] .stage { background: rgba(16,185,129,0.12); color: #6ee7b7; border-color: rgba(16,185,129,0.3); }
+  body[data-stage="done"] .stage .dot { background: #10b981; }
+  body[data-stage="done"] { --glow: rgba(16,185,129,0.5); }
+  body[data-stage="error"] .stage { background: rgba(239,68,68,0.15); color: #f87171; border-color: rgba(239,68,68,0.35); }
+  body[data-stage="error"] .stage .dot { background: #ef4444; }
+  body[data-stage="error"] { --glow: rgba(239,68,68,0.6); }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+
+  .wave {
+    display: flex; align-items: center; gap: 3px; height: 2.4rem;
+    margin: 1.1rem 0 0.4rem; opacity: 0; transition: opacity 0.3s;
+  }
+  body[data-stage="recording"] .wave { opacity: 1; }
+  .wave span {
+    flex: 1; border-radius: 999px; min-height: 4px;
+    background: linear-gradient(to top, #0ea5e9, #818cf8);
+    transition: height 0.09s linear;
+  }
+
+  .main {
+    min-height: 9rem;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 0.6rem 0.2rem;
+  }
+  .standby { text-align: center; color: #475569; font-size: 1.05rem; letter-spacing: 0.2em; padding: 2.2rem 0; }
+  .standby .mic { font-size: 2.4rem; display: block; margin-bottom: 0.8rem; opacity: 0.5; }
+  .text {
+    font-size: 1.6rem; line-height: 1.65; color: #f8fafc;
+    word-break: break-word; white-space: pre-wrap;
+  }
+  .text.final {
+    background: linear-gradient(120deg, #f8fafc, #e2e8f0);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    font-weight: 600;
+  }
+  .text .cursor {
+    display: inline-block; width: 0.55em; height: 1.1em; margin-left: 2px;
+    background: #818cf8; border-radius: 2px; vertical-align: -0.15em;
+    animation: pulse 0.9s infinite;
+  }
+  .partial { color: #7dd3fc; font-size: 1.25rem; line-height: 1.6; }
+  .partial::after { content: "▍"; color: #38bdf8; animation: pulse 0.9s infinite; }
+  .reasoning {
+    color: #475569; font-size: 0.85rem; line-height: 1.5; margin-top: 0.7rem;
+    max-height: 4.2em; overflow: hidden;
+  }
+  .raw {
+    color: #64748b; font-size: 0.85rem; margin-top: 0.9rem;
+    border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 0.7rem;
+  }
+  .raw b { color: #94a3b8; font-weight: 500; }
+
+  .foot {
+    display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;
+    margin-top: 1rem; font-size: 0.78rem; color: #64748b;
+  }
+  .foot .msg { min-width: 0; flex: 1; }
+  .foot .meta { color: #475569; font-size: 0.72rem; }
+  .conn { display: flex; align-items: center; gap: 0.35rem; flex: none; }
+  .conn .dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #ef4444; }
+  .conn.ok .dot { background: #10b981; box-shadow: 0 0 8px rgba(16,185,129,0.8); }
+  .conn .label { font-size: 0.72rem; }
+  .timing { color: #475569; font-variant-numeric: tabular-nums; flex: none; }
+</style>
+</head>
+<body data-stage="idle">
+  <div class="card">
+    <div class="top">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none">
+          <rect x="9" y="3" width="6" height="11" rx="3" fill="white"/>
+          <path d="M5 11a7 7 0 0 0 14 0" stroke="white" stroke-width="2" stroke-linecap="round" fill="none"/>
+          <path d="M12 18v3" stroke="white" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div>
+        <div class="name">SpeakNow <span id="ver" style="font-weight:400;font-size:0.7rem;color:#475569"></span></div>
+        <div class="sub">外接字幕屏 · 实时跟随本机语音输入</div>
+      </div>
+      <div class="stage"><span class="dot"></span><span id="stage-text">等待连接</span></div>
+    </div>
+
+    <div class="wave" id="wave"></div>
+
+    <div class="main">
+      <div class="standby" id="standby"><span class="mic">🎙️</span>等待语音指令</div>
+      <div id="body" style="display:none">
+        <div class="partial" id="partial" style="display:none"></div>
+        <div class="text" id="text"></div>
+        <div class="reasoning" id="reasoning" style="display:none"></div>
+        <div class="raw" id="raw" style="display:none"></div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <div class="conn" id="conn"><span class="dot"></span><span class="label">连接中…</span></div>
+      <div class="timing" id="timing"></div>
+      <div class="msg" id="msg"></div>
+      <div class="meta" id="meta"></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+  // URL 参数 ?scale=1.3 可整体放大字号，适配小尺寸硬件屏
+  const q = new URLSearchParams(location.search);
+  const scale = parseFloat(q.get('scale'));
+  if (scale > 0.3 && scale < 5) document.documentElement.style.setProperty('--fs', (16 * scale) + 'px');
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    stageText: $('stage-text'), standby: $('standby'), body: $('body'),
+    partial: $('partial'), text: $('text'), reasoning: $('reasoning'),
+    raw: $('raw'), msg: $('msg'), meta: $('meta'), timing: $('timing'),
+    conn: $('conn'), connLabel: document.querySelector('#conn .label'), wave: $('wave'),
+  };
+
+  const STAGE_LABEL = {
+    idle: '待机', recording: '正在聆听', transcribing: '识别中',
+    optimizing: 'AI 优化中', review: '待确认', done: '已完成', error: '出错',
+  };
+  const BARS = 48;
+  const levels = new Array(BARS).fill(0);
+  for (let i = 0; i < BARS; i++) {
+    const s = document.createElement('span');
+    s.style.height = '4px';
+    els.wave.appendChild(s);
+  }
+  const bars = els.wave.children;
+  let levelTimer = null;
+
+  function setStage(stage) {
+    document.body.dataset.stage = stage || 'idle';
+    els.stageText.textContent = STAGE_LABEL[stage] || stage || '待机';
+    if (stage !== 'recording') {
+      levels.fill(0);
+      renderBars();
+    }
+    if (stage === 'idle') reset();
+  }
+
+  function reset() {
+    els.standby.style.display = '';
+    els.body.style.display = 'none';
+    els.partial.style.display = 'none';
+    els.text.textContent = '';
+    els.text.className = 'text';
+    els.reasoning.style.display = 'none';
+    els.reasoning.textContent = '';
+    els.raw.style.display = 'none';
+    els.timing.textContent = '';
+  }
+
+  function showBody() {
+    els.standby.style.display = 'none';
+    els.body.style.display = '';
+  }
+
+  function renderBars() {
+    const boost = Math.max(1, 24 / (levels.reduce((a, b) => a + b, 0) + 0.001));
+    for (let i = 0; i < BARS; i++) {
+      const v = Math.min(1, levels[i] * 3.5 * boost * 0.6);
+      bars[i].style.height = Math.max(4, v * 36) + 'px';
+      bars[i].style.opacity = 0.35 + v * 0.65;
+    }
+  }
+
+  function onLevel(lv) {
+    levels.shift();
+    levels.push(Math.max(0.02, Math.min(1, lv)));
+    if (!levelTimer) {
+      levelTimer = requestAnimationFrame(() => { levelTimer = null; renderBars(); });
+    }
+  }
+
+  /* ---------- 事件处理（未知 type 一律忽略，保持前向兼容） ---------- */
+  function onEvent(env) {
+    if (!env || typeof env.type !== 'string') return;
+    const d = env.data || {};
+    switch (env.type) {
+      case 'hello':
+        if (d.version) $('ver').textContent = 'v' + d.version;
+        break;
+      case 'status':
+        setStage(d.stage);
+        if (d.message) els.msg.textContent = d.message;
+        break;
+      case 'level':
+        onLevel(typeof d === 'number' ? d : d.level);
+        break;
+      case 'partial':
+        showBody();
+        els.partial.style.display = '';
+        els.partial.textContent = d.text || '';
+        els.text.textContent = '';
+        els.text.className = 'text';
+        break;
+      case 'raw':
+        showBody();
+        els.partial.style.display = 'none';
+        els.text.textContent = d.text || '';
+        els.text.className = 'text';
+        break;
+      case 'delta':
+        showBody();
+        if (d.kind === 'reasoning') {
+          els.reasoning.style.display = '';
+          els.reasoning.textContent = (d.text || d.delta || '');
+        } else {
+          els.partial.style.display = 'none';
+          els.text.className = 'text';
+          els.text.innerHTML = '';
+          els.text.appendChild(document.createTextNode(d.text || d.delta || ''));
+          if (d.text) { // 打字光标
+            const c = document.createElement('span');
+            c.className = 'cursor';
+            els.text.appendChild(c);
+          }
+        }
+        break;
+      case 'result':
+        showBody();
+        els.partial.style.display = 'none';
+        els.reasoning.style.display = 'none';
+        els.text.className = 'text final';
+        els.text.textContent = d.final || '';
+        if (d.raw && d.raw !== d.final) {
+          els.raw.style.display = '';
+          els.raw.innerHTML = '';
+          els.raw.appendChild(document.createElement('b')).textContent = '原文  ';
+          els.raw.appendChild(document.createTextNode(d.raw));
+        } else {
+          els.raw.style.display = 'none';
+        }
+        if (d.asrMs != null) {
+          const parts = [`识别 ${(d.asrMs / 1000).toFixed(1)}s`];
+          if (d.llmMs > 0) parts.push(`优化 ${(d.llmMs / 1000).toFixed(1)}s`);
+          if (d.audioSecs > 0) parts.push(`语音 ${d.audioSecs.toFixed(1)}s`);
+          els.timing.textContent = parts.join(' · ');
+        }
+        break;
+      case 'meta':
+        if (d.asrModel) {
+          els.meta.textContent = d.asrModel + (d.llmEnabled ? ' → ' + (d.llmModel || 'AI') : '');
+        }
+        break;
+      case 'target':
+        if (d.title) els.meta.textContent = '正在输入到：' + d.title;
+        break;
+    }
+  }
+
+  /* ---------- WebSocket 连接（自动重连） ---------- */
+  let ws = null, retry = 0;
+  function setConn(ok, label) {
+    els.conn.classList.toggle('ok', ok);
+    els.connLabel.textContent = label;
+  }
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    try { ws = new WebSocket(`${proto}://${location.host}/api/events`); }
+    catch { return scheduleReconnect(); }
+    ws.onopen = () => { retry = 0; setConn(true, '已连接'); if (document.body.dataset.stage === 'idle') setStage('idle'); };
+    ws.onmessage = (e) => {
+      try { onEvent(JSON.parse(e.data)); } catch {}
+    };
+    ws.onclose = () => { setConn(false, '已断开'); scheduleReconnect(); };
+    ws.onerror = () => { try { ws.close(); } catch {} };
+  }
+  function scheduleReconnect() {
+    retry++;
+    setConn(false, retry > 1 ? `重连中…（${retry - 1}）` : '连接中…');
+    setTimeout(connect, Math.min(1500 * retry, 8000));
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

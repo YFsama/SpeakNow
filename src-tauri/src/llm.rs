@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::asr::truncate;
 use crate::config::LlmConfig;
+use crate::events;
 
 /// 把 ASR 原始转写交给大模型纠错/优化
 pub async fn optimize(cfg: &LlmConfig, raw: &str) -> anyhow::Result<String> {
@@ -139,7 +140,8 @@ pub async fn optimize_streaming(
                 .and_then(Value::as_str)
             {
                 if !rc.is_empty() {
-                    let _ = app.emit(
+                    events::emit(
+                        app,
                         "sn-llm-delta",
                         serde_json::json!({ "kind": "reasoning", "delta": rc }),
                     );
@@ -156,7 +158,8 @@ pub async fn optimize_streaming(
                         }
                     }
                     acc.push_str(c);
-                    let _ = app.emit(
+                    events::emit(
+                        app,
                         "sn-llm-delta",
                         serde_json::json!({ "kind": "content", "delta": c, "text": acc }),
                     );

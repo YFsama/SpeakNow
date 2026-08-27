@@ -25,7 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cpal = "0.15"
 reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "fs", "io-util", "net"] }
+axum = { version = "0.8", features = ["ws"] }
 anyhow = "1"
 arboard = "3"
 base64 = "0.22"

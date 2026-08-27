@@ -130,6 +130,19 @@ export const cancelReview = () => invoke('cancel_review');
 export const optimizeText = (text: string) =>
   invoke<string>('optimize_text', { text });
 
+/** 外接显示（硬件字幕屏）服务状态 */
+export interface DisplayStatus {
+  running: boolean;
+  port?: number;
+  allowLan?: boolean;
+  urls: string[];
+  error?: string | null;
+}
+export const displayStatus = () => invoke<DisplayStatus>('display_status');
+/** 在系统默认浏览器打开外接显示页（仅限本机/局域网地址） */
+export const openDisplayPage = (url: string) =>
+  invoke('open_display_page', { url });
+
 /** 本应用当前是否以管理员身份运行 */
 export const isElevated = () => invoke<boolean>('is_elevated');
 /** 以管理员身份重启（UAC 确认后旧实例自动退出） */

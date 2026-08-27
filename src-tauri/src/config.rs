@@ -12,6 +12,7 @@ pub struct Config {
     pub llm: LlmConfig,
     pub output: OutputConfig,
     pub general: GeneralConfig,
+    pub external_display: ExternalDisplayConfig,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             output: OutputConfig::default(),
             general: GeneralConfig::default(),
+            external_display: ExternalDisplayConfig::default(),
         }
     }
 }
@@ -203,6 +205,32 @@ impl Default for GeneralConfig {
             autostart: false,
             theme: "dark".into(),
             font_scale: 1.0,
+        }
+    }
+}
+
+/// 外接显示（硬件字幕屏）API。开启后本机启动 HTTP + WebSocket 服务，
+/// 聆听窗口的全部字幕事件同步推送给外接硬件；可选择同时隐藏本地悬浮窗。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExternalDisplayConfig {
+    /// 启用外接显示 API 服务
+    pub enabled: bool,
+    /// 服务端口
+    pub port: u16,
+    /// 允许局域网设备连接（false=仅本机 127.0.0.1；true=监听 0.0.0.0）
+    pub allow_lan: bool,
+    /// 外接显示时不再弹出本地聆听悬浮窗
+    pub hide_local_overlay: bool,
+}
+
+impl Default for ExternalDisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8866,
+            allow_lan: false,
+            hide_local_overlay: false,
         }
     }
 }

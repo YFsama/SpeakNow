@@ -3,10 +3,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 use crate::config::{AsrConfig, Config};
-use crate::{asr, audio, history, inject, llm, overlay, Ctx, PendingReview};
+use crate::{asr, audio, events, history, inject, llm, overlay, Ctx, PendingReview};
+
+/// 外接显示独占模式：本地不再弹出聆听悬浮窗（字幕只推给外接硬件）
+pub fn suppress_local_overlay(cfg: &Config) -> bool {
+    cfg.external_display.enabled && cfg.external_display.hide_local_overlay
+}
 
 /// 托盘 / 切换模式：正在录音则停止，否则开始
 /// 上次 toggle 时刻（ms）：热键事件去抖。键盘连击/驱动重复会在几十毫秒内
@@ -87,10 +92,10 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
         });
     }
 
-    if cfg.general.show_overlay {
+    if cfg.general.show_overlay && !suppress_local_overlay(&cfg) {
         overlay::show(app);
     }
-    let _ = app.emit("sn-retryable", false);
+    events::emit(app, "sn-retryable", serde_json::json!(false));
     let hint = match (cfg.hotkey.mode.as_str(), skip_llm) {
         ("hold", false) => "松开快捷键结束并输入",
         ("hold", true) => "松开快捷键结束（快速模式 · 不经 AI）",
@@ -133,7 +138,8 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig) {
                             texts.push(t);
                             texts.join(joiner)
                         };
-                        let _ = app.emit(
+                        events::emit(
+                            &app,
                             "sn-partial",
                             serde_json::json!({ "text": joined }),
                         );
@@ -186,7 +192,7 @@ fn watch(
         let Some((level, silence, elapsed_ms, len, rate)) = info else {
             return;
         };
-        let _ = app.emit("sn-level", level);
+        events::emit(&app, "sn-level", serde_json::json!(level));
 
         // 流式分段：静音 700ms 或单段满 10s 时切一段送识别
         if streaming && len > 0 {
@@ -261,7 +267,8 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, from_ui: bool) 
     } else {
         cfg.asr.model.clone()
     };
-    let _ = app.emit(
+    events::emit(
+        &app,
         "sn-meta",
         serde_json::json!({
             "asrModel": asr_label,
@@ -354,7 +361,7 @@ pub async fn process_audio(
             // 保留音频供「重试」
             *app.state::<Ctx>().last_audio.lock().unwrap() =
                 Some((samples.clone(), from_ui));
-            let _ = app.emit("sn-retryable", true);
+            events::emit(&app, "sn-retryable", serde_json::json!(true));
             finish_status(
                 &app,
                 "error",
@@ -396,7 +403,7 @@ pub async fn process_audio(
     if raw.trim().is_empty() {
         *app.state::<Ctx>().last_audio.lock().unwrap() =
             Some((samples.clone(), from_ui));
-        let _ = app.emit("sn-retryable", true);
+        events::emit(&app, "sn-retryable", serde_json::json!(true));
         finish_status(
             &app,
             "error",
@@ -408,7 +415,7 @@ pub async fn process_audio(
     }
 
     // 第一时间把原始转写推给悬浮窗预览（AI 优化期间即可阅读）
-    let _ = app.emit("sn-raw", serde_json::json!({ "text": raw }));
+    events::emit(&app, "sn-raw", serde_json::json!({ "text": raw }));
 
     // 会话已过期：新录音已开始，本代结果不再输入（防止旧文本晚到覆盖新输入）
     if gen != app.state::<Ctx>().run_gen.load(Ordering::SeqCst) {
@@ -474,15 +481,17 @@ pub async fn process_audio(
         return;
     }
 
-    // 预览编辑模式：结果进入悬浮窗编辑器，确认后再输入
-    if cfg.output.review && cfg.output.auto_paste {
+    // 预览编辑模式：结果进入悬浮窗编辑器，确认后再输入。
+    // 本地悬浮窗被抑制（外接显示独占）时无处编辑，退回直接输入。
+    if cfg.output.review && cfg.output.auto_paste && !suppress_local_overlay(&cfg) {
         *app.state::<Ctx>().pending_review.lock().unwrap() = Some(PendingReview {
             raw: raw.clone(),
             final_text: final_text.clone(),
             asr_ms,
             llm_ms,
         });
-        let _ = app.emit(
+        events::emit(
+            &app,
             "sn-review",
             serde_json::json!({ "text": final_text, "raw": raw, "llmUsed": llm_ms > 0 }),
         );
@@ -510,7 +519,8 @@ pub async fn finish_and_input(
     audio_secs: f64,
 ) {
     history::push(app, raw, final_text, asr_ms, llm_ms);
-    let _ = app.emit(
+    events::emit(
+        app,
         "sn-result",
         serde_json::json!({
             "raw": raw,
@@ -606,7 +616,8 @@ pub fn hide_later(app: &AppHandle, ms: u64) {
 }
 
 pub fn emit_status(app: &AppHandle, stage: &str, message: &str, sound: bool) {
-    let _ = app.emit(
+    events::emit(
+        app,
         "sn-status",
         serde_json::json!({ "stage": stage, "message": message, "sound": sound }),
     );

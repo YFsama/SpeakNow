@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 const OVERLAY_LABEL: &str = "overlay";
 const OVERLAY_W: f64 = 520.0;
@@ -33,7 +33,8 @@ pub fn show(app: &AppHandle) {
             x.round() as i32,
             y.round() as i32,
         ));
-        let _ = app.emit(
+        let _ = crate::events::emit(
+            app,
             "sn-target",
             serde_json::json!({
                 "title": truncate_title(&title),

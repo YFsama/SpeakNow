@@ -91,6 +91,18 @@ export interface GeneralConfig {
   fontScale: number;
 }
 
+/** 外接显示（硬件字幕屏）API */
+export interface ExternalDisplayConfig {
+  /** 启用外接显示 API 服务 */
+  enabled: boolean;
+  /** 服务端口 */
+  port: number;
+  /** 允许局域网设备连接（false=仅本机） */
+  allowLan: boolean;
+  /** 外接显示时不再弹出本地聆听悬浮窗 */
+  hideLocalOverlay: boolean;
+}
+
 export interface Config {
   hotkey: HotkeyConfig;
   audio: AudioConfig;
@@ -98,6 +110,7 @@ export interface Config {
   llm: LlmConfig;
   output: OutputConfig;
   general: GeneralConfig;
+  externalDisplay: ExternalDisplayConfig;
 }
 
 export interface HistoryItem {
@@ -154,6 +167,7 @@ export type TabId =
   | 'asr'
   | 'llm'
   | 'output'
+  | 'display'
   | 'history'
   | 'about';
 

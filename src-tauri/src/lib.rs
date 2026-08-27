@@ -1,6 +1,8 @@
 mod asr;
 mod audio;
 mod config;
+mod display_api;
+mod events;
 mod history;
 mod hotkey;
 mod inject;
@@ -139,6 +141,11 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
     if let Err(e) = apply_autostart(&app, config.general.autostart) {
         trace_save(&app, &format!("自启设置失败 {e}"));
         messages.push(format!("开机自启：{e}"));
+    }
+    // 外接显示服务：相关配置变化时启停/重启（仅本地行为变化则不打扰已连接硬件）
+    if config.external_display != old.external_display {
+        let ext = config.external_display.clone();
+        tauri::async_runtime::spawn_blocking(move || display_api::apply(&ext));
     }
     let _ = app.emit("sn-config-changed", ());
     trace_save(&app, &format!("完成 {}ms", t0.elapsed().as_millis()));
@@ -853,7 +860,8 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
         .map_err(|e| format!("输入失败：{e:#}"))?;
 
     history::push(&app, &pending.raw, &text, pending.asr_ms, pending.llm_ms);
-    let _ = app.emit(
+    events::emit(
+        &app,
         "sn-result",
         serde_json::json!({
             "raw": pending.raw,
@@ -923,6 +931,36 @@ fn export_text(app: AppHandle, filename: String, content: String) -> Result<Stri
 #[tauri::command]
 fn show_main(app: AppHandle) {
     tray::open_main_window(&app);
+}
+
+/* ---------- 外接显示（硬件字幕屏）API ---------- */
+
+/// 外接显示服务当前状态（运行中/端口/可访问 URL/最近错误）
+#[tauri::command]
+fn display_status() -> serde_json::Value {
+    display_api::status()
+}
+
+/// 在系统默认浏览器打开指定 URL（仅用于展示本服务自己的地址）
+#[tauri::command]
+fn open_display_page(url: String) -> Result<(), String> {
+    if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:") && !url.starts_with("http://192.168.") && !url.starts_with("http://10.") && !url.starts_with("http://172.") {
+        return Err("仅允许打开本机或局域网地址".into());
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", &url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&url);
+        c
+    };
+    cmd.spawn().map_err(|e| format!("打开失败：{e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1039,6 +1077,8 @@ pub fn run() {
                     }
                 });
             }
+            // 外接显示（硬件字幕屏）API：开机自启
+            display_api::apply(&cfg.external_display);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1115,6 +1155,8 @@ pub fn run() {
             optimize_text,
             show_main,
             quit_app,
+            display_status,
+            open_display_page,
             is_elevated,
             restart_elevated
         ])

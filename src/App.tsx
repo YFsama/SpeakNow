@@ -24,6 +24,7 @@ import Dashboard from './components/Dashboard';
 import {
   AboutTab,
   AsrTab,
+  DisplayTab,
   HistoryTab,
   HotkeyTab,
   LlmTab,
@@ -39,6 +40,7 @@ const NAV: { id: TabId; icon: string; label: string }[] = [
   { id: 'asr', icon: '📝', label: '语音识别' },
   { id: 'llm', icon: '✨', label: 'AI 优化' },
   { id: 'output', icon: '⌨', label: '输入方式' },
+  { id: 'display', icon: '📡', label: '外接显示' },
   { id: 'history', icon: '🕘', label: '历史' },
   { id: 'about', icon: 'ℹ️', label: '关于' },
 ];
@@ -359,6 +361,7 @@ export default function App() {
           {tab === 'asr' && <AsrTab {...tabProps} />}
           {tab === 'llm' && <LlmTab {...tabProps} />}
           {tab === 'output' && <OutputTab {...tabProps} />}
+          {tab === 'display' && <DisplayTab {...tabProps} />}
           {tab === 'history' && <HistoryTab {...tabProps} />}
           {tab === 'about' && <AboutTab {...tabProps} />}
         </div>
