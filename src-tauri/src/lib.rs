@@ -147,6 +147,12 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
         let ext = config.external_display.clone();
         tauri::async_runtime::spawn_blocking(move || display_api::apply(&ext));
     }
+    // 从本地引擎切到云端/其他方式时，停掉常驻 llama-server（约 10GB 提交内存）；
+    // 之后再用回本地会按需自动拉起，不影响「秒级响应」的常驻体验
+    if old.asr.provider == "local" && config.asr.provider != "local" {
+        let h = app.clone();
+        tauri::async_runtime::spawn_blocking(move || qwen_asr::shutdown(&h));
+    }
     let _ = app.emit("sn-config-changed", ());
     trace_save(&app, &format!("完成 {}ms", t0.elapsed().as_millis()));
     Ok(messages.join("；"))
@@ -721,7 +727,7 @@ fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
     }
     if id == qwen_asr::MODEL_ID {
         // 服务进程占着 gguf 文件，必须先停
-        qwen_asr::shutdown();
+        qwen_asr::shutdown(&app);
     }
     let root = local_whisper::models_root(&app).map_err(|e| e.to_string())?;
     let dir = root.join(&id);
@@ -1068,6 +1074,14 @@ pub fn run() {
         .setup(|app| {
             let cfg = config::load(app.handle());
             *app.state::<Ctx>().config.lock().unwrap() = Some(cfg.clone());
+            // 先清掉上次崩溃/强杀遗留的 llama-server（曾以 ~10GB 提交内存常驻多日，
+            // 加重系统内存压力导致白屏/卡死），本次会话按需重新拉起并纳入 Job Object
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    qwen_asr::cleanup_orphan_engines(&h);
+                });
+            }
             tray::setup(app.handle())?;
             if let Err(e) = hotkey::apply(app.handle(), &cfg.hotkey) {
                 eprintln!("[speaknow] {e:#}");
@@ -1173,10 +1187,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("SpeakNow 启动失败")
-        .run(|_app, event| {
-            // 应用退出时收掉 llama-server 子进程，避免孤儿进程占着 3GB 内存
+        .run(|app, event| {
+            // 应用退出时收掉 llama-server 子进程，避免孤儿进程占着 3GB 内存；
+            // 强杀/崩溃路径由 Job Object（KILL_ON_JOB_CLOSE）兜底
             if let tauri::RunEvent::Exit = event {
-                qwen_asr::shutdown();
+                qwen_asr::shutdown(app);
             }
         });
 }

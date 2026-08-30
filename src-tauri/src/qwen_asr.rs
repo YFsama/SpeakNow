@@ -334,13 +334,145 @@ static SERVER: LazyLock<Mutex<Option<ServerState>>> = LazyLock::new(|| Mutex::ne
 /// 串行化引擎启动，避免并发首识时重复拉起
 static SPAWN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-pub fn shutdown() {
+/// Windows Job Object（KILL_ON_JOB_CLOSE）：本进程无论正常退出、被强杀还是崩溃，
+/// 内核关闭 Job 句柄时都会连带收掉 llama-server。此前只靠 RunEvent::Exit 里的
+/// shutdown()，强杀/崩溃一次就会遗留常驻 ~10GB 提交内存的孤儿进程。
+#[cfg(target_os = "windows")]
+struct JobHandle(windows::Win32::Foundation::HANDLE);
+#[cfg(target_os = "windows")]
+unsafe impl Send for JobHandle {}
+#[cfg(target_os = "windows")]
+static JOB: LazyLock<Mutex<Option<JobHandle>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 把子进程挂进 Job（挂进后立即生效，即使应用在引擎启动等待期崩溃也会被收掉）
+#[cfg(target_os = "windows")]
+fn assign_to_job(child: &Child) {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let mut job = JOB.lock().unwrap();
+    unsafe {
+        if job.is_none() {
+            let h = match CreateJobObjectW(None, None) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .is_err()
+            {
+                return;
+            }
+            *job = Some(JobHandle(h));
+        }
+        if let Some(JobHandle(h)) = *job {
+            let _ = AssignProcessToJobObject(h, HANDLE(child.as_raw_handle()));
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn assign_to_job(_child: &Child) {}
+
+/// 终止遗留的 llama-server 进程（可执行文件位于本应用 llama-runtime 目录内），
+/// 返回清理数量。覆盖两类残留：旧版本强杀/崩溃留下的孤儿，以及被本会话
+/// 「接管」（无句柄）的实例——后者此前连正常退出都收不掉。
+#[cfg(target_os = "windows")]
+fn kill_leftover_runtimes(app: &AppHandle) -> usize {
+    use std::mem::size_of;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let Ok(dir) = runtime_dir(app) else {
+        return 0;
+    };
+    let dir_lower = dir.to_string_lossy().to_lowercase();
+    let mut killed = 0usize;
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return 0;
+        };
+        let mut e = PROCESSENTRY32W::default();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut e).is_ok();
+        while more {
+            let name = String::from_utf16_lossy(&e.szExeFile)
+                .trim_end_matches('\0')
+                .to_lowercase();
+            if name == "llama-server.exe" {
+                let rights = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
+                if let Ok(h) = OpenProcess(rights, false, e.th32ProcessID) {
+                    let mut buf = [0u16; 1024];
+                    let mut len = buf.len() as u32;
+                    if QueryFullProcessImageNameW(
+                        h,
+                        PROCESS_NAME_FORMAT(0),
+                        PWSTR(buf.as_mut_ptr()),
+                        &mut len,
+                    )
+                    .is_ok()
+                    {
+                        let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+                        // 只动自己 runtime 目录里的，绝不碰用户自行运行的同名进程
+                        if path.starts_with(&dir_lower) && TerminateProcess(h, 1).is_ok() {
+                            killed += 1;
+                        }
+                    }
+                    let _ = CloseHandle(h);
+                }
+            }
+            more = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    killed
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_leftover_runtimes(_app: &AppHandle) -> usize {
+    0
+}
+
+/// 应用启动时调用：清理上次崩溃/强杀遗留的 llama-server（同步、毫秒级）
+pub fn cleanup_orphan_engines(app: &AppHandle) -> usize {
+    let n = kill_leftover_runtimes(app);
+    if n > 0 {
+        eprintln!("[speaknow] 已清理遗留的 llama-server 进程 ×{n}（上次可能异常退出）");
+    }
+    n
+}
+
+/// 停止本地引擎：先收自己拉起的子进程，再兜底清掉目录内遗留实例
+/// （包括被「接管」的无句柄进程——此前这类实例在正常退出时也收不掉）
+pub fn shutdown(app: &AppHandle) {
     if let Some(st) = SERVER.lock().unwrap().take() {
         if let Some(mut c) = st.child {
             let _ = c.kill();
             let _ = c.wait();
         }
     }
+    kill_leftover_runtimes(app);
 }
 
 fn probe_client() -> reqwest::blocking::Client {
@@ -417,7 +549,11 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
         }
     }
 
-    // 2) 接管上次异常退出的残留服务
+    // 2) 清掉上次异常退出遗留的 llama-server（含无句柄的「接管」实例），
+    //    本次会话重新拉起并纳入 Job Object 管理，进程生命周期与应用严格绑定
+    kill_leftover_runtimes(app);
+
+    // 3) 接管上次异常退出的残留服务
     if let Some(base) = adoptable(BASE_PORT) {
         *SERVER.lock().unwrap() = Some(ServerState {
             child: None,
@@ -427,7 +563,7 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
         return Ok(base);
     }
 
-    // 3) 前置检查
+    // 4) 前置检查
     if !model_files_ok(app) {
         bail!("Qwen3-ASR 模型文件不完整：请在「识别设置」重新点击下载");
     }
@@ -438,7 +574,7 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
     let mut backend = runtime_backend(app).unwrap_or_else(|| "cpu".into());
     let dir = model_dir(app)?;
 
-    // 4) 启动（vulkan 初始化失败时自动换 CPU 运行时重试一次）
+    // 5) 启动（vulkan 初始化失败时自动换 CPU 运行时重试一次）
     for attempt in 0..2 {
         let port = find_free_port();
         let log_file = runtime_dir(app)?.join("server.log");
@@ -477,6 +613,8 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
             Ok(c) => c,
             Err(e) => return Err(anyhow!("启动 llama-server 失败: {e}（运行时可能被杀毒软件拦截）")),
         };
+        // 立即挂进 Job Object：应用后续无论怎么死（含强杀/崩溃），子进程都会被内核收掉
+        assign_to_job(&child);
 
         let base = format!("http://127.0.0.1:{port}");
         let start = Instant::now();
