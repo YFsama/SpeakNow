@@ -105,6 +105,7 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
     emit_status(app, "recording", hint, sound);
 
     let handle = app.clone();
+    let watch_device = cfg.audio.device.clone();
     thread::spawn(move || {
         watch(
             handle,
@@ -113,6 +114,9 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
             cfg.audio.vad_silence_ms,
             cfg.audio.max_duration_sec,
             streaming,
+            watch_device,
+            cfg.audio.gain_db,
+            cfg.audio.auto_gain,
         );
     });
     Ok(())
@@ -161,7 +165,105 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig) {
     }
 }
 
-/// 电平上报 + VAD 静音自动结束 + 最长时长保护 + 流式分段切分
+/// 录音期自动增益（AGC）：以用户设定的基准增益为中心，仅在「确有语音」且窗口
+/// 峰值过低时逐步提升、接近削波时快速回落。增益只作用于本次录音；结束时若学
+/// 到了新值（偏离基准 ≥ 1.5dB 且确实听到语音），经 sn-gain-learned 事件交由
+/// 前端写回该设备的记忆增益，下一次录音直接从学到的值起步，不再重复爬升。
+struct Agc {
+    enabled: bool,
+    base_db: f32,
+    gain_db: f32,
+    /// 窗口内电平采样（增益后 RMS，watch 每 100ms 一拍）
+    window: Vec<f32>,
+    /// 窗口内「判定有语音」的采样数
+    window_speech: usize,
+    /// 整场录音累计有语音采样数（学得值门槛，防止对着底噪自学）
+    total_speech: usize,
+    min_db: f32,
+    max_db: f32,
+}
+
+impl Agc {
+    /// 决策窗口 1.5s
+    const WINDOW_TICKS: usize = 15;
+    /// 窗口内「有语音」采样下限（约 0.4s，纯底噪偶发越限不足以触发）
+    const WINDOW_SPEECH_MIN: usize = 4;
+    /// 学得值门槛：整场至少 1s 有效语音
+    const TOTAL_SPEECH_MIN: usize = 10;
+    /// 增益后窗口峰值低于此（RMS）→ 提升；正常音量（窗口峰值 0.2+）不触发
+    const TARGET_LOW: f32 = 0.10;
+    /// 增益后窗口峰值达到此（RMS）→ 接近削波，回落
+    const TARGET_CLIP: f32 = 0.90;
+    /// 增益前 RMS 峰值低于此视为无语音（底噪），绝不放大纯底噪
+    const PRE_SPEECH_FLOOR: f32 = 0.01;
+    const STEP_UP_DB: f32 = 3.0;
+    const STEP_DOWN_DB: f32 = 4.0;
+    /// 自动调节范围：基准 ±12dB（提升侧再受 45dB 硬上限约束）
+    const RANGE_DB: f32 = 12.0;
+    const HARD_MAX_DB: f32 = 45.0;
+
+    fn new(base_db: f32, enabled: bool) -> Self {
+        let base_db = base_db.clamp(0.0, Self::HARD_MAX_DB);
+        Self {
+            enabled,
+            min_db: (base_db - Self::RANGE_DB).max(0.0),
+            max_db: (base_db + Self::RANGE_DB).min(Self::HARD_MAX_DB),
+            base_db,
+            gain_db: base_db,
+            window: Vec::with_capacity(Self::WINDOW_TICKS),
+            window_speech: 0,
+            total_speech: 0,
+        }
+    }
+
+    /// 每拍喂入增益后电平（RMS 0~1）。返回新增益（dB）；None = 本拍无需调节。
+    fn on_tick(&mut self, post_level: f32) -> Option<f32> {
+        if !self.enabled {
+            return None;
+        }
+        // 折算增益前电平：低于语音门限的信号（底噪）不计入语音判定，
+        // 保证 AGC 只会放大「确实有人在说话」的输入，而不是把底噪泵上去
+        let pre_level = post_level / 10f32.powf(self.gain_db / 20.0);
+        if pre_level >= Self::PRE_SPEECH_FLOOR || post_level >= Self::TARGET_CLIP {
+            self.window_speech += 1;
+            self.total_speech += 1;
+        }
+        self.window.push(post_level);
+        if self.window.len() < Self::WINDOW_TICKS {
+            return None;
+        }
+        let peak = self.window.iter().copied().fold(0.0f32, f32::max);
+        self.window.clear();
+        let speech_ticks = self.window_speech;
+        self.window_speech = 0;
+
+        if peak >= Self::TARGET_CLIP && self.gain_db > self.min_db {
+            self.gain_db = (self.gain_db - Self::STEP_DOWN_DB).max(self.min_db);
+            return Some(self.gain_db);
+        }
+        if speech_ticks >= Self::WINDOW_SPEECH_MIN
+            && peak < Self::TARGET_LOW
+            && self.gain_db < self.max_db
+        {
+            self.gain_db = (self.gain_db + Self::STEP_UP_DB).min(self.max_db);
+            return Some(self.gain_db);
+        }
+        None
+    }
+
+    /// 录音结束：若学到新增益则返回应记忆的值（0.5dB 步进）
+    fn learned(&self) -> Option<f32> {
+        if !self.enabled || self.total_speech < Self::TOTAL_SPEECH_MIN {
+            return None;
+        }
+        if (self.gain_db - self.base_db).abs() < 1.5 {
+            return None;
+        }
+        Some((self.gain_db * 2.0).round() / 2.0)
+    }
+}
+
+/// 电平上报 + VAD 静音自动结束 + 最长时长保护 + 流式分段切分 + 录音期 AGC
 #[allow(clippy::too_many_arguments)]
 fn watch(
     app: AppHandle,
@@ -170,18 +272,27 @@ fn watch(
     silence_ms: u64,
     max_sec: u64,
     streaming: bool,
+    device: Option<String>,
+    base_gain_db: f32,
+    auto_gain: bool,
 ) {
+    let mut agc = Agc::new(base_gain_db, auto_gain);
     loop {
         thread::sleep(Duration::from_millis(100));
         if cancel.load(Ordering::SeqCst) {
-            return;
+            break;
         }
         let info = {
             let state = app.state::<Ctx>();
             let guard = state.recording.lock().unwrap();
             guard.as_ref().map(|r| {
+                let level = r.shared.level();
+                // AGC 决策与写入都在持锁期间完成，避免与下一次调节竞争
+                if let Some(db) = agc.on_tick(level) {
+                    r.shared.set_gain_db(db);
+                }
                 (
-                    r.shared.level(),
+                    level,
                     r.shared.silence_ms(),
                     r.shared.elapsed_ms(),
                     r.shared.len(),
@@ -190,7 +301,7 @@ fn watch(
             })
         };
         let Some((level, silence, elapsed_ms, len, rate)) = info else {
-            return;
+            break;
         };
         events::emit(&app, "sn-level", serde_json::json!(level));
 
@@ -221,13 +332,34 @@ fn watch(
         if vad_enabled && elapsed_ms > 900 && silence > silence_ms {
             crate::trace_pipeline(&app, "VAD 静音自动结束");
             let _ = stop(&app, false);
-            return;
+            break;
         }
         if elapsed_ms > max_sec * 1000 {
             crate::trace_pipeline(&app, "达到最长时长自动结束");
             let _ = stop(&app, false);
-            return;
+            break;
         }
+    }
+    // 单一出口：AGC 学到的增益广播给前端按设备记忆（sn-gain-learned）
+    if let Some(learned_db) = agc.learned() {
+        crate::trace_pipeline(
+            &app,
+            &format!(
+                "AGC 学得增益：基准 {:.1}dB → {:.1}dB（{}）",
+                agc.base_db,
+                learned_db,
+                device.as_deref().unwrap_or("系统默认")
+            ),
+        );
+        events::emit(
+            &app,
+            "sn-gain-learned",
+            serde_json::json!({
+                "device": device,
+                "gainDb": learned_db,
+                "baseDb": agc.base_db,
+            }),
+        );
     }
 }
 
@@ -638,4 +770,63 @@ pub fn emit_status(app: &AppHandle, stage: &str, message: &str, sound: bool) {
         "sn-status",
         serde_json::json!({ "stage": stage, "message": message, "sound": sound }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agc;
+
+    /// 模拟固定「增益前」语音电平：on_tick 收到的是增益后电平
+    fn feed(agc: &mut Agc, pre_speech: f32, windows: usize) {
+        for _ in 0..windows * Agc::WINDOW_TICKS {
+            let post = pre_speech * 10f32.powf(agc.gain_db / 20.0);
+            agc.on_tick(post);
+        }
+    }
+
+    /// 输入过小且确有语音 → 逐窗口 +3dB，到目标后停住，并给出学得值
+    #[test]
+    fn agc_boosts_quiet_speech_and_converges() {
+        let mut agc = Agc::new(0.0, true);
+        feed(&mut agc, 0.03, 10);
+        // 0.03 × ~4（12dB）≈ 0.12 ≥ 0.10 目标 → 恰好停在 +12dB
+        assert!((agc.gain_db - 12.0).abs() < 0.01, "实际 {}", agc.gain_db);
+        assert_eq!(agc.learned(), Some(12.0));
+    }
+
+    /// 纯底噪（增益前低于语音门限）绝不放大
+    #[test]
+    fn agc_ignores_noise_floor() {
+        let mut agc = Agc::new(0.0, true);
+        feed(&mut agc, 0.002, 8);
+        assert!(agc.gain_db < 0.01, "实际 {}", agc.gain_db);
+        assert!(agc.learned().is_none());
+    }
+
+    /// 正常音量不动
+    #[test]
+    fn agc_leaves_healthy_level_alone() {
+        let mut agc = Agc::new(0.0, true);
+        feed(&mut agc, 0.25, 4);
+        assert!(agc.gain_db < 0.01, "实际 {}", agc.gain_db);
+        assert!(agc.learned().is_none());
+    }
+
+    /// 接近削波 → 快速回落，且下限为基准 -12dB
+    #[test]
+    fn agc_backs_off_near_clipping() {
+        let mut agc = Agc::new(20.0, true);
+        feed(&mut agc, 0.95, 5);
+        assert!((agc.gain_db - 8.0).abs() < 0.01, "实际 {}", agc.gain_db);
+        assert_eq!(agc.learned(), Some(8.0));
+    }
+
+    /// 关闭时完全不参与
+    #[test]
+    fn agc_disabled_is_noop() {
+        let mut agc = Agc::new(0.0, false);
+        feed(&mut agc, 0.03, 6);
+        assert!(agc.gain_db < 0.01);
+        assert!(agc.learned().is_none());
+    }
 }

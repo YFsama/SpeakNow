@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   Button,
@@ -48,6 +48,7 @@ import type {
   MicVolumeInfo,
 } from '../api';
 import type { Config, DeviceInfo, MicTestResult, TabProps } from '../types';
+import { DEFAULT_DEVICE_KEY } from '../types';
 
 /* ============ 快捷键 ============ */
 export function HotkeyTab({ cfg, set }: TabProps) {
@@ -116,6 +117,7 @@ function DeviceCard({
   onQuick,
   testing,
   result,
+  gainDb,
 }: {
   name: string;
   spec: string;
@@ -125,6 +127,8 @@ function DeviceCard({
   onQuick: () => void;
   testing: boolean;
   result?: MicTestResult;
+  /** 该设备记忆的软件增益（dB），> 0 时展示徽章 */
+  gainDb?: number;
 }) {
   return (
     <div
@@ -150,6 +154,14 @@ function DeviceCard({
         {isDefault && (
           <span className="shrink-0 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 text-[10px] text-emerald-300">
             默认
+          </span>
+        )}
+        {gainDb !== undefined && gainDb > 0 && (
+          <span
+            title="该设备记忆的软件增益"
+            className="shrink-0 rounded-full border border-sky-400/25 bg-sky-400/10 px-1.5 py-0.5 font-mono text-[10px] text-sky-300"
+          >
+            +{gainDb.toFixed(gainDb % 1 ? 1 : 0)}dB
           </span>
         )}
         <button
@@ -216,6 +228,74 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
   const [allLive, setAllLive] = useState<Record<string, number>>({});
   const [sysVol, setSysVol] = useState<MicVolumeInfo | null>(null);
   const [hwLevels, setHwLevels] = useState<HwLevel[] | null>(null);
+
+  // 异步回调（自动校准等）里读取最新配置，避免闭包拿到过期值
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
+
+  // 设备键：null（系统默认模式）用固定键，其余用设备名
+  const deviceKey = (d: string | null) => d ?? DEFAULT_DEVICE_KEY;
+
+  // 写入当前所选设备的增益（滑杆 / 校准共用），同步映射表
+  const setGainDb = (db: number) => {
+    const cur = cfgRef.current;
+    if (!cur) return;
+    set('audio', {
+      gainDb: db,
+      gainDbByDevice: {
+        ...(cur.audio.gainDbByDevice ?? {}),
+        [deviceKey(cur.audio.device)]: db,
+      },
+    });
+  };
+
+  // 新设备首次选用：后台自动校准一次增益（需用户对着麦克风说话）
+  const calibrateFirstUse = async (name: string | null) => {
+    const label = name ?? '系统默认';
+    toast(`「${label}」首次使用，自动校准增益中——请对麦克风说几句话`);
+    try {
+      const r = await autoCalibrate(name);
+      const cur = cfgRef.current;
+      if (!cur || cur.audio.device !== name) return; // 校准期间又切走了
+      if (r.suggestedDb == null) {
+        toast('未检测到足够信号，暂不校准；录音时自动增益仍会按需提升');
+        return;
+      }
+      set('audio', {
+        gainDb: r.suggestedDb,
+        gainDbByDevice: {
+          ...(cur.audio.gainDbByDevice ?? {}),
+          [deviceKey(name)]: r.suggestedDb,
+        },
+      });
+      toast(`「${label}」增益已自动校准为 ${r.suggestedDb}dB（按设备记忆）`);
+    } catch {
+      // 校准失败不阻塞选用；录音期 AGC 仍会兜底
+    }
+  };
+
+  // 切换设备：先把当前增益记到当前设备名下，再换入新设备记忆的增益；
+  // 新设备无记忆且开了自动增益时后台校准一次
+  const selectDevice = (name: string | null) => {
+    const cur = cfgRef.current;
+    if (!cur || name === cur.audio.device) return;
+    const byDev = { ...(cur.audio.gainDbByDevice ?? {}) };
+    byDev[deviceKey(cur.audio.device)] = cur.audio.gainDb;
+    const stored = byDev[deviceKey(name)];
+    set('audio', {
+      device: name,
+      gainDb: stored ?? 0,
+      gainDbByDevice: byDev,
+    });
+    const label = name ?? '系统默认';
+    if (stored !== undefined) {
+      toast(`已切换到「${label}」· 增益 ${stored}dB（按设备记忆）`);
+    } else if (cur.audio.autoGain !== false) {
+      void calibrateFirstUse(name);
+    } else {
+      toast(`已切换到「${label}」，增益从 0dB 起步`);
+    }
+  };
 
   // 读取系统端点音量 + 驱动硬件增益控件（仅 Windows）
   useEffect(() => {
@@ -304,9 +384,11 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
           '几乎检测不到信号：请检查 Windows 设置 → 系统 → 声音 → 输入 音量是否为 0、耳机是否硬件静音、以及 隐私和安全性 → 麦克风 是否允许桌面应用',
         );
       } else {
-        set('audio', { gainDb: r.suggestedDb });
+        setGainDb(r.suggestedDb);
         toast(
-          `原始峰值 ${r.peakPercent.toFixed(0)}%，已设置增益 ${r.suggestedDb}dB（保存后生效，可再跑完整测试验证）`,
+          `原始峰值 ${r.peakPercent.toFixed(0)}%，已为「${
+            cfg.audio.device ?? '系统默认'
+          }」设置增益 ${r.suggestedDb}dB（按设备记忆，保存后生效）`,
         );
       }
     } catch (e) {
@@ -694,10 +776,7 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
                     {row.ok && (
                       <button
                         type="button"
-                        onClick={() => {
-                          set('audio', { device: row.name });
-                          toast(`已选用「${row.name}」，保存后生效`);
-                        }}
+                        onClick={() => selectDevice(row.name)}
                         className={`shrink-0 rounded-md px-2 py-1 text-[11px] transition ${
                           isTop
                             ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
@@ -783,10 +862,11 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
             name="系统默认"
             spec="跟随操作系统当前选择的输入设备"
             selected={!cfg.audio.device}
-            onSelect={() => set('audio', { device: null })}
+            onSelect={() => selectDevice(null)}
             onQuick={() => void quick(null)}
             testing={quickTesting === null}
             result={quickResult['']}
+            gainDb={cfg.audio.gainDbByDevice?.[DEFAULT_DEVICE_KEY]}
           />
           {devices.map((d) => (
             <DeviceCard
@@ -795,10 +875,11 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
               spec={specText(d)}
               isDefault={d.isDefault}
               selected={cfg.audio.device === d.name}
-              onSelect={() => set('audio', { device: d.name })}
+              onSelect={() => selectDevice(d.name)}
               onQuick={() => void quick(d.name)}
               testing={quickTesting === d.name}
               result={quickResult[d.name]}
+              gainDb={cfg.audio.gainDbByDevice?.[d.name]}
             />
           ))}
           {/* 已保存但当前未枚举到的设备（无线接收器休眠/重枚举/刚重启）：
@@ -809,9 +890,10 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
                 name={cfg.audio.device}
                 spec="已保存 · 当前未检测到，设备就绪后自动恢复使用（录音会临时走系统默认）"
                 selected
-                onSelect={() => set('audio', { device: cfg.audio.device })}
+                onSelect={() => selectDevice(cfg.audio.device)}
                 onQuick={() => void quick(cfg.audio.device)}
                 testing={quickTesting === cfg.audio.device}
+                gainDb={cfg.audio.gainDbByDevice?.[cfg.audio.device]}
               />
             )}
           {devices.length === 0 && (
@@ -823,8 +905,10 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
       </Field>
 
       <Field
-        label={`麦克风增益（软件）：${cfg.audio.gainDb.toFixed(1)} dB / 上限 45dB`}
-        hint="原始信号弱（无线耳机常见）时用软件增益拉高；信号峰值到 40–70% 即可，过大可能放大底噪。增益本身不损失音质（上限内自动防削波）"
+        label={`麦克风增益（软件）· ${cfg.audio.device ?? '系统默认'}：${cfg.audio.gainDb.toFixed(
+          1,
+        )} dB / 上限 45dB`}
+        hint="每个设备独立记忆：切换麦克风自动换入对应增益。原始信号弱（无线耳机常见）时拉高；信号峰值到 40–70% 即可，过大可能放大底噪。增益本身不损失音质（上限内自动防削波）"
       >
         <div className="flex items-center gap-3">
           <input
@@ -833,7 +917,7 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
             max={45}
             step={0.5}
             value={cfg.audio.gainDb}
-            onChange={(e) => set('audio', { gainDb: Number(e.target.value) })}
+            onChange={(e) => setGainDb(Number(e.target.value))}
             className="min-w-0 flex-1"
           />
           <Button onClick={calibrate} disabled={calibrating}>
@@ -847,9 +931,16 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
           </Button>
         </div>
         <div className="mt-1.5 text-[11px] leading-5 text-slate-500">
-          校准方式：对麦克风正常说几句话（2.6 秒），自动将峰值校准到 ~60%
+          校准方式：对麦克风正常说几句话（2.6 秒），自动将峰值校准到 ~60%，结果按当前设备记忆
         </div>
       </Field>
+
+      <Toggle
+        checked={cfg.audio.autoGain !== false}
+        onChange={(autoGain) => set('audio', { autoGain })}
+        label="录音时自动增益（AGC）"
+        desc="输入过小且确有语音时自动提升、接近削波时回落；学到的增益按设备记忆，下次录音直接生效，不再重复爬升"
+      />
 
       {hasDji && (
         <div className="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] px-3.5 py-2.5 text-[11.5px] leading-5 text-amber-200/80">

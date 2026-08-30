@@ -61,8 +61,15 @@ pub struct AudioConfig {
     pub vad_silence_ms: u64,
     pub vad_threshold: f32,
     pub max_duration_sec: u64,
-    /// 软件输入增益（dB，0~30）。用于系统输入电平过低的设备（如部分无线耳机）
+    /// 软件输入增益（dB，0~45）。用于系统输入电平过低的设备（如部分无线耳机）。
+    /// 始终等于「当前所选设备」的增益；切换设备时由前端按映射换入对应值。
     pub gain_db: f32,
+    /// 各输入设备独立记住的软件增益（键 = 设备名，"__default__" = 系统默认模式）
+    pub gain_db_by_device: std::collections::BTreeMap<String, f32>,
+    /// 录音期自动增益：输入过小且确有语音时逐步提升、接近削波时回落，
+    /// 学到的值录音结束后写回该设备的记忆增益；旧配置缺省时默认开启
+    #[serde(default = "default_true")]
+    pub auto_gain: bool,
 }
 
 impl Default for AudioConfig {
@@ -74,6 +81,8 @@ impl Default for AudioConfig {
             vad_threshold: 0.012,
             max_duration_sec: 120,
             gain_db: 0.0,
+            gain_db_by_device: std::collections::BTreeMap::new(),
+            auto_gain: true,
         }
     }
 }

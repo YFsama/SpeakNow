@@ -19,6 +19,7 @@ import type {
   Stage,
   TabId,
 } from './types';
+import { DEFAULT_DEVICE_KEY } from './types';
 import { Spinner } from './components/Controls';
 import Dashboard from './components/Dashboard';
 import {
@@ -123,11 +124,40 @@ export default function App() {
     const un3 = listen('sn-models-changed', () => {
       builtinModels().then(setLocalModels);
     });
+    // 录音期 AGC 学到的增益：按设备写回记忆；若正是当前所用设备则同步滑杆
+    const un4 = listen<{ device: string | null; gainDb: number }>(
+      'sn-gain-learned',
+      (e) => {
+        const { device, gainDb } = e.payload;
+        const key = device ?? DEFAULT_DEVICE_KEY;
+        const cur = cfgRef.current;
+        const isCurrent = !!cur && (cur.audio.device ?? null) === (device ?? null);
+        const known = cur?.audio.gainDbByDevice?.[key];
+        const unchanged =
+          known !== undefined &&
+          Math.abs(known - gainDb) < 0.1 &&
+          (!isCurrent || Math.abs(cur.audio.gainDb - gainDb) < 0.1);
+        if (unchanged) return;
+        if (isCurrent) setToast(`🎧 已自动记忆本设备增益 ${gainDb.toFixed(1)}dB`);
+        setCfg((c) => {
+          if (!c) return c;
+          return {
+            ...c,
+            audio: {
+              ...c.audio,
+              gainDb: isCurrent ? gainDb : c.audio.gainDb,
+              gainDbByDevice: { ...(c.audio.gainDbByDevice ?? {}), [key]: gainDb },
+            },
+          };
+        });
+      },
+    );
     return () => {
       if (idleTimer) clearTimeout(idleTimer);
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
+      un4.then((f) => f());
     };
   }, []);
 

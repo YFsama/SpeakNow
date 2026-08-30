@@ -11,14 +11,21 @@ export interface HotkeyConfig {
   enabled: boolean;
 }
 
+/** 「系统默认输入」模式在按设备增益映射中的键 */
+export const DEFAULT_DEVICE_KEY = '__default__';
+
 export interface AudioConfig {
   device: string | null;
   vadEnabled: boolean;
   vadSilenceMs: number;
   vadThreshold: number;
   maxDurationSec: number;
-  /** 软件输入增益（dB，0~30） */
+  /** 软件输入增益（dB，0~45）；始终等于当前所选设备的增益 */
   gainDb: number;
+  /** 各设备独立记住的软件增益（键 = 设备名，"__default__" = 系统默认模式）；旧配置缺省为空 */
+  gainDbByDevice?: Record<string, number>;
+  /** 录音期自动增益：输入过小自动提升、接近削波回落，学到的值按设备记忆 */
+  autoGain?: boolean;
 }
 
 export interface AsrConfig {

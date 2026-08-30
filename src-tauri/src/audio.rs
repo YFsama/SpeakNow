@@ -23,6 +23,9 @@ pub struct Shared {
     last_voice_ms: AtomicU64,
     /// 各原始声道独立峰值（诊断用）
     channel_peaks: Mutex<Vec<f32>>,
+    /// 当前软件增益（线性 × 1000）。存原子量：录音期间 AGC 可实时调节，
+    /// cpal 回调每个音频块重新读取，避免重建音频流
+    gain_milli: AtomicU32,
 }
 
 impl Shared {
@@ -31,6 +34,16 @@ impl Shared {
     }
     pub fn level(&self) -> f32 {
         self.level.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+    /// 当前软件增益（dB）
+    pub fn gain_db(&self) -> f32 {
+        let g = self.gain_milli.load(Ordering::Relaxed) as f32 / 1000.0;
+        20.0 * g.log10().max(0.0)
+    }
+    /// 运行期调节软件增益（dB，< 0 按 0 处理）
+    pub fn set_gain_db(&self, db: f32) {
+        let g = 10f32.powf(db.max(0.0) / 20.0) * 1000.0;
+        self.gain_milli.store(g as u32, Ordering::Relaxed);
     }
     pub fn silence_ms(&self) -> u64 {
         self
@@ -185,11 +198,12 @@ pub fn start(
         level: AtomicU32::new(0),
         last_voice_ms: AtomicU64::new(0),
         channel_peaks: Mutex::new(Vec::new()),
+        gain_milli: AtomicU32::new(1000),
     });
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
     let dev_name = device.map(str::to_string);
-    let gain = 10f32.powf(gain_db.max(0.0) / 20.0);
+    shared.set_gain_db(gain_db);
 
     let thread_shared = shared.clone();
     let thread_flag = stop_flag.clone();
@@ -211,9 +225,7 @@ pub fn start(
                     &config,
                     {
                         let s = thread_shared.clone();
-                        move |data: &[f32], _| {
-                            push_block(data, &s, channels, vad_threshold, gain)
-                        }
+                        move |data: &[f32], _| push_block(data, &s, channels, vad_threshold)
                     },
                     err_fn,
                     None,
@@ -225,7 +237,7 @@ pub fn start(
                         move |data: &[i16], _| {
                             let conv: Vec<f32> =
                                 data.iter().map(|v| *v as f32 / 32768.0).collect();
-                            push_block(&conv, &s, channels, vad_threshold, gain);
+                            push_block(&conv, &s, channels, vad_threshold);
                         }
                     },
                     err_fn,
@@ -240,7 +252,7 @@ pub fn start(
                                 .iter()
                                 .map(|v| (*v as f32 - 32768.0) / 32768.0)
                                 .collect();
-                            push_block(&conv, &s, channels, vad_threshold, gain);
+                            push_block(&conv, &s, channels, vad_threshold);
                         }
                     },
                     err_fn,
@@ -284,14 +296,8 @@ pub fn start(
 }
 
 /// 多声道 → 单声道：逐帧取绝对值最大的通道（防止信号只在一个声道或差分信号被平均稀释/抵消）；
-/// 同时应用增益、更新电平、VAD 与各声道独立峰值
-fn push_block(
-    data: &[f32],
-    shared: &Shared,
-    channels: u32,
-    vad_threshold: f32,
-    gain: f32,
-) {
+/// 同时应用增益（每个块重新读取，支持录音期 AGC 实时调节）、更新电平、VAD 与各声道独立峰值
+fn push_block(data: &[f32], shared: &Shared, channels: u32, vad_threshold: f32) {
     if data.is_empty() {
         return;
     }
@@ -326,6 +332,7 @@ fn push_block(
             })
             .collect()
     };
+    let gain = shared.gain_milli.load(Ordering::Relaxed) as f32 / 1000.0;
     if (gain - 1.0).abs() > 1e-4 {
         for s in mono.iter_mut() {
             *s = (*s * gain).clamp(-1.0, 1.0);
