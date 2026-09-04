@@ -1232,7 +1232,7 @@ export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: Tab
           </div>
           <Field
             label="ASR 热词（专业行业字库）"
-            hint="每行一个或用逗号分隔。GLM-ASR 等支持热词的模型会显著提升专有名词、行业术语的识别准确率（最多 100 个）"
+            hint="每行一个或用逗号分隔。GLM-ASR 等支持热词的模型会显著提升专有名词、行业术语的识别准确率（最多 100 个）。「AI 优化」页术语表中的术语会自动并入，无需重复填写"
           >
             <TextArea
               rows={3}
@@ -1631,13 +1631,13 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
           </Field>
           <Field
             label="术语表（纠错词库）"
-            hint="纠正结果会优先采用以下写法，适合团队黑话、项目代号、专业名词"
+            hint="每行一个术语，纠正结果优先采用。可声明常见误识形式（用 = 和 | 分隔），命中时强制纠正，如：Rust=拉斯特|拉斯。用智谱 ASR 时术语还会自动并入识别热词，从源头减少误识别"
           >
             <TextArea
               rows={3}
               value={cfg.llm.glossary}
               onChange={(glossary) => set('llm', { glossary })}
-              placeholder={'Tauri\n低代码平台\n增量训练'}
+              placeholder={'Tauri\nRust=拉斯特|拉斯\n低代码平台'}
             />
           </Field>
           <Field

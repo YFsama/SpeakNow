@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::config::AsrConfig;
 use crate::local_whisper;
@@ -75,7 +75,48 @@ pub async fn transcribe(
     if provider == "mimo" {
         return transcribe_mimo_chunked(cfg, samples).await;
     }
-    transcribe_http_chunked(cfg, samples).await
+    // GLM-ASR 热词联动：AI 术语表的规范写法自动并入 ASR 热词——
+    // 专有名词在识别源头就倾向于正确写法，比事后靠 LLM 纠正可靠得多。
+    // 仅对智谱接口启用：其余兼容接口对多余表单字段的容忍度未知。
+    let mut http_cfg = cfg.clone();
+    if http_cfg.base_url.to_lowercase().contains("bigmodel") {
+        let glossary = app
+            .state::<crate::Ctx>()
+            .config
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default()
+            .llm
+            .glossary;
+        if !glossary.trim().is_empty() {
+            http_cfg.hotwords = merge_hotwords(&http_cfg.hotwords, &glossary);
+        }
+    }
+    transcribe_http_chunked(&http_cfg, samples).await
+}
+
+/// 合并 ASR 热词与 LLM 术语表（术语行取「=」左侧的规范写法），去重、上限 100
+fn merge_hotwords(existing: &str, glossary: &str) -> String {
+    let glossary_terms = glossary
+        .lines()
+        .map(|l| l.split('=').next().unwrap_or("").trim());
+    let mut seen: Vec<String> = Vec::new();
+    let mut merged: Vec<&str> = Vec::new();
+    for term in existing
+        .split(|c| c == '\n' || c == ',' || c == '，')
+        .map(str::trim)
+        .chain(glossary_terms)
+    {
+        if term.is_empty() || merged.len() >= 100 {
+            continue;
+        }
+        if !seen.iter().any(|s| s.eq_ignore_ascii_case(term)) {
+            seen.push(term.to_lowercase());
+            merged.push(term);
+        }
+    }
+    merged.join("\n")
 }
 
 /// 小米 MiMo-V2.5-ASR：OpenAI Chat Completions 兼容（input_audio base64）
@@ -281,4 +322,20 @@ fn extract_text(body: &str) -> anyhow::Result<String> {
         return Ok(t.to_string());
     }
     bail!("ASR 响应中没有文本字段: {}", truncate(body.trim(), 120))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_hotwords;
+
+    #[test]
+    fn merge_dedups_and_strips_aliases() {
+        assert_eq!(
+            merge_hotwords("Kubernetes\n", "Rust=拉斯特|拉斯\nkubernetes\n低代码平台"),
+            "Kubernetes\nRust\n低代码平台"
+        );
+        // 空白与逗号分隔均可
+        assert_eq!(merge_hotwords("A, B", "C"), "A\nB\nC");
+        assert_eq!(merge_hotwords("", ""), "");
+    }
 }
