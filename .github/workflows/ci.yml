@@ -57,13 +57,15 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Rust compile check (incl. examples)
+        shell: bash
         run: |
-          set -o pipefail
-          if ! cargo check --locked --lib --examples 2>&1 | tee check.log; then
-            # 失败时把编译错误提升为注解：公开仓库的原始日志需登录才能拉取，
-            # 而 check-runs 注解 API 匿名可读——无凭据排查的主要通道
-            grep -E '^error' -A 4 check.log | head -60 | sed 's/^--$/·····/' | while IFS= read -r line; do
-              echo "::error::$(printf %s "$line" | cut -c1-500)"
+          if cargo check --locked --lib --examples > check.log 2>&1; then
+            echo "cargo check passed"
+          else
+            # 失败时把错误摘要与日志尾部提升为注解：公开仓库的原始日志需登录
+            # 才能拉取，而 check-runs 注解 API 匿名可读——无凭据排查的主通道
+            { grep -E '^error' check.log | head -8 || true; echo '····· tail ·····'; tail -8 check.log; } | while IFS= read -r l; do
+              echo "::error::$(printf %s "$l" | cut -c1-500)"
             done
             exit 1
           fi
