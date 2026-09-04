@@ -98,13 +98,16 @@ npm run tauri dev
 ### 打包成品
 
 ```bash
-npm run tauri build            # Windows 下生成 NSIS 安装包
+npm run tauri build            # Windows 下生成 NSIS 安装包；macOS 下生成 .app + .dmg
 ```
 
 产物位置：
 
-- 安装包：`src-tauri/target/release/bundle/nsis/SpeakNow_0.4.5_x64-setup.exe`
-- 绿色单文件：`src-tauri/target/release/speaknow.exe`（免安装直接运行）
+- Windows 安装包：`src-tauri/target/release/bundle/nsis/SpeakNow_0.4.6_x64-setup.exe`
+- Windows 绿色单文件：`src-tauri/target/release/speaknow.exe`（免安装直接运行）
+- macOS：`src-tauri/target/release/bundle/dmg/SpeakNow_0.4.6_aarch64.dmg`
+
+各平台安装包（含 macOS Apple Silicon DMG）也可直接从 [Releases](https://github.com/YFsama/SpeakNow/releases) 下载。macOS 的权限授权与 Gatekeeper 说明见 [docs/macos.md](./docs/macos.md)。
 
 版本历史与各版本变更详见 [CHANGELOG.md](./CHANGELOG.md)（应用内「关于」页也可查看更新记录）。
 

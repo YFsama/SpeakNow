@@ -1,9 +1,10 @@
 name: CI & Release
 
-# Every push/PR runs checks (typecheck, cargo check, unit tests).
-# Publishing is fully automated: when a push to main carries a version
-# (src-tauri/tauri.conf.json) that has no GitHub Release yet, the publish job
-# builds the NSIS installer, creates the tag, and publishes a Release with
+# Every push/PR runs checks (typecheck, cargo check, unit tests) on Windows
+# and macOS. Publishing is fully automated: when a push to main carries a
+# version (src-tauri/tauri.conf.json) that has no GitHub Release yet, each
+# platform leg of the publish matrix builds its bundles (Windows NSIS
+# installer, macOS aarch64 DMG) and uploads them to the same Release, with
 # notes taken from the matching CHANGELOG.md section.
 #
 # Releasing a version:
@@ -29,8 +30,12 @@ concurrency:
 
 jobs:
   check:
-    runs-on: windows-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -64,8 +69,18 @@ jobs:
     if: github.event_name != 'pull_request'
     permissions:
       contents: write
-    runs-on: windows-latest
-    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: NSIS installer (.exe)
+          - os: windows-latest
+            args: ""
+          # macOS: Apple Silicon (aarch64) .app + .dmg
+          - os: macos-latest
+            args: "--target aarch64-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -111,8 +126,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      # aarch64-apple-darwin is only needed on the macOS leg; installing the
+      # extra std on Windows is harmless and keeps one shared step.
       - uses: dtolnay/rust-toolchain@stable
         if: steps.version.outputs.published == 'false'
+        with:
+          targets: aarch64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         if: steps.version.outputs.published == 'false'
@@ -135,3 +154,4 @@ jobs:
           releaseCommitish: ${{ github.sha }}
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
