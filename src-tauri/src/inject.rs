@@ -485,12 +485,17 @@ fn new_enigo() -> Result<Enigo> {
 
 fn send_paste_key(paste_key: &str) -> Result<()> {
     let mut e = new_enigo()?;
+    // Shift+Insert 是 Windows/Linux 终端的粘贴键；macOS 键盘没有 Insert 键
+    // （enigo 的 mac 后端也没有 Key::Insert 变体），该配置在 mac 上退回
+    // 系统标准粘贴键（下方 default 分支的 ⌘V）
+    #[cfg(target_os = "windows")]
+    if paste_key == "shift+insert" {
+        e.key(Key::Shift, Direction::Press)?;
+        e.key(Key::Insert, Direction::Click)?;
+        e.key(Key::Shift, Direction::Release)?;
+        return Ok(());
+    }
     match paste_key {
-        "shift+insert" => {
-            e.key(Key::Shift, Direction::Press)?;
-            e.key(Key::Insert, Direction::Click)?;
-            e.key(Key::Shift, Direction::Release)?;
-        }
         "ctrl+shift+v" => {
             // Windows Terminal / WSL / Unix 风格终端的标准粘贴键
             e.key(Key::Control, Direction::Press)?;

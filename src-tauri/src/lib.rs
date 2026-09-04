@@ -371,7 +371,8 @@ async fn mic_diagnose(device: Option<String>) -> Result<serde_json::Value, Strin
     let (system_privacy, app_privacy) = consent_status();
     let denied = |v: &str| v.eq_ignore_ascii_case("Deny");
 
-    // 系统端点音量（仅 Windows）
+    // 系统端点音量（仅 Windows）。非 Windows 分支的 None 需显式标注类型：
+    // 提供具体类型的 Windows 分支被编译掉后，推断无从进行
     let (sys_volume, sys_muted, sys_dev) = {
         #[cfg(target_os = "windows")]
         {
@@ -382,7 +383,7 @@ async fn mic_diagnose(device: Option<String>) -> Result<serde_json::Value, Strin
         }
         #[cfg(not(target_os = "windows"))]
         {
-            (None, false, None)
+            (None::<f32>, false, None::<String>)
         }
     };
 
