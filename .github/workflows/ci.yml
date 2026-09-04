@@ -62,9 +62,14 @@ jobs:
           if cargo check --locked --lib --examples > check.log 2>&1; then
             echo "cargo check passed"
           else
-            # 失败时把错误摘要与日志尾部提升为注解：公开仓库的原始日志需登录
-            # 才能拉取，而 check-runs 注解 API 匿名可读——无凭据排查的主通道
-            { grep -E '^error' check.log | head -8 || true; echo '····· tail ·····'; tail -8 check.log; } | while IFS= read -r l; do
+            # 失败时把错误提升为注解：公开仓库的原始日志需登录才能拉取，而
+            # check-runs 注解 API 匿名可读。short 格式输出 file:line 单行错误，
+            # 便于直接定位；tail 兜底捕捉 panic / OOM 等无 error 行的失败
+            strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+            { cargo check --locked --lib --message-format=short 2>&1 | strip | grep -E '(^|:) ?error' | head -10 || true
+              echo '····· tail ·····'
+              tail -6 check.log | strip
+            } | while IFS= read -r l; do
               echo "::error::$(printf %s "$l" | cut -c1-500)"
             done
             exit 1
