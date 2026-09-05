@@ -31,6 +31,12 @@ fn position_for_anchor(_t: &TargetInfo, _w: f64, _h: f64) -> Option<(f64, f64, b
     None
 }
 
+/// 前台窗口所在显示器的工作区与 DPI 缩放：((x, y, w, h), scale)
+#[cfg(not(target_os = "windows"))]
+pub fn foreground_monitor_work_area() -> Option<((f64, f64, f64, f64), f64)> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use super::TargetInfo;
@@ -38,7 +44,8 @@ mod imp {
     use windows::Win32::Foundation::{HWND, POINT, RECT};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::Graphics::Gdi::{
-        ClientToScreen, GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        ClientToScreen, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, SAFEARRAY, CLSCTX_ALL,
@@ -224,6 +231,42 @@ mod imp {
         None
     }
 
+    /// 前台窗口所在显示器的工作区（物理像素）与 DPI 缩放。
+    /// 光标锚点全部失败时的回退基准：卡片应落在「用户正在输入的那块屏」上；
+    /// 鼠标可能恰好停在另一块显示器上，按鼠标定位会把卡片弹到用户没在看的屏幕。
+    pub fn foreground_monitor_work_area() -> Option<((f64, f64, f64, f64), f64)> {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_invalid() {
+                return None;
+            }
+            let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+            if hmon.is_invalid() {
+                return None;
+            }
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                return None;
+            }
+            let mut ux = 96u32;
+            let mut uy = 96u32;
+            let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut ux, &mut uy);
+            let w = mi.rcWork;
+            Some((
+                (
+                    w.left as f64,
+                    w.top as f64,
+                    (w.right - w.left) as f64,
+                    (w.bottom - w.top) as f64,
+                ),
+                ux as f64 / 96.0,
+            ))
+        }
+    }
+
     /// 由锚点 + 悬浮窗逻辑尺寸计算物理坐标（贴合显示器工作区）
     /// 返回 (x, y, 是否放置在输入框上方)
     pub fn position_for_anchor(t: &TargetInfo, w: f64, h: f64) -> Option<(f64, f64, bool)> {
@@ -279,3 +322,5 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 use imp::{focused_anchor, position_for_anchor};
+#[cfg(target_os = "windows")]
+pub use imp::foreground_monitor_work_area;

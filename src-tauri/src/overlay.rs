@@ -10,7 +10,7 @@ fn mouse_location() -> Option<(i32, i32)> {
 }
 
 /// 显示状态悬浮窗（不抢占焦点）。定位优先级：
-/// 手动拖拽位置（本会话） → 光标/输入框锚点 → 鼠标所在屏底部 → 主屏底部
+/// 手动拖拽位置（本会话） → 光标/输入框锚点 → 前台窗口所在屏底部 → 鼠标所在屏底部 → 主屏底部
 pub fn show(app: &AppHandle) {
     let Some(win) = app.get_webview_window(OVERLAY_LABEL) else {
         return;
@@ -41,6 +41,21 @@ pub fn show(app: &AppHandle) {
                 "above": above,
             }),
         );
+        let _ = win.show();
+        return;
+    }
+
+    // 回退：前台窗口所在显示器底部居中。双屏场景鼠标常停在另一块屏上，
+    // 按鼠标定位会把卡片弹到用户没在看的显示器（表现为「提示音正常但框不弹」）
+    if let Some(((wx, wy, ww, wh), scale)) = crate::caret::foreground_monitor_work_area() {
+        let w = OVERLAY_W * scale;
+        let h = OVERLAY_H * scale;
+        let x = wx + ((ww - w) / 2.0).max(0.0);
+        let y = wy + (wh - h - 110.0 * scale).max(0.0);
+        let _ = win.set_position(tauri::PhysicalPosition::new(
+            x.round() as i32,
+            y.round() as i32,
+        ));
         let _ = win.show();
         return;
     }
