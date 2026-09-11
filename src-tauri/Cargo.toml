@@ -1,6 +1,6 @@
 [package]
 name = "speaknow"
-version = "0.4.6"
+version = "0.4.7"
 description = "语音输入助手：全局快捷键 → 大模型 ASR 转写 → AI 纠错优化 → 自动输入到任意输入框"
 authors = ["SpeakNow Contributors"]
 license = "MIT"
