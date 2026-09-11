@@ -507,3 +507,72 @@ html.light ::selection {
     visibility: hidden;
   }
 }
+
+/* ============ 悬浮窗边缘呈现（v2） ============
+   旧版问题：单层 70px 大模糊阴影从 0.7 alpha 缓降到 0——
+   ① 窗口两侧仅 10px 余量，阴影被窗口矩形硬切成锐利断层（浅色桌面尤其刺眼）；
+   ② 低 alpha 长尾经 8bit 通道量化，部分屏幕上形成同心环状色带。
+   新版：三层短焦分层阴影（衰减在 ~26px 内完成，量化步进不可感知）
+   + 与描边同色系的阶段色微光 + 外层 feather 遮罩把任何越界阴影沿窗口
+   边缘渐隐归零——无论 DPI/壁纸/缩放如何，都不会再出现硬切边或色带。 */
+
+/* 外层羽化遮罩：窗口最外 14px 内一切内容（含阴影）平滑衰减为全透明 */
+.overlay-feather {
+  --feather: 14px;
+  -webkit-mask-image:
+    linear-gradient(
+      to right,
+      transparent 0,
+      #000 var(--feather),
+      #000 calc(100% - var(--feather)),
+      transparent 100%
+    ),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--feather),
+      #000 calc(100% - var(--feather)),
+      transparent 100%
+    );
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(
+      to right,
+      transparent 0,
+      #000 var(--feather),
+      #000 calc(100% - var(--feather)),
+      transparent 100%
+    ),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--feather),
+      #000 calc(100% - var(--feather)),
+      transparent 100%
+    );
+  mask-composite: intersect;
+}
+
+/* 卡片边缘：1px 勾边 + 接触/近景/环境三层短焦阴影 + 阶段色微光 */
+.overlay-edge {
+  --stage-glow: rgba(56, 189, 248, 0.18);
+  box-shadow:
+    0 0 0 1px rgba(2, 6, 23, 0.22),
+    0 1px 2px rgba(2, 6, 23, 0.4),
+    0 4px 10px -2px rgba(2, 6, 23, 0.38),
+    0 14px 30px -10px rgba(2, 6, 23, 0.5),
+    0 0 20px -4px var(--stage-glow);
+  transition:
+    box-shadow 0.3s ease,
+    filter 0.3s ease;
+}
+
+.overlay-edge:hover {
+  filter: brightness(1.07);
+  box-shadow:
+    0 0 0 1px rgba(2, 6, 23, 0.24),
+    0 1px 2px rgba(2, 6, 23, 0.42),
+    0 5px 12px -2px rgba(2, 6, 23, 0.4),
+    0 18px 36px -10px rgba(2, 6, 23, 0.55),
+    0 0 26px -4px var(--stage-glow);
+}

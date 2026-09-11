@@ -1,12 +1,28 @@
 use tauri::{AppHandle, Manager};
 
 const OVERLAY_LABEL: &str = "overlay";
-const OVERLAY_W: f64 = 520.0;
+/// 悬浮窗基准逻辑尺寸。比卡片（500px）宽 60px，给两侧阴影各留 30px 完整渐隐空间，
+/// 避免阴影被透明窗口的矩形边界硬切出锐利断层
+const OVERLAY_W: f64 = 560.0;
 const OVERLAY_H: f64 = 320.0;
 
 fn mouse_location() -> Option<(i32, i32)> {
     use enigo::{Enigo, Mouse, Settings};
     Enigo::new(&Settings::default()).ok()?.location().ok()
+}
+
+/// 界面缩放后的实际窗口逻辑尺寸：前端用 body.zoom 缩放卡片并同步放大窗口，
+/// 定位与工作区夹紧必须按放大后的尺寸计算，否则大缩放下卡片会越出屏幕
+fn overlay_size(app: &AppHandle) -> (f64, f64) {
+    let scale = app
+        .state::<crate::Ctx>()
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().map(|c| f64::from(c.general.font_scale)))
+        .filter(|s| (0.5..=2.0).contains(s))
+        .unwrap_or(1.0);
+    (OVERLAY_W * scale, OVERLAY_H * scale)
 }
 
 /// 显示状态悬浮窗（不抢占焦点）。定位优先级：
@@ -28,7 +44,8 @@ pub fn show(app: &AppHandle) {
     }
 
     // 优先：贴近正在输入的输入框（ZCode/Codex 等聊天式输入框上方）
-    if let Some(((x, y, above), title)) = crate::caret::overlay_position(OVERLAY_W, OVERLAY_H) {
+    let (ov_w, ov_h) = overlay_size(app);
+    if let Some(((x, y, above), title)) = crate::caret::overlay_position(ov_w, ov_h) {
         let _ = win.set_position(tauri::PhysicalPosition::new(
             x.round() as i32,
             y.round() as i32,
@@ -48,8 +65,8 @@ pub fn show(app: &AppHandle) {
     // 回退：前台窗口所在显示器底部居中。双屏场景鼠标常停在另一块屏上，
     // 按鼠标定位会把卡片弹到用户没在看的显示器（表现为「提示音正常但框不弹」）
     if let Some(((wx, wy, ww, wh), scale)) = crate::caret::foreground_monitor_work_area() {
-        let w = OVERLAY_W * scale;
-        let h = OVERLAY_H * scale;
+        let w = ov_w * scale;
+        let h = ov_h * scale;
         let x = wx + ((ww - w) / 2.0).max(0.0);
         let y = wy + (wh - h - 110.0 * scale).max(0.0);
         let _ = win.set_position(tauri::PhysicalPosition::new(
@@ -89,8 +106,8 @@ pub fn show(app: &AppHandle) {
         }
     }
     if let Some((sw, sh)) = screen {
-        let x = ((sw - OVERLAY_W) / 2.0).max(0.0);
-        let y = (sh - OVERLAY_H - 110.0).max(0.0);
+        let x = ((sw - ov_w) / 2.0).max(0.0);
+        let y = (sh - ov_h - 110.0).max(0.0);
         let _ = win.set_position(tauri::LogicalPosition::new(x, y));
     }
     let _ = win.show();

@@ -27,7 +27,7 @@
         "label": "overlay",
         "title": "SpeakNow",
         "url": "overlay.html",
-        "width": 520,
+        "width": 560,
         "height": 320,
         "visible": false,
         "decorations": false,

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import type { Config, MetaPayload, Stage } from '../types';
@@ -16,13 +16,28 @@ import {
 
 const BAR_COUNT = 26;
 const COUNTDOWN_MS = 3200;
-const WIN_NORMAL = { w: 520, h: 320 };
-const WIN_REVIEW = { w: 560, h: 420 };
+/* 窗口须比卡片宽出两圈完整阴影余量（两侧各 30px）：
+   旧版 520 窗口装 500 卡片，仅 10px 余量，阴影被窗口矩形硬切出不自然断层 */
+const WIN_NORMAL = { w: 560, h: 320 };
+const WIN_REVIEW = { w: 600, h: 420 };
+const CARD_W_REVIEW = 540;
 
 const MODE_LABELS: Record<string, string> = {
   correct: '仅纠错',
   polish: '纠错 + 润色',
   prompt: '编程指令',
+};
+
+/* 阶段色微光（卡片外圈短焦光晕的颜色，与描边渐变同色系）：
+   取代旧版大范围灰色阴影——低透明长尾在 8bit alpha 量化下会出现色带，
+   且色相单一的暗灰晕在浅色桌面上观感浑浊 */
+const GLOW_COLORS: Record<string, string> = {
+  recording: 'rgba(244,63,94,0.22)',
+  transcribing: 'rgba(56,189,248,0.18)',
+  optimizing: 'rgba(129,140,248,0.22)',
+  done: 'rgba(52,211,153,0.20)',
+  error: 'rgba(239,68,68,0.22)',
+  review: 'rgba(251,191,36,0.20)',
 };
 
 /* ---- WebAudio 合成提示音（无资源文件依赖） ---- */
@@ -185,11 +200,16 @@ export default function Overlay() {
   const editorRef = useRef<HTMLTextAreaElement>(null);
   /* 重新优化期间把流式增量直接写回审阅编辑框 */
   const reoptStreamRef = useRef(false);
+  /* 界面缩放：body.zoom 放大卡片的同时窗口必须同步放大，否则卡片被窗口边缘裁切 */
+  const zoomRef = useRef(1);
+  const winSize = (w: number, h: number) =>
+    new LogicalSize(Math.round(w * zoomRef.current), Math.round(h * zoomRef.current));
 
   /* 悬浮窗固定深色玻璃风（不随浅色主题变白）；仅缩放跟随配置 */
   useEffect(() => {
     const apply = (c: Config) => {
-      document.body.style.zoom = String(c.general.fontScale || 1);
+      zoomRef.current = c.general.fontScale || 1;
+      document.body.style.zoom = String(zoomRef.current);
       setLlmEnabled(c.llm.enabled && !!c.llm.baseUrl.trim());
       setLlmMode(c.llm.mode);
     };
@@ -225,7 +245,7 @@ export default function Overlay() {
   useEffect(() => {
     const win = getCurrentWindow();
     if (stage === 'review') {
-      void win.setSize(new LogicalSize(WIN_REVIEW.w, WIN_REVIEW.h));
+      void win.setSize(winSize(WIN_REVIEW.w, WIN_REVIEW.h));
       setTimeout(() => editorRef.current?.focus(), 60);
     } else if (stageRef.current !== 'review') {
       // 其他阶段恢复默认尺寸
@@ -234,7 +254,7 @@ export default function Overlay() {
 
   useEffect(() => {
     if (stage !== 'review') {
-      void getCurrentWindow().setSize(new LogicalSize(WIN_NORMAL.w, WIN_NORMAL.h));
+      void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
     }
   }, [stage === 'review']);
 
@@ -244,7 +264,7 @@ export default function Overlay() {
   useEffect(() => {
     if (stage !== 'done' || !result) return;
     const h = Math.min(Math.max(196 + doneTextH, WIN_NORMAL.h), 560);
-    void getCurrentWindow().setSize(new LogicalSize(WIN_NORMAL.w, h));
+    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, h));
   }, [stage, result, doneTextH]);
 
   useEffect(() => {
@@ -403,16 +423,19 @@ export default function Overlay() {
 
   return (
     <div
-      className="flex h-screen w-screen items-start justify-center pt-4"
+      className="overlay-feather flex h-screen w-screen items-start justify-center pt-4"
       onClick={stage === 'review' ? undefined : dismissOverlay}
     >
       <div
         onMouseEnter={onEnter}
         onMouseLeave={onLeave}
-        className={`anim-pop relative w-[500px] rounded-[22px] bg-gradient-to-r ${glow} p-[1.5px] shadow-[0_24px_70px_-22px_rgba(2,6,23,0.7)] transition-all duration-300 ${
-          hovered ? 'brightness-[1.08] shadow-[0_28px_80px_-20px_rgba(2,6,23,0.75)]' : ''
-        }`}
-        style={stage === 'review' ? { width: WIN_REVIEW.w - 20 } : undefined}
+        className={`anim-pop overlay-edge relative w-[500px] rounded-[22px] bg-gradient-to-r ${glow} p-[1.5px]`}
+        style={
+          {
+            ...(stage === 'review' ? { width: CARD_W_REVIEW } : null),
+            '--stage-glow': GLOW_COLORS[stage] ?? GLOW_COLORS.transcribing,
+          } as CSSProperties
+        }
       >
         {/* 锚点箭头：指向下方输入框（卡片悬于输入框上方时） */}
         {stage !== 'review' && (
