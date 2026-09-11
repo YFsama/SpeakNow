@@ -28,7 +28,11 @@ fn parse_glossary(cfg: &LlmConfig) -> Vec<GlossaryEntry> {
             let (canonical, aliases) = match line.split_once('=') {
                 Some((c, a)) => (
                     c.trim().to_string(),
-                    a.split('|').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+                    a.split('|')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect(),
                 ),
                 None => (line.to_string(), Vec::new()),
             };
@@ -61,8 +65,13 @@ fn user_content(cfg: &LlmConfig, raw: &str) -> String {
 fn patch_message(raw: &str, prev: &str, missing: &[String], truncated: bool) -> String {
     let mut problems = String::new();
     if !missing.is_empty() {
-        let list = missing.iter().map(|m| format!("「{m}」")).collect::<String>();
-        problems.push_str(&format!("丢失或改写了原文中的关键词：{list}。把这些关键词按原文写法补回或恢复原样。"));
+        let list = missing
+            .iter()
+            .map(|m| format!("「{m}」"))
+            .collect::<String>();
+        problems.push_str(&format!(
+            "丢失或改写了原文中的关键词：{list}。把这些关键词按原文写法补回或恢复原样。"
+        ));
     }
     if truncated {
         problems.push_str(
@@ -82,12 +91,21 @@ fn patch_message(raw: &str, prev: &str, missing: &[String], truncated: bool) -> 
 /// 构造 chat/completions 请求体（流式 / 非流式共用）。
 /// 自定义指令存在时用户消息为指令模板（{text} 占位），系统提示改用中性版本，
 /// 避免模式指令（如「保持口语风格」）与用户意图（如「翻译成英文」）互相打架。
-fn request_body(cfg: &LlmConfig, user: &str, stream: bool) -> Value {
+/// `token_floor`：max_tokens 下限。思考型模型（GLM-4.5/4.6、Qwen3、R1 等）的
+/// 推理 token 同样计入 max_tokens——预算太小会被思考烧光、正文一字不出。
+/// `extra`：重试时附加的顶层参数（如关闭深度思考）。
+fn request_body(
+    cfg: &LlmConfig,
+    user: &str,
+    stream: bool,
+    token_floor: usize,
+    extra: Option<&Value>,
+) -> Value {
     let system = build_system_prompt(cfg);
     // 中文约 1 字 1 token；编程指令模式会整理成条目，膨胀更多，留出更大余量
     let factor = if cfg.mode == "prompt" { 3 } else { 2 };
-    let max_tokens = (400 + user.chars().count() * factor).min(8192);
-    serde_json::json!({
+    let max_tokens = (token_floor + user.chars().count() * factor).min(8192);
+    let mut body = serde_json::json!({
         "model": cfg.model,
         "messages": [
             { "role": "system", "content": system },
@@ -96,15 +114,105 @@ fn request_body(cfg: &LlmConfig, user: &str, stream: bool) -> Value {
         "temperature": if cfg.custom_prompt.trim().is_empty() && cfg.mode == "correct" { 0.1 } else { 0.2 },
         "max_tokens": max_tokens,
         "stream": stream
+    });
+    if let (Some(Value::Object(src)), Some(dst)) = (extra, body.as_object_mut()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    body
+}
+
+/// 单次调用的产出：正文 + 结束原因 + 是否流出了思考内容。
+/// 「思考烧尽预算」的判定依据：正文为空，且要么全程只见思考、要么以 length 截断。
+#[derive(Debug, Default)]
+struct ChatOutcome {
+    text: String,
+    finish_reason: Option<String>,
+    reasoning_seen: bool,
+}
+
+impl ChatOutcome {
+    fn thinking_starved(&self) -> bool {
+        self.text.trim().is_empty()
+            && (self.reasoning_seen || self.finish_reason.as_deref() == Some("length"))
+    }
+}
+
+/// 常规请求的 max_tokens 下限：智谱官方建议 ≥1024（低于此思考模型极易被思考耗尽）
+const TOKEN_FLOOR: usize = 1024;
+/// 烧尽重试的下限：给关闭思考后的正文留足空间（长文本编程指令整理等）
+const TOKEN_FLOOR_RETRY: usize = 4096;
+
+/// 关闭深度思考的参数（双字段强制版）：智谱 GLM-4.5+ 用 thinking.type，
+/// Qwen3 系（DashScope / SiliconFlow / vLLM）用 enable_thinking。
+/// 仅用于「思考烧尽」后的兜底重试——两个都带提高命中，不识别的网关会忽略。
+fn force_no_thinking_extra() -> Value {
+    serde_json::json!({
+        "thinking": { "type": "disabled" },
+        "enable_thinking": false
     })
+}
+
+/// 按模型选择关闭思考的字段：智谱 GLM 只认 thinking，Qwen3 系只认 enable_thinking，
+/// 各带各的，避免给单一网关塞进它不认识的字段。
+fn no_thinking_extra_for(model: &str) -> Value {
+    let m = model.to_lowercase();
+    if m.starts_with("qwen3") || m.starts_with("qwq") {
+        serde_json::json!({ "enable_thinking": false })
+    } else {
+        serde_json::json!({ "thinking": { "type": "disabled" } })
+    }
+}
+
+/// 快路径：语音纠错 / 润色是短文本机械任务，深度思考（GLM-4.6 动辄数百 token
+/// 推理）只会把首字延迟拖到数秒且随时烧尽预算——思考系模型首轮即关思考，
+/// 首字亚秒级、正文必出。编程指令模式（需结构整理）与未知模型不带参数，
+/// 保持原行为；烧尽兜底重试仍在。
+fn fast_path_no_thinking(cfg: &LlmConfig) -> Option<Value> {
+    if cfg.mode == "prompt" {
+        return None;
+    }
+    let m = cfg.model.to_lowercase();
+    if m.starts_with("glm") || m.starts_with("qwen3") || m.starts_with("qwq") {
+        Some(no_thinking_extra_for(&m))
+    } else {
+        None
+    }
+}
+
+/// 烧尽后的重试参数：思考型模型直接关思考（最快且必出正文）；
+/// 普通模型撞 length 上限则只放大预算。
+fn starved_retry_extra(o: &ChatOutcome) -> Value {
+    if o.reasoning_seen {
+        force_no_thinking_extra()
+    } else {
+        serde_json::json!({})
+    }
 }
 
 /// 把 ASR 原始转写交给大模型纠错/优化（非流式；设置页测试、历史重优化用）。
 /// 输出经过关键词对齐守卫：先做确定性的术语误识替换，仍有丢失时定点修补重试一次，
 /// 且只在修补版违规更少时采纳——重试绝不劣化结果。
 pub async fn optimize(cfg: &LlmConfig, raw: &str) -> anyhow::Result<String> {
-    let first = optimize_once(cfg, &user_content(cfg, raw)).await?;
-    let out = apply_alias_fixes(cfg, &first);
+    let user = user_content(cfg, raw);
+    // 思考系模型在纠错/润色任务首轮即关思考（快路径），烧尽兜底在后面
+    let fast = fast_path_no_thinking(cfg);
+    let mut outcome = chat_nostream(cfg, &user, TOKEN_FLOOR, fast.as_ref()).await?;
+    if outcome.thinking_starved() {
+        // 思考型模型把预算烧在推理上、正文为空：关思考重试（普通模型撞上限则放大预算）
+        eprintln!(
+            "[speaknow] 正文为空（finish={:?}, 思考={}），按烧尽策略重试",
+            outcome.finish_reason, outcome.reasoning_seen
+        );
+        let extra = starved_retry_extra(&outcome);
+        if let Ok(r) = chat_nostream(cfg, &user, TOKEN_FLOOR_RETRY, Some(&extra)).await {
+            if !r.thinking_starved() {
+                outcome = r;
+            }
+        }
+    }
+    let out = apply_alias_fixes(cfg, &outcome.text);
     let missing = guard_missing(cfg, raw, &out);
     let truncated = truncation_violation(cfg, raw, &out);
     if missing.is_empty() && !truncated {
@@ -112,9 +220,16 @@ pub async fn optimize(cfg: &LlmConfig, raw: &str) -> anyhow::Result<String> {
     }
     let score = missing.len() + truncated as usize;
     eprintln!("[speaknow] 对齐守卫：丢失关键词 {missing:?}、概括删减={truncated}，尝试定点修补");
-    match optimize_once(cfg, &patch_message(raw, &out, &missing, truncated)).await {
-        Ok(t) if !t.trim().is_empty() => {
-            let t = apply_alias_fixes(cfg, &t);
+    match chat_nostream(
+        cfg,
+        &patch_message(raw, &out, &missing, truncated),
+        TOKEN_FLOOR_RETRY,
+        None,
+    )
+    .await
+    {
+        Ok(t) if !t.text.trim().is_empty() => {
+            let t = apply_alias_fixes(cfg, &t.text);
             let t_score =
                 guard_missing(cfg, raw, &t).len() + truncation_violation(cfg, raw, &t) as usize;
             if t_score <= score {
@@ -128,8 +243,13 @@ pub async fn optimize(cfg: &LlmConfig, raw: &str) -> anyhow::Result<String> {
     }
 }
 
-/// 单次非流式请求
-async fn optimize_once(cfg: &LlmConfig, user: &str) -> anyhow::Result<String> {
+/// 单次非流式请求（守卫逻辑在外层包装）
+async fn chat_nostream(
+    cfg: &LlmConfig,
+    user: &str,
+    token_floor: usize,
+    extra: Option<&Value>,
+) -> anyhow::Result<ChatOutcome> {
     let base = cfg.base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         bail!("尚未配置 AI 优化接口地址");
@@ -142,20 +262,37 @@ async fn optimize_once(cfg: &LlmConfig, user: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.timeout_sec.max(5)))
         .build()?;
-    let mut req = client.post(&url).json(&request_body(cfg, user, false));
+    let mut req = client
+        .post(&url)
+        .json(&request_body(cfg, user, false, token_floor, extra));
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
     }
 
-    let resp = req.send().await.context("AI 优化请求失败，请检查网络或代理设置")?;
+    let mut resp = req
+        .send()
+        .await
+        .context("AI 优化请求失败，请检查网络或代理设置")?;
+    // 附加参数（关思考等）被严格校验未知字段的网关拒绝（4xx）时，去掉参数原样重发一次
+    if extra.is_some() && matches!(resp.status().as_u16(), 400 | 404 | 422) {
+        let mut retry = client
+            .post(&url)
+            .json(&request_body(cfg, user, false, token_floor, None));
+        if !cfg.api_key.trim().is_empty() {
+            retry = retry.bearer_auth(cfg.api_key.trim());
+        }
+        resp = retry
+            .send()
+            .await
+            .context("AI 优化请求失败，请检查网络或代理设置")?;
+    }
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         bail!("AI 服务返回 {}: {}", status, truncate(text.trim(), 300));
     }
 
-    let v: Value =
-        serde_json::from_str(&text).map_err(|_| anyhow!("AI 响应解析失败"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| anyhow!("AI 响应解析失败"))?;
     let content = v
         .get("choices")
         .and_then(|c| c.get(0))
@@ -163,7 +300,17 @@ async fn optimize_once(cfg: &LlmConfig, user: &str) -> anyhow::Result<String> {
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("AI 响应缺少 content: {}", truncate(&text, 200)))?;
-    Ok(clean(content))
+    Ok(ChatOutcome {
+        text: clean(content),
+        finish_reason: v
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reasoning_seen: v
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(Value::as_str)
+            .map_or(false, |s| !s.is_empty()),
+    })
 }
 
 /// 流式优化：SSE 逐 token 经 sn-llm-delta 事件推给悬浮窗（content 逐字上屏、
@@ -180,7 +327,58 @@ pub async fn optimize_streaming(
     first_token_ms: Option<&std::sync::atomic::AtomicU64>,
     superseded: Superseded<'_>,
 ) -> anyhow::Result<String> {
-    let first = stream_once(cfg, &user_content(cfg, raw), app, first_token_ms, superseded).await?;
+    let user = user_content(cfg, raw);
+    // 思考系模型在纠错/润色任务首轮即关思考（快路径）：语音输入首字延迟优先，
+    // 深度思考对这类短文本机械修正收益甚微，还随时烧尽 max_tokens 预算
+    let fast = fast_path_no_thinking(cfg);
+    let mut outcome = stream_once(
+        cfg,
+        &user,
+        app,
+        first_token_ms,
+        superseded,
+        TOKEN_FLOOR,
+        fast.as_ref(),
+    )
+    .await?;
+    if outcome.thinking_starved() {
+        // 被新录音取代则不再耗费重试流量
+        if superseded.map_or(false, |f| f()) {
+            bail!("已被新的录音取代，中止本次优化");
+        }
+        // 思考型模型把 max_tokens 烧在推理上、正文一字未出（悬浮窗里只见思考）——
+        // 关闭深度思考重试；普通模型撞 length 上限则只放大预算
+        let why = if outcome.reasoning_seen {
+            "思考超出 token 预算，关闭深度思考重试"
+        } else {
+            "输出超长被截断，放大 token 预算重试"
+        };
+        crate::trace_pipeline(
+            app,
+            &format!("AI 正文为空（finish={:?}），{why}", outcome.finish_reason),
+        );
+        events::emit(
+            app,
+            "sn-llm-delta",
+            serde_json::json!({ "kind": "reasoning", "delta": format!("⚠ {why}…\n") }),
+        );
+        let extra = starved_retry_extra(&outcome);
+        match stream_once(
+            cfg,
+            &user,
+            app,
+            first_token_ms,
+            superseded,
+            TOKEN_FLOOR_RETRY,
+            Some(&extra),
+        )
+        .await
+        {
+            Ok(r) if !r.thinking_starved() => outcome = r,
+            _ => {}
+        }
+    }
+    let first = outcome.text;
     let out = apply_alias_fixes(cfg, &first);
     let missing = guard_missing(cfg, raw, &out);
     let truncated = truncation_violation(cfg, raw, &out);
@@ -194,7 +392,10 @@ pub async fn optimize_streaming(
     let score = missing.len() + truncated as usize;
     let mut why = String::new();
     if !missing.is_empty() {
-        let list = missing.iter().map(|m| format!("「{m}」")).collect::<String>();
+        let list = missing
+            .iter()
+            .map(|m| format!("「{m}」"))
+            .collect::<String>();
         why.push_str(&format!("丢失关键词 {list}"));
     }
     if truncated {
@@ -212,9 +413,19 @@ pub async fn optimize_streaming(
             "delta": format!("⚠ {why}，定点修补中…\n")
         }),
     );
-    match stream_once(cfg, &patch_message(raw, &out, &missing, truncated), app, first_token_ms, superseded).await {
-        Ok(t) if !t.trim().is_empty() => {
-            let t = apply_alias_fixes(cfg, &t);
+    match stream_once(
+        cfg,
+        &patch_message(raw, &out, &missing, truncated),
+        app,
+        first_token_ms,
+        superseded,
+        TOKEN_FLOOR_RETRY,
+        None,
+    )
+    .await
+    {
+        Ok(t) if !t.text.trim().is_empty() => {
+            let t = apply_alias_fixes(cfg, &t.text);
             let m2 = guard_missing(cfg, raw, &t);
             let t2 = truncation_violation(cfg, raw, &t);
             let t_score = m2.len() + t2 as usize;
@@ -237,17 +448,20 @@ pub async fn optimize_streaming(
 }
 
 /// 单次流式请求（守卫逻辑在外层包装）
+#[allow(clippy::too_many_arguments)]
 async fn stream_once(
     cfg: &LlmConfig,
     user: &str,
     app: &AppHandle,
     first_token_ms: Option<&std::sync::atomic::AtomicU64>,
     superseded: Superseded<'_>,
-) -> anyhow::Result<String> {
+    token_floor: usize,
+    extra: Option<&Value>,
+) -> anyhow::Result<ChatOutcome> {
     let t0 = std::time::Instant::now();
     let base = cfg.base_url.trim().trim_end_matches('/');
     if base.is_empty() || cfg.model.trim().is_empty() {
-        return optimize_once(cfg, user).await;
+        return chat_nostream(cfg, user, token_floor, extra).await;
     }
     let url = format!("{base}/chat/completions");
 
@@ -256,9 +470,11 @@ async fn stream_once(
         .build()
     {
         Ok(c) => c,
-        Err(_) => return optimize_once(cfg, user).await,
+        Err(_) => return chat_nostream(cfg, user, token_floor, extra).await,
     };
-    let mut req = client.post(&url).json(&request_body(cfg, user, true));
+    let mut req = client
+        .post(&url)
+        .json(&request_body(cfg, user, true, token_floor, extra));
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
     }
@@ -266,10 +482,12 @@ async fn stream_once(
     let mut resp = match req.send().await {
         Ok(r) if r.status().is_success() => r,
         // 不支持 stream 的网关等：静默回退非流式
-        _ => return optimize_once(cfg, user).await,
+        _ => return chat_nostream(cfg, user, token_floor, extra).await,
     };
 
     let mut acc = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut reasoning_seen = false;
     // 按字节缓冲、按完整行切分：多字节 UTF-8 字符可能被网络分块拦腰截断，
     // 逐 chunk 转字符串会产生乱码（U+FFFD）混进正文
     let mut buf: Vec<u8> = Vec::new();
@@ -294,12 +512,20 @@ async fn stream_once(
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
+            // 结束原因：length = 预算耗尽（思考型模型的推理烧光 max_tokens 是空正文主因）
+            if let Some(fr) = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                finish_reason = Some(fr.to_string());
+            }
             // 思考型模型先流 reasoning_content（推理过程），正文在 content
             if let Some(rc) = v
                 .pointer("/choices/0/delta/reasoning_content")
                 .and_then(Value::as_str)
             {
                 if !rc.is_empty() {
+                    reasoning_seen = true;
                     events::emit(
                         app,
                         "sn-llm-delta",
@@ -307,7 +533,10 @@ async fn stream_once(
                     );
                 }
             }
-            if let Some(c) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+            if let Some(c) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
                 if !c.is_empty() {
                     if let Some(ft) = first_token_ms {
                         if ft.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -331,9 +560,22 @@ async fn stream_once(
         bail!("已被新的录音取代，中止本次优化");
     }
     if acc.trim().is_empty() {
-        return optimize_once(cfg, user).await;
+        // 全程无任何产出（非思考、无结束原因）多为网关不支持流式输出——回退非流式；
+        // 有思考痕迹或 length 截断则原样上抛，交给外层「关思考重试」策略
+        if !reasoning_seen && finish_reason.is_none() {
+            return chat_nostream(cfg, user, token_floor, extra).await;
+        }
+        return Ok(ChatOutcome {
+            text: String::new(),
+            finish_reason,
+            reasoning_seen,
+        });
     }
-    Ok(clean(&acc))
+    Ok(ChatOutcome {
+        text: clean(&acc),
+        finish_reason,
+        reasoning_seen,
+    })
 }
 
 /* ================= 关键词对齐守卫 ================= */
@@ -342,17 +584,121 @@ async fn stream_once(
 /// 含中文口语里常被合法汉化的普通借词（code→代码、app→应用、web→网页、demo→演示、ppt→幻灯片）。
 /// 刻意不含否定与量化词（no / not / all / any / some），它们丢了会改变句意。
 const GUARD_WHITELIST: &[&str] = &[
-    "the", "a", "an", "and", "or", "but", "if", "because", "so", "that", "this", "these",
-    "those", "of", "to", "in", "on", "at", "for", "with", "by", "from", "into", "about",
-    "is", "am", "are", "was", "were", "be", "been", "being", "do", "does", "did",
-    "doing", "have", "has", "had", "will", "would", "can", "could", "should", "shall",
-    "may", "might", "must", "i", "you", "he", "she", "it", "we", "they", "me", "him",
-    "her", "us", "them", "my", "your", "his", "its", "our", "their", "here", "there",
-    "what", "which", "who", "when", "where", "why", "how", "than", "then", "too",
-    "very", "just", "also", "once", "again", "other", "such", "own", "same",
-    "ok", "okay", "yeah", "yep", "yup", "nope", "uh", "um", "oh", "wow", "hey",
-    "hi", "hello", "please", "thanks", "thank", "like", "really", "actually",
-    "basically", "literally", "maybe", "well", "code", "app", "web", "demo", "ppt",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "if",
+    "because",
+    "so",
+    "that",
+    "this",
+    "these",
+    "those",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "for",
+    "with",
+    "by",
+    "from",
+    "into",
+    "about",
+    "is",
+    "am",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "have",
+    "has",
+    "had",
+    "will",
+    "would",
+    "can",
+    "could",
+    "should",
+    "shall",
+    "may",
+    "might",
+    "must",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "him",
+    "her",
+    "us",
+    "them",
+    "my",
+    "your",
+    "his",
+    "its",
+    "our",
+    "their",
+    "here",
+    "there",
+    "what",
+    "which",
+    "who",
+    "when",
+    "where",
+    "why",
+    "how",
+    "than",
+    "then",
+    "too",
+    "very",
+    "just",
+    "also",
+    "once",
+    "again",
+    "other",
+    "such",
+    "own",
+    "same",
+    "ok",
+    "okay",
+    "yeah",
+    "yep",
+    "yup",
+    "nope",
+    "uh",
+    "um",
+    "oh",
+    "wow",
+    "hey",
+    "hi",
+    "hello",
+    "please",
+    "thanks",
+    "thank",
+    "like",
+    "really",
+    "actually",
+    "basically",
+    "literally",
+    "maybe",
+    "well",
+    "code",
+    "app",
+    "web",
+    "demo",
+    "ppt",
 ];
 
 /// 提取原文中的英文/数字词元（最大 [字母数字.] 连续段，去掉首尾句点）。
@@ -589,7 +935,9 @@ fn glossary_section(cfg: &LlmConfig) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
-    let mut s = String::from("用户术语表（规范写法；原文出现其同音/近音/分词变体时，必须纠正为该写法）：\n");
+    let mut s = String::from(
+        "用户术语表（规范写法；原文出现其同音/近音/分词变体时，必须纠正为该写法）：\n",
+    );
     for e in &entries {
         if e.aliases.is_empty() {
             s.push_str(&format!("- {}\n", e.canonical));
@@ -629,9 +977,7 @@ pub fn clean(s: &str) -> String {
             t = t[..p].trim();
         }
     }
-    let t = t.trim_matches(|c| {
-        matches!(c, '"' | '“' | '”' | '\'' | '‘' | '’' | '「' | '」' | '`')
-    });
+    let t = t.trim_matches(|c| matches!(c, '"' | '“' | '”' | '\'' | '‘' | '’' | '「' | '」' | '`'));
     t.trim().to_string()
 }
 
@@ -686,7 +1032,10 @@ mod tests {
     #[test]
     fn guard_catches_lost_numbers_and_versions() {
         let c = cfg("polish", "");
-        assert_eq!(guard_missing(&c, "版本 4.6 有问题", "版本有问题"), vec!["4.6"]);
+        assert_eq!(
+            guard_missing(&c, "版本 4.6 有问题", "版本有问题"),
+            vec!["4.6"]
+        );
         // 单个数字被书面化（3 → 三）不算丢失
         assert!(guard_missing(&c, "等 3 秒重试", "等三秒重试").is_empty());
     }
@@ -718,7 +1067,10 @@ mod tests {
         // 误识形式被正确纠正 → 通过
         assert!(guard_missing(&c, "我们在做低code平台", "我们在做低代码平台").is_empty());
         // 原文含规范写法但输出丢了 → 违规
-        assert_eq!(guard_missing(&c, "用 Rust 写的", "用某系统语言写的"), vec!["Rust"]);
+        assert_eq!(
+            guard_missing(&c, "用 Rust 写的", "用某系统语言写的"),
+            vec!["Rust"]
+        );
     }
 
     #[test]
@@ -757,7 +1109,10 @@ mod tests {
     fn alias_fixes_replace_misrecognition() {
         let c = cfg("polish", "Rust=拉斯特|拉斯");
         // 多处误识全部替换为规范写法
-        assert_eq!(apply_alias_fixes(&c, "用拉斯特和拉斯写的"), "用Rust和Rust写的");
+        assert_eq!(
+            apply_alias_fixes(&c, "用拉斯特和拉斯写的"),
+            "用Rust和Rust写的"
+        );
         // 已含规范写法（大小写不敏感）则不动——大小写规范化是模型的活
         assert_eq!(apply_alias_fixes(&c, "用 rust 写的"), "用 rust 写的");
         assert!(guard_missing(&c, "用 Rust 写的", "用 rust 写的").is_empty());
@@ -775,8 +1130,14 @@ mod tests {
 
     #[test]
     fn replace_ci_handles_multiple_and_case() {
-        assert_eq!(replace_ci("Tauri 和 tauri", "tauri", "Tauri"), "Tauri 和 Tauri");
-        assert_eq!(replace_ci("低code平台", "低code平台", "低代码平台"), "低代码平台");
+        assert_eq!(
+            replace_ci("Tauri 和 tauri", "tauri", "Tauri"),
+            "Tauri 和 Tauri"
+        );
+        assert_eq!(
+            replace_ci("低code平台", "低code平台", "低代码平台"),
+            "低代码平台"
+        );
         // 顺序非重叠替换：两个源匹配各替换一次
         assert_eq!(replace_ci("abab", "ab", "ba"), "baba");
     }
@@ -785,7 +1146,12 @@ mod tests {
 
     #[test]
     fn patch_message_carries_prev_output_and_keywords() {
-        let m = patch_message("用 Tauri 写的", "用桌面框架写的", &["tauri".to_string()], false);
+        let m = patch_message(
+            "用 Tauri 写的",
+            "用桌面框架写的",
+            &["tauri".to_string()],
+            false,
+        );
         assert!(m.contains("（原始转写）"));
         assert!(m.contains("用 Tauri 写的"));
         assert!(m.contains("（上一次的输出）"));
@@ -840,7 +1206,11 @@ mod tests {
         assert!(!truncation_violation(&polish, "这个方案可行吗", "可行"));
         // prompt 模式整理成条目会收缩，不判
         let prompt = cfg("prompt", "");
-        assert!(!truncation_violation(&prompt, "这个方案我觉得整体可行但是细节还要再讨论一下风险点和回滚方案", "可行"));
+        assert!(!truncation_violation(
+            &prompt,
+            "这个方案我觉得整体可行但是细节还要再讨论一下风险点和回滚方案",
+            "可行"
+        ));
     }
 
     #[test]
@@ -850,5 +1220,80 @@ mod tests {
         assert!(polish.contains("示例"));
         let correct = build_system_prompt(&cfg("correct", ""));
         assert!(correct.contains("宁可少改"));
+    }
+
+    /* ---- 思考预算与烧尽重试 ---- */
+
+    #[test]
+    fn request_body_has_token_floor_for_thinking_models() {
+        let c = cfg("polish", "");
+        // 短文本也保底 1024：思考型模型的推理 token 计入 max_tokens，
+        // 旧版 400+2×字数 会被思考烧光、正文一字不出
+        let body = request_body(&c, "修一下这句话", false, TOKEN_FLOOR, None);
+        assert!(body["max_tokens"].as_u64().unwrap() >= 1024);
+        // 附加参数并入请求体顶层
+        let extra = force_no_thinking_extra();
+        let body = request_body(&c, "修一下", false, TOKEN_FLOOR_RETRY, Some(&extra));
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["enable_thinking"], false);
+        assert_eq!(
+            body["max_tokens"].as_u64().unwrap(),
+            (TOKEN_FLOOR_RETRY + "修一下".chars().count() * 2) as u64
+        );
+    }
+
+    #[test]
+    fn fast_path_disables_thinking_for_known_reasoning_models() {
+        // GLM / Qwen3 系在纠错、润色、自定义指令模式下首轮即关思考
+        for mode in ["correct", "polish"] {
+            let mut c = cfg(mode, "");
+            c.model = "glm-4.6".into();
+            let e = fast_path_no_thinking(&c).unwrap();
+            assert_eq!(e["thinking"]["type"], "disabled");
+            c.model = "Qwen3-32B".into();
+            let e = fast_path_no_thinking(&c).unwrap();
+            assert_eq!(e["enable_thinking"], false);
+            c.custom_prompt = "把 {text} 翻译成英文".into();
+            assert!(fast_path_no_thinking(&c).is_some());
+        }
+        // 编程指令模式需要结构整理，保留思考
+        let mut c = cfg("prompt", "");
+        c.model = "glm-4.6".into();
+        assert!(fast_path_no_thinking(&c).is_none());
+        // 未知模型不带参数，避免严格网关拒绝
+        let c = cfg("polish", "");
+        assert!(fast_path_no_thinking(&c).is_none());
+    }
+
+    #[test]
+    fn thinking_starved_detection() {
+        let mk = |text: &str, fr: Option<&str>, seen: bool| ChatOutcome {
+            text: text.into(),
+            finish_reason: fr.map(str::to_string),
+            reasoning_seen: seen,
+        };
+        // 思考流了一堆、finish=length、正文为空 → 烧尽
+        assert!(mk("", Some("length"), true).thinking_starved());
+        // 只见思考、未见 finish → 同样烧尽
+        assert!(mk("", None, true).thinking_starved());
+        // 普通模型撞 length 上限 → 也是预算问题
+        assert!(mk("", Some("length"), false).thinking_starved());
+        // 正常产出 / 无思考痕迹的空响应（交给非流式回退）→ 不算
+        assert!(!mk("正文", Some("stop"), true).thinking_starved());
+        assert!(!mk("", None, false).thinking_starved());
+    }
+
+    #[test]
+    fn starved_retry_extra_disables_thinking_only_for_reasoning_models() {
+        let mk = |fr: Option<&str>, seen: bool| ChatOutcome {
+            text: String::new(),
+            finish_reason: fr.map(str::to_string),
+            reasoning_seen: seen,
+        };
+        // 思考型 → 关思考；普通模型撞上限 → 只放大预算（不带额外字段）
+        let thinking = starved_retry_extra(&mk(Some("length"), true));
+        assert_eq!(thinking["thinking"]["type"], "disabled");
+        let plain = starved_retry_extra(&mk(Some("length"), false));
+        assert!(plain.as_object().unwrap().is_empty());
     }
 }

@@ -21,6 +21,38 @@ pub fn truncate(s: &str, n: usize) -> String {
 /// 云端单段音频上限（智谱 GLM-ASR 等限制 30 秒，留 2 秒余量）
 const HTTP_CHUNK_SECS: usize = 28;
 
+/// 分段（流式 VAD 切段 / 长音频分段）识别结果的拼接：
+/// - 边界两侧已有标点 → 原样相连；
+/// - 拉丁字符边界 → 补空格（英文/中英混排）；
+/// - 其余（中文等）→ 补「，」。分段边界多为语义停顿（静音切分），
+///   空衔接会让两句直接粘连成一句，标点永远缺失。
+pub fn join_transcripts(parts: &[String]) -> String {
+    let punct = |c: char| "，,、；;。！!？?…~～".contains(c);
+    let mut out = String::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(p);
+            continue;
+        }
+        let ends_punct = out.chars().last().map_or(false, punct);
+        let starts_punct = p.chars().next().map_or(false, punct);
+        let latin_edge = out.chars().last().map_or(false, |c| c.is_ascii())
+            && p.chars().next().map_or(false, |c| c.is_ascii());
+        if !ends_punct && !starts_punct {
+            out.push(if latin_edge { ' ' } else { '，' });
+        } else if latin_edge && !starts_punct {
+            // 英文句点后仍需空格：End. Next 而非 End.Next
+            out.push(' ');
+        }
+        out.push_str(p);
+    }
+    out
+}
+
 /// 统一入口：按 provider 分发到 本地内置 Whisper 或 OpenAI 兼容云端接口
 pub async fn transcribe(
     app: &AppHandle,
@@ -49,7 +81,11 @@ pub async fn transcribe(
         let id = statuses
             .iter()
             .find(|m| m.id == cfg.local_model && m.downloaded)
-            .or_else(|| statuses.iter().find(|m| m.downloaded && m.kind.as_deref() != Some("qwen")))
+            .or_else(|| {
+                statuses
+                    .iter()
+                    .find(|m| m.downloaded && m.kind.as_deref() != Some("qwen"))
+            })
             .map(|m| m.id.clone())
             .ok_or_else(|| {
                 anyhow!("本地模型尚未下载：请在「识别设置」下载本地模型，或填写云端 API Key")
@@ -152,8 +188,7 @@ async fn transcribe_mimo_chunked(cfg: &AsrConfig, samples: &[i16]) -> anyhow::Re
             parts.push(text);
         }
     }
-    let joiner = if cfg.language == "en" { " " } else { "" };
-    Ok(parts.join(joiner))
+    Ok(join_transcripts(&parts))
 }
 
 /// 网络类失败自动重试一次；鉴权/参数类错误直接返回
@@ -202,9 +237,7 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
             } else {
                 format!("/{}", cfg.endpoint_path)
             };
-            let mut req = client
-                .post(format!("{base}{path}"))
-                .json(body);
+            let mut req = client.post(format!("{base}{path}")).json(body);
             if !cfg.api_key.trim().is_empty() {
                 req = req.bearer_auth(cfg.api_key.trim());
             }
@@ -253,11 +286,7 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!(
-            "ASR 服务返回 {}: {}",
-            status,
-            truncate(body.trim(), 300)
-        );
+        bail!("ASR 服务返回 {}: {}", status, truncate(body.trim(), 300));
     }
     extract_text(&body)
 }
@@ -265,7 +294,10 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
 /// 是否本机自建服务（whisper.cpp server 等，无需 Key，不做本地回退）
 fn is_local_server(base: &str) -> bool {
     let b = base.trim().to_lowercase();
-    b.contains("localhost") || b.contains("127.0.0.1") || b.contains("0.0.0.0") || b.contains("[::1]")
+    b.contains("localhost")
+        || b.contains("127.0.0.1")
+        || b.contains("0.0.0.0")
+        || b.contains("[::1]")
 }
 
 /// 超长录音自动分段识别再拼接
@@ -287,8 +319,7 @@ async fn transcribe_http_chunked(cfg: &AsrConfig, samples: &[i16]) -> anyhow::Re
             parts.push(t);
         }
     }
-    let joiner = if cfg.language == "en" { " " } else { "" };
-    Ok(parts.join(joiner))
+    Ok(join_transcripts(&parts))
 }
 
 fn extract_text(body: &str) -> anyhow::Result<String> {
@@ -326,7 +357,7 @@ fn extract_text(body: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_hotwords;
+    use super::{join_transcripts, merge_hotwords};
 
     #[test]
     fn merge_dedups_and_strips_aliases() {
@@ -337,5 +368,55 @@ mod tests {
         // 空白与逗号分隔均可
         assert_eq!(merge_hotwords("A, B", "C"), "A\nB\nC");
         assert_eq!(merge_hotwords("", ""), "");
+    }
+
+    #[test]
+    fn joins_zh_segments_inserting_comma_at_bare_boundaries() {
+        // 分段边界（VAD 静音切分处）多为语义停顿：无标点衔接时补「，」而非粘连
+        assert_eq!(
+            join_transcripts(&["今天讨论预算".into(), "下午继续聊方案".into()]),
+            "今天讨论预算，下午继续聊方案"
+        );
+        // 任一侧已有标点 → 原样相连
+        assert_eq!(
+            join_transcripts(&["今天讨论预算，".into(), "下午继续".into()]),
+            "今天讨论预算，下午继续"
+        );
+        assert_eq!(
+            join_transcripts(&["第一点。".into(), "第二点。".into()]),
+            "第一点。第二点。"
+        );
+    }
+
+    #[test]
+    fn joins_latin_segments_with_space() {
+        assert_eq!(
+            join_transcripts(&["hello there".into(), "how are you".into()]),
+            "hello there how are you"
+        );
+        // 句点后仍要有空格
+        assert_eq!(
+            join_transcripts(&["End.".into(), "Next one".into()]),
+            "End. Next one"
+        );
+        // 下一句以标点开头 → 不加空格
+        assert_eq!(
+            join_transcripts(&["hello".into(), ", world".into()]),
+            "hello, world"
+        );
+        // 中英混排边界按中文处理
+        assert_eq!(
+            join_transcripts(&["先说结论".into(), "then we move on".into()]),
+            "先说结论，then we move on"
+        );
+    }
+
+    #[test]
+    fn joins_skip_empty_parts() {
+        assert_eq!(
+            join_transcripts(&["".into(), "  ".into(), "正文".into()]),
+            "正文"
+        );
+        assert_eq!(join_transcripts(&[]), "");
     }
 }

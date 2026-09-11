@@ -30,7 +30,10 @@ pub fn toggle(app: &AppHandle, skip_llm: bool) {
     let now = now_ms();
     let last = LAST_TOGGLE_MS.load(Ordering::SeqCst);
     if last > 0 && now.saturating_sub(last) < 300 {
-        crate::trace_pipeline(app, &format!("toggle 忽略（{}ms 内重复，疑按键抖动）", now - last));
+        crate::trace_pipeline(
+            app,
+            &format!("toggle 忽略（{}ms 内重复，疑按键抖动）", now - last),
+        );
         return;
     }
     LAST_TOGGLE_MS.store(now, Ordering::SeqCst);
@@ -124,34 +127,22 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
 
 /// 流式分段消费者：按顺序识别队列中的分段并推送实时字幕
 async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig) {
-    let joiner = if asr_cfg.language == "en" { " " } else { "" };
     loop {
-        let seg = app
-            .state::<Ctx>()
-            .stream_queue
-            .lock()
-            .unwrap()
-            .pop_front();
+        let seg = app.state::<Ctx>().stream_queue.lock().unwrap().pop_front();
         match seg {
-            Some(samples) => {
-                match asr::transcribe(&app, &asr_cfg, &samples).await {
-                    Ok(t) if !t.trim().is_empty() => {
-                        let joined = {
-                            let state = app.state::<Ctx>();
-                            let mut texts = state.stream_texts.lock().unwrap();
-                            texts.push(t);
-                            texts.join(joiner)
-                        };
-                        events::emit(
-                            &app,
-                            "sn-partial",
-                            serde_json::json!({ "text": joined }),
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("[speaknow] 流式分段识别失败: {e:#}"),
+            Some(samples) => match asr::transcribe(&app, &asr_cfg, &samples).await {
+                Ok(t) if !t.trim().is_empty() => {
+                    let joined = {
+                        let state = app.state::<Ctx>();
+                        let mut texts = state.stream_texts.lock().unwrap();
+                        texts.push(t);
+                        asr::join_transcripts(&texts)
+                    };
+                    events::emit(&app, "sn-partial", serde_json::json!({ "text": joined }));
                 }
-            }
+                Ok(_) => {}
+                Err(e) => eprintln!("[speaknow] 流式分段识别失败: {e:#}"),
+            },
             None => {
                 if app.state::<Ctx>().stream_done.load(Ordering::SeqCst) {
                     app.state::<Ctx>()
@@ -365,7 +356,14 @@ fn watch(
 
 /// from_ui=true：由设置页触发（只复制结果，不模拟输入，避免打字打进出设置页）
 pub fn stop(app: &AppHandle, from_ui: bool) -> Result<(), String> {
-    crate::trace_pipeline(app, if from_ui { "stop（设置页）" } else { "stop" });
+    crate::trace_pipeline(
+        app,
+        if from_ui {
+            "stop（设置页）"
+        } else {
+            "stop"
+        },
+    );
     let state = app.state::<Ctx>();
     state.watcher_cancel.store(true, Ordering::SeqCst);
     let Some(rec) = state.recording.lock().unwrap().take() else {
@@ -417,7 +415,11 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, from_ui: bool) 
         let tail = rec.shared.take_range(cut);
         if !tail.is_empty() {
             let seg16 = audio::to_16k_i16(&tail, rate);
-            app.state::<Ctx>().stream_queue.lock().unwrap().push_back(seg16);
+            app.state::<Ctx>()
+                .stream_queue
+                .lock()
+                .unwrap()
+                .push_back(seg16);
         }
         app.state::<Ctx>().stream_done.store(true, Ordering::SeqCst);
     }
@@ -473,8 +475,7 @@ pub async fn process_audio(
         let joined = {
             let state = app.state::<Ctx>();
             let texts = state.stream_texts.lock().unwrap();
-            let joiner = if cfg.asr.language == "en" { " " } else { "" };
-            texts.join(joiner)
+            asr::join_transcripts(&texts)
         };
         if joined.trim().is_empty() {
             // 兜底：整段识别
@@ -491,8 +492,7 @@ pub async fn process_audio(
         Err(e) => {
             eprintln!("[speaknow] ASR 失败: {e:#}");
             // 保留音频供「重试」
-            *app.state::<Ctx>().last_audio.lock().unwrap() =
-                Some((samples.clone(), from_ui));
+            *app.state::<Ctx>().last_audio.lock().unwrap() = Some((samples.clone(), from_ui));
             events::emit(&app, "sn-retryable", serde_json::json!(true));
             finish_status(
                 &app,
@@ -533,8 +533,7 @@ pub async fn process_audio(
     };
 
     if raw.trim().is_empty() {
-        *app.state::<Ctx>().last_audio.lock().unwrap() =
-            Some((samples.clone(), from_ui));
+        *app.state::<Ctx>().last_audio.lock().unwrap() = Some((samples.clone(), from_ui));
         events::emit(&app, "sn-retryable", serde_json::json!(true));
         finish_status(
             &app,
@@ -552,13 +551,7 @@ pub async fn process_audio(
     // 会话已过期：新录音已开始，本代结果不再输入（防止旧文本晚到覆盖新输入）
     if gen != app.state::<Ctx>().run_gen.load(Ordering::SeqCst) {
         crate::trace_pipeline(&app, &format!("识别完成但已过期（gen {gen}），跳过输入"));
-        finish_status(
-            &app,
-            "done",
-            "已跳过（已被新的录音取代）",
-            2000,
-            false,
-        );
+        finish_status(&app, "done", "已跳过（已被新的录音取代）", 2000, false);
         return;
     }
 
@@ -575,7 +568,20 @@ pub async fn process_audio(
         match llm::optimize_streaming(&cfg.llm, &raw, &app, Some(&first_token), Some(&stale)).await
         {
             Ok(t) if !t.trim().is_empty() => final_text = t,
-            Ok(_) => {}
+            Ok(_) => {
+                // 空正文（思考烧尽预算且重试仍空 / 模型异常）：不再静默吞掉，让用户知道为何是原文
+                crate::trace_pipeline(
+                    &app,
+                    "AI 优化返回空正文（思考超限或模型异常），使用原始识别结果",
+                );
+                emit_status(
+                    &app,
+                    "optimizing",
+                    "AI 未返回正文，使用原始识别结果…",
+                    false,
+                );
+                thread::sleep(Duration::from_millis(700));
+            }
             Err(e) => {
                 // 被新录音取代：直接放弃本代结果，不再回退输入旧文本
                 if app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen {
@@ -607,7 +613,10 @@ pub async fn process_audio(
         );
         crate::trace_pipeline(
             &app,
-            &format!("耗时对比｜识别 {asr_ms}ms｜优化 {llm_ms}ms（首字 {llm_first_ms}ms）｜合计 {}ms", asr_ms + llm_ms),
+            &format!(
+                "耗时对比｜识别 {asr_ms}ms｜优化 {llm_ms}ms（首字 {llm_first_ms}ms）｜合计 {}ms",
+                asr_ms + llm_ms
+            ),
         );
     }
 
@@ -617,6 +626,10 @@ pub async fn process_audio(
         finish_status(&app, "done", "已跳过（已被新的录音取代）", 2000, false);
         return;
     }
+
+    // 输出前的确定性标点规整：紧邻汉字的半角标点全角化、中英文之间补空格。
+    // 对 LLM 输出与快速模式原文一视同仁——这类格式问题不该依赖模型自觉
+    let final_text = crate::text_clean::tidy_punct(&final_text);
 
     if from_ui {
         let _ = inject::copy_only(&final_text);
@@ -649,8 +662,18 @@ pub async fn process_audio(
         return;
     }
 
-    finish_and_input(&app, &cfg, &raw, &final_text, asr_ms, llm_ms, gen, llm_first_ms, duration_secs)
-        .await;
+    finish_and_input(
+        &app,
+        &cfg,
+        &raw,
+        &final_text,
+        asr_ms,
+        llm_ms,
+        gen,
+        llm_first_ms,
+        duration_secs,
+    )
+    .await;
 }
 
 /// 直接输入路径（历史 + 事件 + 粘贴）。gen 为本代会话代数：粘贴前若已有
@@ -682,7 +705,11 @@ pub async fn finish_and_input(
     );
 
     if cfg.output.auto_paste {
-        let undo_hint = if cfg!(target_os = "macos") { "⌘Z" } else { "Ctrl+Z" };
+        let undo_hint = if cfg!(target_os = "macos") {
+            "⌘Z"
+        } else {
+            "Ctrl+Z"
+        };
         let ok_msg = if cfg.output.method == "clipboard" {
             format!("已输入到光标处（{undo_hint} 可撤销）")
         } else {
@@ -695,11 +722,15 @@ pub async fn finish_and_input(
         let device = cfg.audio.device.clone();
         let voice_gate = (cfg.audio.vad_threshold * 100.0).max(2.0);
         let h = app.clone();
-        let superseded = Arc::new(move || {
-            h.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen
-        });
+        let superseded = Arc::new(move || h.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen);
         let r = tauri::async_runtime::spawn_blocking(move || {
-            inject::paste_text_checked(&out_cfg, &text, superseded, device.as_deref(), Some(voice_gate))
+            inject::paste_text_checked(
+                &out_cfg,
+                &text,
+                superseded,
+                device.as_deref(),
+                Some(voice_gate),
+            )
         })
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("输入线程异常: {e}")));
@@ -731,7 +762,13 @@ pub async fn finish_and_input(
         }
     } else {
         let _ = inject::copy_only(final_text);
-        finish_status(app, "done", "已复制到剪贴板", 3200, cfg.general.sound_feedback);
+        finish_status(
+            app,
+            "done",
+            "已复制到剪贴板",
+            3200,
+            cfg.general.sound_feedback,
+        );
     }
 }
 
