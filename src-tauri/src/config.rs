@@ -5,7 +5,11 @@ use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+#[derive(Default)]
 pub struct Config {
+    /// 统一 API 凭据组：一处维护 base_url + api_key，语音识别与 AI 优化共同引用。
+    /// 同一厂商（如智谱：GLM-ASR + GLM 纠错）只需填写一次 Key
+    pub providers: Vec<ProviderProfile>,
     pub hotkey: HotkeyConfig,
     pub audio: AudioConfig,
     pub asr: AsrConfig,
@@ -15,16 +19,46 @@ pub struct Config {
     pub external_display: ExternalDisplayConfig,
 }
 
-impl Default for Config {
+
+/// 翻译目标语言候选（代码 → 展示名）。托盘快切与设置页共用。
+pub const TRANSLATE_LANGS: &[(&str, &str)] = &[
+    ("zh", "中文"),
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("es", "Español"),
+    ("ru", "Русский"),
+];
+
+/// 语言代码转展示名（未知代码原样返回）
+pub fn lang_name(code: &str) -> String {
+    TRANSLATE_LANGS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProviderProfile {
+    /// 稳定标识，asr.providerId / llm.providerId 引用它
+    pub id: String,
+    /// 显示名（如「智谱」「DeepSeek」）
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl Default for ProviderProfile {
     fn default() -> Self {
         Self {
-            hotkey: HotkeyConfig::default(),
-            audio: AudioConfig::default(),
-            asr: AsrConfig::default(),
-            llm: LlmConfig::default(),
-            output: OutputConfig::default(),
-            general: GeneralConfig::default(),
-            external_display: ExternalDisplayConfig::default(),
+            id: "p1".into(),
+            name: "智谱".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            api_key: String::new(),
         }
     }
 }
@@ -36,6 +70,8 @@ pub struct HotkeyConfig {
     pub key: String,
     /// 快速模式快捷键（可选）：跳过 AI 优化，直接输出 ASR 原文
     pub key_quick: String,
+    /// 翻译模式快捷键（可选）：本次听写强制用「翻译」模式，输出目标语言译文
+    pub key_translate: String,
     /// hold（按住说话）/ toggle（按一下开始/结束）
     pub mode: String,
     pub enabled: bool,
@@ -46,6 +82,7 @@ impl Default for HotkeyConfig {
         Self {
             key: "ctrl+shift+Space".into(),
             key_quick: String::new(),
+            key_translate: String::new(),
             mode: "toggle".into(),
             enabled: true,
         }
@@ -92,6 +129,9 @@ impl Default for AudioConfig {
 pub struct AsrConfig {
     /// http（云端/自建接口）| local（内置离线 Whisper）
     pub provider: String,
+    /// 引用凭据组 id（Config.providers）；命中时以凭据组的 base_url/api_key 为准，
+    /// 留空则使用下方内联字段（自定义/未迁移配置）
+    pub provider_id: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -119,6 +159,7 @@ impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             provider: "http".into(),
+            provider_id: String::new(),
             base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             api_key: String::new(),
             model: "glm-asr-2512".into(),
@@ -134,24 +175,46 @@ impl Default for AsrConfig {
     }
 }
 
+impl AsrConfig {
+    /// 展开凭据组引用：providerId 命中时以凭据组的 base_url/api_key 覆盖内联字段
+    pub fn resolved(&self, providers: &[ProviderProfile]) -> AsrConfig {
+        let mut c = self.clone();
+        if let Some(p) = providers.iter().find(|p| p.id == c.provider_id) {
+            c.base_url = p.base_url.clone();
+            c.api_key = p.api_key.clone();
+        }
+        c
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LlmConfig {
     pub enabled: bool,
+    /// 引用凭据组 id（Config.providers）；命中时以凭据组的 base_url/api_key 为准
+    pub provider_id: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-    /// correct / polish / prompt
+    /// correct / polish / prompt / translate
     pub mode: String,
     pub glossary: String,
     pub custom_prompt: String,
     pub timeout_sec: u64,
+    /// 翻译目标语言代码（见 TRANSLATE_LANGS）
+    pub translate_target: String,
+    /// 第二目标语言：识别语言==目标语言时改译为此语言
+    /// （如目标 en、第二目标 zh：说中文出英文、说英文出中文）
+    pub translate_second_target: String,
+    /// translation（仅译文）/ bilingual（原文 + 译文两行）
+    pub translate_output: String,
 }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            provider_id: String::new(),
             base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             api_key: String::new(),
             model: "glm-4.6".into(),
@@ -159,7 +222,34 @@ impl Default for LlmConfig {
             glossary: String::new(),
             custom_prompt: String::new(),
             timeout_sec: 45,
+            translate_target: "en".into(),
+            translate_second_target: "zh".into(),
+            translate_output: "translation".into(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// 展开凭据组引用：providerId 命中时以凭据组的 base_url/api_key 覆盖内联字段
+    pub fn resolved(&self, providers: &[ProviderProfile]) -> LlmConfig {
+        let mut c = self.clone();
+        if let Some(p) = providers.iter().find(|p| p.id == c.provider_id) {
+            c.base_url = p.base_url.clone();
+            c.api_key = p.api_key.clone();
+        }
+        c
+    }
+}
+
+impl Config {
+    /// ASR 配置展开凭据组后的快照（识别链路入口使用）
+    pub fn resolved_asr(&self) -> AsrConfig {
+        self.asr.resolved(&self.providers)
+    }
+
+    /// LLM 配置展开凭据组后的快照（优化/翻译链路入口使用）
+    pub fn resolved_llm(&self) -> LlmConfig {
+        self.llm.resolved(&self.providers)
     }
 }
 
@@ -168,7 +258,7 @@ impl Default for LlmConfig {
 pub struct OutputConfig {
     /// clipboard / typing
     pub method: String,
-    /// auto（终端自动用 Shift+Insert）/ ctrl+v / shift+insert
+    /// auto（终端自动用 Shift+Insert）/ ctrl+v / ctrl+shift+v / shift+insert / terminal-typing
     pub paste_key: String,
     pub auto_paste: bool,
     pub auto_submit: bool,
@@ -276,7 +366,78 @@ pub fn load(app: &AppHandle) -> Config {
     if cfg.output.paste_key == "ctrl+v" {
         cfg.output.paste_key = "auto".into();
     }
+    migrate_providers(&mut cfg);
+    scrub_dangling_provider_ids(&mut cfg);
     cfg
+}
+
+/// 清洗悬空的 providerId（引用已不存在的凭据组——手改配置/文件损坏的残留）：
+/// 清掉后 resolve 回退内联字段，设置页下拉也显示「自定义」而不是空白。
+fn scrub_dangling_provider_ids(cfg: &mut Config) {
+    let hit = |id: &str| cfg.providers.iter().any(|p| p.id == id);
+    if !cfg.asr.provider_id.is_empty() && !hit(&cfg.asr.provider_id) {
+        cfg.asr.provider_id.clear();
+    }
+    if !cfg.llm.provider_id.is_empty() && !hit(&cfg.llm.provider_id) {
+        cfg.llm.provider_id.clear();
+    }
+}
+
+/// v1 → v2 凭据组迁移：旧版 asr/llm 各自内联一份 base_url + api_key，
+/// 同一厂商要填两遍。迁移把已有凭据收拢为凭据组并建立引用，此后 Key 只存一处。
+/// 规则：
+/// - providers 已非空（v2 配置）→ 不动
+/// - ASR 有 Key → 生成凭据组 asr，asr.providerId 指向它；LLM 地址与 Key 与
+///   ASR 完全一致（智谱「一个 Key 两用」的常见形态）→ 共用同一条
+/// - 仅 LLM 有 Key → 生成凭据组 llm
+/// - 引用建立后清空内联 Key 与地址（以凭据组为准）；providerId 未命中时
+///   resolve 回退内联字段，不致破坏手动编辑的配置
+fn migrate_providers(cfg: &mut Config) {
+    if !cfg.providers.is_empty() {
+        return;
+    }
+    let asr_key = cfg.asr.api_key.trim().to_string();
+    let llm_key = cfg.llm.api_key.trim().to_string();
+    if asr_key.is_empty() && llm_key.is_empty() {
+        return; // 没有可迁移的凭据
+    }
+    let asr_url = cfg.asr.base_url.trim().to_string();
+    let llm_url = cfg.llm.base_url.trim().to_string();
+    let same = !asr_key.is_empty()
+        && !llm_key.is_empty()
+        && asr_url == llm_url
+        && asr_key == llm_key;
+    if !asr_key.is_empty() {
+        let name = if same { "API 服务".to_string() } else { "ASR 服务".to_string() };
+        cfg.providers.push(ProviderProfile {
+            id: "asr".into(),
+            name,
+            base_url: asr_url.clone(),
+            api_key: asr_key,
+        });
+        cfg.asr.provider_id = "asr".into();
+    }
+    if !llm_key.is_empty() {
+        if same {
+            cfg.llm.provider_id = "asr".into();
+        } else {
+            cfg.providers.push(ProviderProfile {
+                id: "llm".into(),
+                name: "AI 优化服务".into(),
+                base_url: llm_url,
+                api_key: llm_key,
+            });
+            cfg.llm.provider_id = "llm".into();
+        }
+    }
+    if !cfg.asr.provider_id.is_empty() {
+        cfg.asr.api_key.clear();
+        cfg.asr.base_url.clear();
+    }
+    if !cfg.llm.provider_id.is_empty() {
+        cfg.llm.api_key.clear();
+        cfg.llm.base_url.clear();
+    }
 }
 
 pub fn save(app: &AppHandle, cfg: &Config) -> anyhow::Result<()> {
@@ -291,13 +452,25 @@ pub fn save(app: &AppHandle, cfg: &Config) -> anyhow::Result<()> {
 /// 原子写文件：先写 .tmp 再 rename 替换（NTFS 同卷 rename 原子），
 /// 进程被强杀也只会留下完整旧文件或完整新文件，不会出现半截 JSON。
 /// 写入前把上一份完好内容备份到 .bak，供主文件损坏时恢复。
+/// tmp 名带 pid + 序号：设置页异步保存 / 托盘 / 退出落盘三条路径并发写
+/// 同一文件时互不覆盖对方的半成品。
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{seq}",
+        std::process::id()
+    ));
     fs::write(&tmp, data)?;
     if path.exists() {
         let _ = fs::copy(path, path.with_extension("bak"));
     }
-    fs::rename(&tmp, path)
+    let r = fs::rename(&tmp, path);
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }
 
 #[cfg(test)]
@@ -329,5 +502,91 @@ mod tests {
         }
         assert_eq!(std::fs::read(&p).unwrap(), b"{\"n\":4}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- v1→v2 凭据组迁移与 resolve ---- */
+
+    #[test]
+    fn migrate_collapses_shared_creds_into_one_profile() {
+        // 智谱「一个 Key 两用」的常见形态：ASR 与 LLM 同址同 Key → 共用一条凭据组
+        let mut cfg = Config::default();
+        cfg.asr.api_key = "sk-1".into();
+        cfg.llm.api_key = "sk-1".into();
+        migrate_providers(&mut cfg);
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.asr.provider_id, "asr");
+        assert_eq!(cfg.llm.provider_id, "asr");
+        assert!(cfg.asr.api_key.is_empty() && cfg.llm.api_key.is_empty());
+        assert_eq!(cfg.resolved_asr().api_key, "sk-1");
+        assert_eq!(cfg.resolved_llm().api_key, "sk-1");
+        assert_eq!(
+            cfg.resolved_llm().base_url,
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+    }
+
+    #[test]
+    fn migrate_separates_different_vendors() {
+        let mut cfg = Config::default();
+        cfg.asr.api_key = "sk-a".into();
+        cfg.llm.base_url = "https://api.deepseek.com".into();
+        cfg.llm.api_key = "sk-b".into();
+        migrate_providers(&mut cfg);
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(cfg.llm.provider_id, "llm");
+        assert_eq!(cfg.resolved_llm().base_url, "https://api.deepseek.com");
+        assert_eq!(cfg.resolved_llm().api_key, "sk-b");
+    }
+
+    #[test]
+    fn migrate_noop_without_keys_and_idempotent_on_v2() {
+        let mut fresh = Config::default();
+        migrate_providers(&mut fresh);
+        assert!(fresh.providers.is_empty(), "无凭据不迁移");
+
+        let mut v2 = Config::default();
+        v2.providers.push(ProviderProfile::default());
+        let before = v2.providers.clone();
+        migrate_providers(&mut v2);
+        assert_eq!(v2.providers, before, "v2 配置不再迁移");
+    }
+
+    #[test]
+    fn resolved_falls_back_to_inline_when_provider_id_misses() {
+        let mut cfg = Config::default();
+        cfg.llm.provider_id = "ghost".into();
+        cfg.llm.base_url = "https://x.example".into();
+        cfg.llm.api_key = "sk-x".into();
+        let llm = cfg.resolved_llm();
+        assert_eq!(llm.base_url, "https://x.example");
+        assert_eq!(llm.api_key, "sk-x");
+    }
+
+    #[test]
+    fn scrub_clears_dangling_provider_ids_only() {
+        let mut cfg = Config::default();
+        cfg.providers.push(ProviderProfile {
+            id: "p1".into(),
+            name: "组1".into(),
+            base_url: "https://a.example".into(),
+            api_key: "k1".into(),
+        });
+        cfg.asr.provider_id = "p1".into();
+        cfg.llm.provider_id = "ghost".into();
+        scrub_dangling_provider_ids(&mut cfg);
+        assert_eq!(cfg.asr.provider_id, "p1", "命中的引用保留");
+        assert!(cfg.llm.provider_id.is_empty(), "悬空引用被清洗");
+        // 空引用与空组列表：无事发生
+        let mut empty = Config::default();
+        empty.llm.provider_id = "x".into();
+        scrub_dangling_provider_ids(&mut empty);
+        assert!(empty.llm.provider_id.is_empty());
+    }
+
+    #[test]
+    fn lang_name_maps_known_codes() {
+        assert_eq!(lang_name("en"), "English");
+        assert_eq!(lang_name("zh"), "中文");
+        assert_eq!(lang_name("xx"), "xx");
     }
 }

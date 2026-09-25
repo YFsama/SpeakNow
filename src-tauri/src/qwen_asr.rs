@@ -8,7 +8,6 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::asr::truncate;
@@ -32,10 +31,10 @@ const USER_AGENT: &str = concat!("SpeakNow/", env!("CARGO_PKG_VERSION"));
 /* ---------- 路径与状态 ---------- */
 
 fn config_dir(app: &AppHandle) -> Result<PathBuf> {
-    Ok(app
+    app
         .path()
         .app_config_dir()
-        .context("无法定位配置目录")?)
+        .context("无法定位配置目录")
 }
 
 fn model_dir(app: &AppHandle) -> Result<PathBuf> {
@@ -357,7 +356,7 @@ fn assign_to_job(child: &Child) {
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
-    let mut job = JOB.lock().unwrap();
+    let mut job = JOB.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     unsafe {
         if job.is_none() {
             let h = match CreateJobObjectW(None, None) {
@@ -413,8 +412,10 @@ fn kill_leftover_runtimes(app: &AppHandle) -> usize {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return 0;
         };
-        let mut e = PROCESSENTRY32W::default();
-        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut e = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut more = Process32FirstW(snap, &mut e).is_ok();
         while more {
             let name = String::from_utf16_lossy(&e.szExeFile)
@@ -466,7 +467,7 @@ pub fn cleanup_orphan_engines(app: &AppHandle) -> usize {
 /// 停止本地引擎：先收自己拉起的子进程，再兜底清掉目录内遗留实例
 /// （包括被「接管」的无句柄进程——此前这类实例在正常退出时也收不掉）
 pub fn shutdown(app: &AppHandle) {
-    if let Some(st) = SERVER.lock().unwrap().take() {
+    if let Some(st) = SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
         if let Some(mut c) = st.child {
             let _ = c.kill();
             let _ = c.wait();
@@ -475,46 +476,18 @@ pub fn shutdown(app: &AppHandle) {
     kill_leftover_runtimes(app);
 }
 
-fn probe_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("probe client")
-}
-
 fn health(base: &str) -> bool {
     matches!(
-        probe_client().get(format!("{base}/health")).send(),
+        crate::http::CLIENT_BLOCKING.get(format!("{base}/health")).send(),
         Ok(r) if r.status().is_success()
     )
 }
 
-/// 端口上是否是我们上次遗留的 Qwen3-ASR 服务（可安全接管复用）
-fn adoptable(port: u16) -> Option<String> {
-    let base = format!("http://127.0.0.1:{port}");
-    if !health(&base) {
-        return None;
-    }
-    let props = probe_client()
-        .get(format!("{base}/props"))
-        .send()
-        .ok()
-        .and_then(|r| r.text().ok())
-        .unwrap_or_default();
-    if props.contains("Qwen3-ASR") {
-        Some(base)
-    } else {
-        None
-    }
-}
-
-fn find_free_port() -> u16 {
-    for p in BASE_PORT..BASE_PORT + 20 {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-    BASE_PORT
+/// 找一个可绑定的端口。全部被占时返回 None——绝不能回落到 BASE_PORT：
+/// 那会把请求打到别人已经占用的服务上（就绪探测误判成「我们的引擎」）
+fn find_free_port() -> Option<u16> {
+    (BASE_PORT..BASE_PORT + 20)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
 }
 
 fn log_tail(app: &AppHandle) -> String {
@@ -530,11 +503,11 @@ fn log_tail(app: &AppHandle) -> String {
 
 /// 确保本地 llama-server 已启动并健康，返回 base URL（阻塞，勿在异步线程直接调用）
 pub fn ensure_server(app: &AppHandle) -> Result<String> {
-    let _guard = SPAWN_LOCK.lock().unwrap();
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // 1) 已有子进程且健康
     {
-        let mut g = SERVER.lock().unwrap();
+        let mut g = SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(st) = g.as_mut() {
             let alive = st
                 .child
@@ -550,20 +523,11 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
     }
 
     // 2) 清掉上次异常退出遗留的 llama-server（含无句柄的「接管」实例），
-    //    本次会话重新拉起并纳入 Job Object 管理，进程生命周期与应用严格绑定
+    //    本次会话重新拉起并纳入 Job Object 管理，进程生命周期与应用严格绑定。
+    //    （不尝试接管残留服务：kill 之后再接管必然扑空，且新拉起才能绑定 Job）
     kill_leftover_runtimes(app);
 
-    // 3) 接管上次异常退出的残留服务
-    if let Some(base) = adoptable(BASE_PORT) {
-        *SERVER.lock().unwrap() = Some(ServerState {
-            child: None,
-            port: BASE_PORT,
-        });
-        eprintln!("[speaknow] 接管已运行的 Qwen3-ASR 引擎（端口 {BASE_PORT}）");
-        return Ok(base);
-    }
-
-    // 4) 前置检查
+    // 3) 前置检查
     if !model_files_ok(app) {
         bail!("Qwen3-ASR 模型文件不完整：请在「识别设置」重新点击下载");
     }
@@ -574,9 +538,11 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
     let mut backend = runtime_backend(app).unwrap_or_else(|| "cpu".into());
     let dir = model_dir(app)?;
 
-    // 5) 启动（vulkan 初始化失败时自动换 CPU 运行时重试一次）
+    // 4) 启动（vulkan 初始化失败时自动换 CPU 运行时重试一次）
     for attempt in 0..2 {
-        let port = find_free_port();
+        let port = find_free_port().ok_or_else(|| {
+            anyhow!("端口 {BASE_PORT}-{} 均被占用，无法启动本地识别引擎", BASE_PORT + 19)
+        })?;
         let log_file = runtime_dir(app)?.join("server.log");
         if let Some(p) = log_file.parent() {
             std::fs::create_dir_all(p).ok();
@@ -620,14 +586,8 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
         let start = Instant::now();
         let mut last_note = Instant::now() - Duration::from_secs(4);
         loop {
-            if health(&base) {
-                eprintln!("[speaknow] Qwen3-ASR 引擎就绪：{base}（{backend}）");
-                *SERVER.lock().unwrap() = Some(ServerState {
-                    child: Some(child),
-                    port,
-                });
-                return Ok(base);
-            }
+            // 先查子进程退出再看健康：端口若被别的服务抢先，llama-server 会
+            // 绑定失败退出——先探健康会把别人的服务误判成「我们的引擎就绪」
             if let Ok(Some(_)) = child.try_wait() {
                 let tail = log_tail(app);
                 let vulkan_fail = backend == "vulkan"
@@ -649,6 +609,14 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
                 }
                 bail!("llama-server 启动即退出：{}", truncate(&tail, 400));
             }
+            if health(&base) {
+                eprintln!("[speaknow] Qwen3-ASR 引擎就绪：{base}（{backend}）");
+                *SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ServerState {
+                    child: Some(child),
+                    port,
+                });
+                return Ok(base);
+            }
             if start.elapsed() > BOOT_TIMEOUT {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -665,7 +633,8 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
                 );
                 last_note = Instant::now();
             }
-            std::thread::sleep(Duration::from_millis(500));
+            // 150ms 探测粒度：引擎就绪后最多延迟一拍被发现（原 500ms 白等最多半秒）
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
     bail!("Qwen3-ASR 引擎启动失败：{}", truncate(&log_tail(app), 300))
@@ -677,9 +646,7 @@ pub fn transcribe(app: &AppHandle, samples: &[i16], language: &str) -> Result<St
         bail!("音频内容为空");
     }
     let base = ensure_server(app)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()?;
+    let client = &*crate::http::CLIENT_BLOCKING;
     let chunk_len = 16_000 * CHUNK_SECS;
     let chunks: Vec<&[i16]> = if samples.len() <= chunk_len {
         vec![samples]
@@ -703,6 +670,7 @@ pub fn transcribe(app: &AppHandle, samples: &[i16], language: &str) -> Result<St
         }
         let resp = client
             .post(format!("{base}/v1/audio/transcriptions"))
+            .timeout(Duration::from_secs(300))
             .multipart(form)
             .send()
             .context("本地引擎请求失败（进程可能已退出）")?;

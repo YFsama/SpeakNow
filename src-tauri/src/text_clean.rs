@@ -31,7 +31,6 @@ pub fn strip_fillers(input: &str) -> String {
     // ---- 1) 拉丁填充词整词移除 ----
     let mut latin_cleaned = String::with_capacity(input.len());
     let mut word = String::new();
-    let mut pending_break = String::new();
     for c in input.chars() {
         if c.is_ascii_alphabetic() {
             word.push(c);
@@ -50,7 +49,6 @@ pub fn strip_fillers(input: &str) -> String {
             latin_cleaned.push(c);
         }
     }
-    let _ = pending_break;
     if !word.is_empty() && !LATIN_FILLERS.contains(&word.to_lowercase().as_str()) {
         latin_cleaned.push_str(&word);
     }
@@ -68,9 +66,7 @@ pub fn strip_fillers(input: &str) -> String {
             }
             let run = j - i;
             if run >= 2 {
-                for k in i..j {
-                    keep[k] = false;
-                }
+                keep[i..j].fill(false);
             } else {
                 // 单个语气字：仅句首/句尾/标点或空白邻接时移除
                 let prev_break = i == 0 || is_break(chars[i - 1]);
@@ -84,7 +80,7 @@ pub fn strip_fillers(input: &str) -> String {
             i += 1;
         }
     }
-    let mut out: String = chars
+    let out: String = chars
         .iter()
         .enumerate()
         .filter(|(idx, _)| keep[*idx])

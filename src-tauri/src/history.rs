@@ -44,9 +44,11 @@ pub fn load(app: &AppHandle) -> Vec<HistoryItem> {
 }
 
 pub fn push(app: &AppHandle, raw: &str, final_text: &str, asr_ms: u64, llm_ms: u64) {
+    // 毫秒时间戳：秒级粒度下同一秒的两条记录共享 ts（key 冲突 / 删除连带）。
+    // 旧数据仍是秒级，前端展示按数量级自适应（<1e12 视为秒）
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let mut items = load(app);
     items.insert(

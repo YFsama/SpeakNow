@@ -67,11 +67,14 @@ http://<ip>:8866/display?scale=1.5                # 整体放大字号，适配�
 | `hello` | 连接建立后首条 | `app`、`version`、`protocol` |
 | `status` | 阶段变化 | `stage`: `idle` / `recording` / `transcribing` / `optimizing` / `review` / `done` / `error`；`message`: 提示文案；`sound`: 是否播放提示音 |
 | `level` | 录音期间每 100ms | 录音电平数值（0~1，裸数字） |
-| `meta` | 每次识别开始 | `asrModel`、`llmEnabled`、`llmModel`、`skip`（本次是否跳过 AI） |
+| `meta` | 每次识别开始 | `asrModel`、`llmEnabled`、`llmModel`、`skip`（本次是否跳过 AI）、`translate`（本次是否翻译模式） |
 | `partial` | 流式分段识别出一段（边说边出字） | `text`: 已识别字幕累计 |
 | `raw` | 完整原始转写出炉（AI 优化期间即可阅读） | `text` |
 | `delta` | AI 优化逐字流式输出 | `kind`: `content` / `reasoning`（思考过程）；`delta`: 本段增量；`text`: content 时为累计全文 |
 | `result` | 最终结果确认 | `raw`、`final`、`asrMs`、`llmMs`、`llmFirstMs`、`audioSecs` |
+| `review` | 预览编辑模式：结果进入悬浮窗编辑器 | `text`、`raw`、`llmUsed` |
+| `retryable` | 识别失败且音频已保留（可重试） | 布尔值（裸 `true`） |
+| `gain-learned` | 录音期 AGC 学到新增益（按设备记忆） | `device`、`gainDb`、`baseDb` |
 | `target` | 悬浮窗定位到目标输入框时（仅本地悬浮窗开启时会有） | `title`: 目标窗口标题；`above` |
 
 一次典型会话的事件顺序：

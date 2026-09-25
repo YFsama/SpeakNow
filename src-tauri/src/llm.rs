@@ -259,11 +259,12 @@ async fn chat_nostream(
     }
     let url = format!("{base}/chat/completions");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_sec.max(5)))
-        .build()?;
+    // 共享客户端（连接复用）：超时按请求覆盖
+    let client = &*crate::http::CLIENT;
+    let req_timeout = Duration::from_secs(cfg.timeout_sec.max(5));
     let mut req = client
         .post(&url)
+        .timeout(req_timeout)
         .json(&request_body(cfg, user, false, token_floor, extra));
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
@@ -277,6 +278,7 @@ async fn chat_nostream(
     if extra.is_some() && matches!(resp.status().as_u16(), 400 | 404 | 422) {
         let mut retry = client
             .post(&url)
+            .timeout(req_timeout)
             .json(&request_body(cfg, user, false, token_floor, None));
         if !cfg.api_key.trim().is_empty() {
             retry = retry.bearer_auth(cfg.api_key.trim());
@@ -309,7 +311,7 @@ async fn chat_nostream(
         reasoning_seen: v
             .pointer("/choices/0/message/reasoning_content")
             .and_then(Value::as_str)
-            .map_or(false, |s| !s.is_empty()),
+            .is_some_and(|s| !s.is_empty()),
     })
 }
 
@@ -343,7 +345,7 @@ pub async fn optimize_streaming(
     .await?;
     if outcome.thinking_starved() {
         // 被新录音取代则不再耗费重试流量
-        if superseded.map_or(false, |f| f()) {
+        if superseded.is_some_and(|f| f()) {
             bail!("已被新的录音取代，中止本次优化");
         }
         // 思考型模型把 max_tokens 烧在推理上、正文一字未出（悬浮窗里只见思考）——
@@ -386,7 +388,7 @@ pub async fn optimize_streaming(
         return Ok(out);
     }
     // 被新录音取代则不再耗费重试流量
-    if superseded.map_or(false, |f| f()) {
+    if superseded.is_some_and(|f| f()) {
         bail!("已被新的录音取代，中止本次优化");
     }
     let score = missing.len() + truncated as usize;
@@ -400,7 +402,7 @@ pub async fn optimize_streaming(
     }
     if truncated {
         if !why.is_empty() {
-            why.push_str("、");
+            why.push('、');
         }
         why.push_str("疑似概括删减");
     }
@@ -465,15 +467,11 @@ async fn stream_once(
     }
     let url = format!("{base}/chat/completions");
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_sec.max(5)))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return chat_nostream(cfg, user, token_floor, extra).await,
-    };
+    // 共享客户端（连接复用）：超时按请求覆盖
+    let client = &*crate::http::CLIENT;
     let mut req = client
         .post(&url)
+        .timeout(Duration::from_secs(cfg.timeout_sec.max(5)))
         .json(&request_body(cfg, user, true, token_floor, extra));
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
@@ -481,8 +479,20 @@ async fn stream_once(
 
     let mut resp = match req.send().await {
         Ok(r) if r.status().is_success() => r,
-        // 不支持 stream 的网关等：静默回退非流式
-        _ => return chat_nostream(cfg, user, token_floor, extra).await,
+        Ok(r) => {
+            // 仅「网关不支持 stream」类状态码回退非流式；401/429/5xx 等真实
+            // 错误直接上抛——静默整单重发只会双倍时延与账单，还掩盖原始错误
+            let code = r.status().as_u16();
+            if matches!(code, 400 | 404 | 405 | 501) {
+                return chat_nostream(cfg, user, token_floor, extra).await;
+            }
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            let body: String = body.chars().take(200).collect();
+            bail!("AI 接口返回 {status}：{body}")
+        }
+        // 连接层错误（网络抖动等）：非流式重试一次仍合理
+        Err(_) => return chat_nostream(cfg, user, token_floor, extra).await,
     };
 
     let mut acc = String::new();
@@ -556,7 +566,7 @@ async fn stream_once(
             }
         }
     }
-    if superseded.map_or(false, |f| f()) {
+    if superseded.is_some_and(|f| f()) {
         bail!("已被新的录音取代，中止本次优化");
     }
     if acc.trim().is_empty() {
@@ -733,9 +743,12 @@ fn guardable_token(tok: &str) -> bool {
 }
 
 /// 校验输出与原文的关键词对齐，返回丢失/被改写的关键词清单（保序去重，至多 8 个）。
-/// 自定义指令模式（翻译、改写等）不适用——关键词合法地会变。
+/// 自定义指令与翻译模式不适用——关键词合法地会变。
 pub fn guard_missing(cfg: &LlmConfig, raw: &str, out: &str) -> Vec<String> {
-    if !cfg.custom_prompt.trim().is_empty() || out.trim().is_empty() {
+    if !cfg.custom_prompt.trim().is_empty()
+        || cfg.mode == "translate"
+        || out.trim().is_empty()
+    {
         return Vec::new();
     }
     let out_l = out.to_lowercase();
@@ -780,6 +793,7 @@ pub fn guard_missing(cfg: &LlmConfig, raw: &str, out: &str) -> Vec<String> {
 fn truncation_violation(cfg: &LlmConfig, raw: &str, out: &str) -> bool {
     if !cfg.custom_prompt.trim().is_empty()
         || cfg.mode == "prompt"
+        || cfg.mode == "translate"
         || raw.trim().is_empty()
         || out.trim().is_empty()
     {
@@ -895,6 +909,30 @@ fn build_system_prompt(cfg: &LlmConfig) -> String {
                  输出：把 src/utils.ts 中的 debounce 函数改为支持取消的版本，\
                  并更新所有调用处。",
             ),
+            "translate" => {
+                let target = crate::config::lang_name(&cfg.translate_target);
+                p.push_str(&format!(
+                    "你是专业口语翻译。输入是语音识别(ASR)的原始转录（可能含少量识别错误），\
+                     请把它翻译成{target}。\n\
+                     要求：\n\
+                     1) 忠实原意，不概括、不增删、不解释；说了几件事就译几件事，\
+                     条件与否定关系一个都不能丢；\n\
+                     2) 人名、产品名、公司名、代码、命令、文件路径、数字与单位原样保留，不翻译；\n\
+                     3) 先修正原文中的明显识别错误（同音字等）再翻译，不要把识别错误带进译文；\n\
+                     4) 译文用自然流畅的目标语言表达，贴合原文的正式度与语气；\n\
+                     5) 只输出译文，不要输出原文或任何解释。"
+                ));
+                // 第二目标语言：识别语言==目标语言时改译此语言。与目标相同
+                // 时是「已是 X 则改译成 X」的退化指令，跳过
+                if !cfg.translate_second_target.trim().is_empty()
+                    && cfg.translate_second_target.trim() != cfg.translate_target.trim()
+                {
+                    let second = crate::config::lang_name(&cfg.translate_second_target);
+                    p.push_str(&format!(
+                        "\n若原文本身已经是{target}，则改为翻译成{second}。"
+                    ));
+                }
+            }
             _ => p.push_str(
                 "你是语音转写校对员。输入是语音识别(ASR)的原始转录，\
                  可能存在同音/近音错字、标点缺失、中英文间距问题。逐句校对，只做修正，不做改写。\n\
@@ -988,6 +1026,7 @@ mod tests {
     fn cfg(mode: &str, glossary: &str) -> LlmConfig {
         LlmConfig {
             enabled: true,
+            provider_id: String::new(),
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
@@ -995,6 +1034,9 @@ mod tests {
             glossary: glossary.into(),
             custom_prompt: String::new(),
             timeout_sec: 30,
+            translate_target: "en".into(),
+            translate_second_target: String::new(),
+            translate_output: "translation".into(),
         }
     }
 
@@ -1220,6 +1262,41 @@ mod tests {
         assert!(polish.contains("示例"));
         let correct = build_system_prompt(&cfg("correct", ""));
         assert!(correct.contains("宁可少改"));
+    }
+
+    /* ---- 翻译模式 ---- */
+
+    #[test]
+    fn translate_prompt_names_target_and_second_target() {
+        let mut c = cfg("translate", "");
+        c.translate_target = "en".into();
+        c.translate_second_target = "zh".into();
+        let p = build_system_prompt(&c);
+        assert!(p.contains("翻译成English"));
+        assert!(p.contains("本身已经是English，则改为翻译成中文"));
+        // 无第二目标时不附加该句
+        c.translate_second_target = String::new();
+        assert!(!build_system_prompt(&c).contains("本身已经是"));
+    }
+
+    #[test]
+    fn guards_skip_translate_mode() {
+        // 翻译后原中文关键词消失、长度骤变都是预期行为
+        let c = cfg("translate", "");
+        assert!(guard_missing(&c, "把 Kubernetes 集群扩容", "Scale up the cluster").is_empty());
+        assert!(!truncation_violation(
+            &c,
+            "明天上午十点开评审会，参加的有前端后端和测试，主要过登录流程和支付流程两个方案",
+            "Meeting at 10"
+        ));
+    }
+
+    #[test]
+    fn fast_path_covers_translate() {
+        // 翻译是短文本机械任务，思考系模型同样首轮关思考
+        let mut c = cfg("translate", "");
+        c.model = "glm-4.6".into();
+        assert!(fast_path_no_thinking(&c).is_some());
     }
 
     /* ---- 思考预算与烧尽重试 ---- */

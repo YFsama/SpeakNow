@@ -264,6 +264,21 @@ input[type='range']::-webkit-slider-thumb {
   animation: wordIn 0.3s ease-out both;
 }
 
+/* 超长结果的轻量入场：只做纯透明度淡入（无 blur/位移）。
+   完整动效只给前 ~120 个词，其余走这里，避免同时驱动上千个 filter 动画 */
+@keyframes wordInFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.word-in-fade {
+  display: inline;
+  animation: wordInFade 0.3s ease-out both;
+}
+
 /* AI 修改处的强调高亮，随后褪去 */
 @keyframes wordChanged {
   0% {

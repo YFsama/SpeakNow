@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   applyAppearance,
@@ -22,17 +22,34 @@ import type {
 import { DEFAULT_DEVICE_KEY } from './types';
 import { Spinner } from './components/Controls';
 import Dashboard from './components/Dashboard';
-import {
-  AboutTab,
-  AsrTab,
-  DisplayTab,
-  HistoryTab,
-  HotkeyTab,
-  LlmTab,
-  MicTab,
-  OutputTab,
-} from './components/sections';
 import './styles.css';
+
+/* 各设置分页按需加载（懒加载分包）；默认页 dash=总览为 Dashboard，
+   保持静态导入，首屏渲染不经过 Suspense、无加载占位闪烁 */
+const HotkeyTab = lazy(() =>
+  import('./components/tabs/HotkeyTab').then((m) => ({ default: m.HotkeyTab })),
+);
+const MicTab = lazy(() =>
+  import('./components/tabs/MicTab').then((m) => ({ default: m.MicTab })),
+);
+const AsrTab = lazy(() =>
+  import('./components/tabs/AsrTab').then((m) => ({ default: m.AsrTab })),
+);
+const LlmTab = lazy(() =>
+  import('./components/tabs/LlmTab').then((m) => ({ default: m.LlmTab })),
+);
+const OutputTab = lazy(() =>
+  import('./components/tabs/OutputTab').then((m) => ({ default: m.OutputTab })),
+);
+const DisplayTab = lazy(() =>
+  import('./components/tabs/DisplayTab').then((m) => ({ default: m.DisplayTab })),
+);
+const HistoryTab = lazy(() =>
+  import('./components/tabs/HistoryTab').then((m) => ({ default: m.HistoryTab })),
+);
+const AboutTab = lazy(() =>
+  import('./components/tabs/AboutTab').then((m) => ({ default: m.AboutTab })),
+);
 
 const NAV: { id: TabId; icon: string; label: string }[] = [
   { id: 'dash', icon: '🏠', label: '总览' },
@@ -152,12 +169,25 @@ export default function App() {
         });
       },
     );
+    // 托盘切换 llm.mode / translateTarget 等会广播配置变更：拉回最新配置，
+    // 防止本窗口内存里的旧配置被 800ms 自动保存写回、静默撤销托盘改动。
+    // 本窗口有未保存编辑（dirty）时保留编辑不覆盖；本窗口自己 save_config
+    // 后也会触发该事件，故 dirty 守卫必不可少
+    const un5 = listen('sn-config-changed', () => {
+      getConfig().then((c) => {
+        const cur = cfgRef.current;
+        if (cur && JSON.stringify(cur) !== savedRef.current) return;
+        setCfg(c);
+        savedRef.current = JSON.stringify(c);
+      });
+    });
     return () => {
       if (idleTimer) clearTimeout(idleTimer);
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
       un4.then((f) => f());
+      un5.then((f) => f());
     };
   }, []);
 
@@ -172,11 +202,21 @@ export default function App() {
     if (cfg) applyAppearance(cfg.general.theme, cfg.general.fontScale);
   }, [cfg?.general.theme, cfg?.general.fontScale]);
 
-  const dirty = cfg !== null && JSON.stringify(cfg) !== savedRef.current;
+  // 序列化较重，用 useMemo 只在 cfg 变化时重算一次（dirty 判断与下方保存栏共用）
+  const cfgJson = useMemo(() => (cfg ? JSON.stringify(cfg) : ''), [cfg]);
+  const dirty = cfg !== null && cfgJson !== savedRef.current;
 
   const set = useCallback(
-    <K extends keyof Config>(key: K, patch: Partial<Config[K]>) => {
-      setCfg((c) => (c ? { ...c, [key]: { ...c[key], ...patch } } : c));
+    <K extends keyof Config>(key: K, patch: Partial<Config[K]> | Config[K]) => {
+      setCfg((c) => {
+        if (!c) return c;
+        const cur = c[key];
+        // 数组字段（如 providers 凭据组列表）整体替换；对象字段做浅合并
+        if (Array.isArray(cur) || Array.isArray(patch)) {
+          return { ...c, [key]: patch } as Config;
+        }
+        return { ...c, [key]: { ...cur, ...patch } } as Config;
+      });
     },
     [],
   );
@@ -236,7 +276,12 @@ export default function App() {
   }, []);
 
   const refreshDevices = useCallback(() => {
-    listDevices().then(setDevices);
+    listDevices().then((next) => {
+      // 10s 轮询：名称+默认标记签名一致时跳过 setState，避免无谓重渲染
+      const sig = (ds: DeviceInfo[]) =>
+        ds.map((d) => `${d.name}|${d.isDefault ? 1 : 0}`).join(';');
+      setDevices((prev) => (sig(prev) === sig(next) ? prev : next));
+    });
   }, []);
 
   // 设备列表自动刷新：无线接收器休眠/重新枚举后设备会迟到，
@@ -275,6 +320,7 @@ export default function App() {
   const stageInfo = STAGE_LABEL[stage];
   const hotkeyChips = shortcutChips(cfg.hotkey.key);
   const quickChips = shortcutChips(cfg.hotkey.keyQuick);
+  const translateChips = shortcutChips(cfg.hotkey.keyTranslate);
 
   const tabProps = {
     cfg,
@@ -376,6 +422,11 @@ export default function App() {
                     快速
                   </span>
                 )}
+                {translateChips.length > 0 && (
+                  <span className="ml-1 rounded border border-emerald-400/25 bg-emerald-400/10 px-1 py-0.5 text-[9.5px] text-emerald-300">
+                    翻译
+                  </span>
+                )}
               </div>
             )}
           </div>
@@ -385,15 +436,23 @@ export default function App() {
       {/* 主内容（按 tab 切换动画） */}
       <main className="min-w-0 flex-1 px-8 pb-32 pt-8">
         <div key={tab} className="anim-page mx-auto max-w-2xl space-y-5">
-          {tab === 'dash' && <Dashboard {...tabProps} />}
-          {tab === 'hotkey' && <HotkeyTab {...tabProps} />}
-          {tab === 'mic' && <MicTab {...tabProps} />}
-          {tab === 'asr' && <AsrTab {...tabProps} />}
-          {tab === 'llm' && <LlmTab {...tabProps} />}
-          {tab === 'output' && <OutputTab {...tabProps} />}
-          {tab === 'display' && <DisplayTab {...tabProps} />}
-          {tab === 'history' && <HistoryTab {...tabProps} />}
-          {tab === 'about' && <AboutTab {...tabProps} />}
+          <Suspense
+            fallback={
+              <div className="flex min-h-[40vh] items-center justify-center text-xs text-slate-600">
+                加载中…
+              </div>
+            }
+          >
+            {tab === 'dash' && <Dashboard {...tabProps} />}
+            {tab === 'hotkey' && <HotkeyTab {...tabProps} />}
+            {tab === 'mic' && <MicTab {...tabProps} />}
+            {tab === 'asr' && <AsrTab {...tabProps} />}
+            {tab === 'llm' && <LlmTab {...tabProps} />}
+            {tab === 'output' && <OutputTab {...tabProps} />}
+            {tab === 'display' && <DisplayTab {...tabProps} />}
+            {tab === 'history' && <HistoryTab {...tabProps} />}
+            {tab === 'about' && <AboutTab {...tabProps} />}
+          </Suspense>
         </div>
       </main>
 

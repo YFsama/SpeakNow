@@ -1,7 +1,16 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import type { Config, MetaPayload, Stage } from '../types';
+import { langName, resolvedLlmCreds } from '../types';
 import {
   cancelReview,
   confirmEdit,
@@ -26,6 +35,7 @@ const MODE_LABELS: Record<string, string> = {
   correct: '仅纠错',
   polish: '纠错 + 润色',
   prompt: '编程指令',
+  translate: '翻译',
 };
 
 /* 阶段色微光（卡片外圈短焦光晕的颜色，与描边渐变同色系）：
@@ -111,6 +121,9 @@ function diffTokens(raw: string, final: string): Token[] {
   const b = tokenize(final);
   const n = a.length;
   const m = b.length;
+  // 超长文本（如 8k 字输出）下 (n+1)×(m+1) 的 DP 矩阵会分配数百 MB 并在完成
+  // 瞬间卡住数秒：超限时放弃差异高亮，整段按普通文本渲染
+  if (n * m > 1e6) return [{ t: final, changed: false }];
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
@@ -139,17 +152,31 @@ function diffTokens(raw: string, final: string): Token[] {
   return out;
 }
 
-function TokenText({ tokens, animate }: { tokens: Token[]; animate: boolean }) {
+/* 完整入场动效（blur + 位移逐词入场）只给前若干个词：超长结果的后续词改用
+   轻量淡入，避免完成瞬间同时驱动上千个 filter 动画把整页卡住 */
+const WORD_IN_CAP = 120;
+
+const TokenText = memo(function TokenText({
+  tokens,
+  animate,
+}: {
+  tokens: Token[];
+  animate: boolean;
+}) {
   let k = 0;
   return (
     <>
       {tokens.map((tok, idx) => {
         if (/^\s+$/.test(tok.t)) return tok.t;
-        const delay = animate ? `${Math.min(k++ * 18, 900)}ms` : undefined;
+        const i = k++;
+        const full = !animate || i < WORD_IN_CAP;
+        const delay = animate && full ? `${Math.min(i * 18, 900)}ms` : undefined;
         return (
           <span
             key={idx}
-            className={`word-in ${tok.changed ? 'word-changed' : ''}`}
+            className={`${full ? 'word-in' : 'word-in-fade'} ${
+              tok.changed ? 'word-changed' : ''
+            }`}
             style={delay ? { animationDelay: delay } : undefined}
           >
             {tok.t}
@@ -158,7 +185,187 @@ function TokenText({ tokens, animate }: { tokens: Token[]; animate: boolean }) {
       })}
     </>
   );
+});
+
+/* 录音电平条：独立子组件持有 sn-level 监听（约 10Hz），
+   电平跳动只重渲染这一排条，不再带动整张卡片重绘 */
+function LevelBars() {
+  const [levels, setLevels] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
+  useEffect(() => {
+    const un = listen<number>('sn-level', (e) => {
+      setLevels((prev) => {
+        const next = prev.slice(1);
+        next.push(Math.max(0.05, Math.min(1, e.payload * 3.5)));
+        return next;
+      });
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+  return (
+    <div className="mt-3 flex h-9 items-center gap-[3px]">
+      {levels.map((v, i) => (
+        <span
+          key={i}
+          /* scaleY 替代 height 过渡：只走合成器，不逐帧触发布局；
+             静态微光替代按值切换的 boxShadow，避免每帧样式对象翻转 */
+          className="flex-1 rounded-full bg-gradient-to-t from-sky-500/90 to-indigo-400/90 transition-[transform,opacity] duration-100"
+          style={{
+            height: '34px',
+            transformOrigin: 'bottom',
+            transform: `scaleY(${Math.max(5, v * 34) / 34})`,
+            opacity: 0.35 + v * 0.65,
+            boxShadow: '0 0 8px rgba(56,189,248,0.32)',
+          }}
+        />
+      ))}
+    </div>
+  );
 }
+
+/* 录音计时：独立子组件持有 200ms 定时器，秒数跳动只重渲染计时文本 */
+function RecTimer() {
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setSecs((s) => +(s + 0.2).toFixed(1)), 200);
+    return () => clearInterval(timer);
+  }, []);
+  return (
+    <span className="ml-auto font-mono text-[13px] tabular-nums text-slate-400">
+      {secs.toFixed(1)}s
+    </span>
+  );
+}
+
+/* AI 流式输出隔离卡：sn-llm-delta 的逐 token 更新只重渲染本子组件，
+   悬浮窗其余部分（上下文条、阶段描边、倒计时条）不再逐字重绘；
+   完成态仍由父级监听 sn-result / sn-status 接管 */
+const LlmStream = memo(function LlmStream({
+  stage,
+  meta,
+  rawText,
+  partial,
+}: {
+  stage: Stage;
+  meta: MetaPayload | null;
+  rawText: string;
+  partial: string;
+}) {
+  /* AI 流式输出：正文逐字累计 + 思考型模型的推理片段 */
+  const [llmText, setLlmText] = useState('');
+  const [llmThinking, setLlmThinking] = useState('');
+  const streamRef = useRef<HTMLDivElement>(null);
+  /* 粘性滚动：用户上滚阅读后不再强制拉回底部，滚回底部附近自动恢复跟随 */
+  const stickRef = useRef(true);
+
+  // 新一轮 AI 优化开始 / 离开优化阶段：清空流式缓冲
+  useEffect(() => {
+    if (stage === 'optimizing' || stage === 'recording') {
+      setLlmText('');
+      setLlmThinking('');
+    }
+  }, [stage]);
+
+  useEffect(() => {
+    const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
+      if (e.payload.kind === 'content' && e.payload.text !== undefined) {
+        setLlmText(e.payload.text);
+      } else if (e.payload.kind === 'reasoning' && e.payload.delta) {
+        setLlmThinking((t) => (t + e.payload.delta).slice(-160));
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  /* 自动滚到最新：只在用户本就停在底部附近（40px 内）时跟随；
+     requestAnimationFrame 合帧（一帧最多滚一次，清理时取消挂起帧），
+     目标位置未变则不写，避免逐 token 触发强制同步布局 */
+  useEffect(() => {
+    const el = streamRef.current;
+    if (!el || !stickRef.current) return;
+    const raf = requestAnimationFrame(() => {
+      const top = el.scrollHeight - el.clientHeight;
+      if (el.scrollTop !== top) el.scrollTop = top;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [llmText]);
+
+  return (
+    <div className="anim-rise">
+      <div className="flex items-center gap-3">
+        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-500/15">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path
+              d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"
+              fill="#818cf0"
+            />
+          </svg>
+        </span>
+        <div className="min-w-0">
+          <div className="flex items-center gap-1 text-[13.5px] font-medium text-slate-100">
+            {stage === 'optimizing' && llmText ? 'AI 优化结果' : 'AI 纠错与优化中'}
+            {!(stage === 'optimizing' && llmText) && (
+              <>
+                <span className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400" />
+                <span
+                  className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400"
+                  style={{ animationDelay: '0.15s' }}
+                />
+                <span
+                  className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400"
+                  style={{ animationDelay: '0.3s' }}
+                />
+              </>
+            )}
+          </div>
+          <div className="text-[11px] text-slate-500">
+            {meta?.llmModel ? `${meta.asrModel} → ${meta.llmModel}` : ''}
+          </div>
+        </div>
+      </div>
+
+      {stage === 'optimizing' && llmText ? (
+        /* 流式正文：逐字增长 + 光标，自动滚到最新 */
+        <div
+          ref={streamRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+          className="sn-scroll mt-2.5 max-h-[170px] overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-indigo-400/15 bg-indigo-500/[0.06] px-3 py-2 text-[13.5px] leading-[1.85] text-slate-100"
+        >
+          {llmText}
+          <span className="llm-cursor text-indigo-300">▍</span>
+        </div>
+      ) : stage === 'optimizing' && llmThinking ? (
+        /* 思考型模型：正文未出，先暗色展示思考片段 */
+        <div className="mt-2.5 rounded-lg border border-white/[0.05] bg-black/20 px-3 py-2">
+          <div className="text-[10px] text-slate-600">深度思考中…</div>
+          <div className="mt-0.5 line-clamp-2 break-all text-[11px] leading-5 text-slate-500">
+            {llmThinking}
+          </div>
+        </div>
+      ) : (
+        <div className="relative mt-3 max-h-[84px] overflow-hidden pl-11 text-[13px] leading-6 text-slate-400/90">
+          {rawText || partial}
+          <span
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-[rgba(16,17,38,0.97)] to-transparent"
+            aria-hidden
+          />
+        </div>
+      )}
+
+      {stage === 'optimizing' && llmText && (
+        <div className="mt-1.5 line-clamp-1 pl-1 text-[10px] text-slate-600">
+          原文：{rawText}
+        </div>
+      )}
+    </div>
+  );
+});
 
 export default function Overlay() {
   const [stage, setStage] = useState<Stage>('idle');
@@ -176,8 +383,6 @@ export default function Overlay() {
     first?: number | null;
     audioSecs?: number | null;
   }>({});
-  const [levels, setLevels] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
-  const [secs, setSecs] = useState(0);
   const [hovered, setHovered] = useState(false);
   const [aboveInput, setAboveInput] = useState(true);
   const [retryable, setRetryable] = useState(false);
@@ -191,15 +396,12 @@ export default function Overlay() {
   const [notice, setNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [llmEnabled, setLlmEnabled] = useState(false);
   const [llmMode, setLlmMode] = useState('correct');
-  /* AI 流式输出：正文逐字累计 + 思考型模型的推理片段 */
-  const [llmText, setLlmText] = useState('');
-  const [llmThinking, setLlmThinking] = useState('');
-  const llmStreamRef = useRef<HTMLDivElement>(null);
-  const stageRef = useRef<Stage>('idle');
-  stageRef.current = stage;
+  const [translateTarget, setTranslateTarget] = useState('en');
   const editorRef = useRef<HTMLTextAreaElement>(null);
-  /* 重新优化期间把流式增量直接写回审阅编辑框 */
+  /* 重新优化期间把流式累计文本直接写回审阅编辑框（不进 React 状态） */
   const reoptStreamRef = useRef(false);
+  /* 重新优化期间最新一份流式累计文本（供渲染后补写与失败时保留部分结果） */
+  const streamTextRef = useRef('');
   /* 界面缩放：body.zoom 放大卡片的同时窗口必须同步放大，否则卡片被窗口边缘裁切 */
   const zoomRef = useRef(1);
   const winSize = (w: number, h: number) =>
@@ -210,8 +412,11 @@ export default function Overlay() {
     const apply = (c: Config) => {
       zoomRef.current = c.general.fontScale || 1;
       document.body.style.zoom = String(zoomRef.current);
-      setLlmEnabled(c.llm.enabled && !!c.llm.baseUrl.trim());
+      // 后端凭据组迁移会清空内联 llm.baseUrl，须按解析后的生效凭据判断
+      // LLM 是否可用，否则迁移后审阅编辑器的「重新优化」会莫名消失
+      setLlmEnabled(c.llm.enabled && !!resolvedLlmCreds(c).baseUrl.trim());
       setLlmMode(c.llm.mode);
+      setTranslateTarget(c.llm.translateTarget || 'en');
     };
     getConfig().then(apply);
     const un = listen('sn-config-changed', () => getConfig().then(apply));
@@ -220,15 +425,19 @@ export default function Overlay() {
     };
   }, []);
 
-  /* AI 流式输出：逐字上屏并滚到最新 */
+  /* 审阅窗口「重新优化」的流式回填：增量不进 React 状态（逐 token setState 会
+     整卡重渲染审阅 UI），改为把事件携带的累计文本直接写入 textarea */
   useEffect(() => {
     const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
-      if (e.payload.kind === 'content' && e.payload.text !== undefined) {
-        setLlmText(e.payload.text);
-        // 审阅窗口「重新优化」：流式结果逐字回填编辑框
-        if (reoptStreamRef.current) setEditText(e.payload.text);
-      } else if (e.payload.kind === 'reasoning' && e.payload.delta) {
-        setLlmThinking((t) => (t + e.payload.delta).slice(-160));
+      if (
+        !reoptStreamRef.current ||
+        e.payload.kind !== 'content' ||
+        e.payload.text === undefined
+      )
+        return;
+      streamTextRef.current = e.payload.text;
+      if (editorRef.current && editorRef.current.value !== e.payload.text) {
+        editorRef.current.value = e.payload.text;
       }
     });
     return () => {
@@ -236,31 +445,53 @@ export default function Overlay() {
     };
   }, []);
 
-  useEffect(() => {
-    const el = llmStreamRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [llmText]);
+  /* 受控 textarea 在重渲染时会把 DOM 值拉回 editText（流式期间是旧值）：
+     每次渲染后、绘制前把最新流式文本补写回去，保证逐字上屏连续无闪断 */
+  useLayoutEffect(() => {
+    if (!reoptStreamRef.current) return;
+    const t = streamTextRef.current;
+    if (t && editorRef.current && editorRef.current.value !== t) {
+      editorRef.current.value = t;
+    }
+  });
 
   /* 预览编辑模式：放大窗口并聚焦输入框 */
   useEffect(() => {
+    if (stage !== 'review') return;
     const win = getCurrentWindow();
-    if (stage === 'review') {
-      void win.setSize(winSize(WIN_REVIEW.w, WIN_REVIEW.h));
-      setTimeout(() => editorRef.current?.focus(), 60);
-    } else if (stageRef.current !== 'review') {
-      // 其他阶段恢复默认尺寸
-    }
+    void win.setSize(winSize(WIN_REVIEW.w, WIN_REVIEW.h));
+    const t = setTimeout(() => editorRef.current?.focus(), 60);
+    return () => clearTimeout(t);
   }, [stage]);
 
+  // 退出审阅或开始新一轮录音时恢复默认尺寸（完成阶段可能已把窗口自适应放大
+  // 到 560px，不在录音时复位的话，长结果之后的下一轮会一直顶着放大的窗口）
   useEffect(() => {
     if (stage !== 'review') {
       void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
     }
-  }, [stage === 'review']);
+  }, [stage === 'review', stage === 'recording']);
 
-  // 完成阶段长文本：按估算行数自适应窗口高度（320~560px），结果区可滚动阅读
-  const doneLines = stage === 'done' && result ? estimateDisplayLines(result, 460) : 0;
-  const doneTextH = Math.min(Math.max(Math.round(doneLines * 26.6), 64), 400);
+  // 完成阶段长文本：按估算行数自适应窗口高度（320~560px），结果区可滚动阅读。
+  // 行数估算与词级 diff 开销不小（长文本可达数毫秒），用 useMemo 锁定在
+  // [stage, result, …] 变化时重算：悬停进出等重渲染不再反复付这笔账
+  const doneLines = useMemo(
+    () => (stage === 'done' && result ? estimateDisplayLines(result, 460) : 0),
+    [stage, result],
+  );
+  const doneTextH = useMemo(
+    () => Math.min(Math.max(Math.round(doneLines * 26.6), 64), 400),
+    [doneLines],
+  );
+  /* 词级 diff 结果：resultId 作新结果的复位键（即使文本相同也换新数组，
+     配合 TokenText 的 key 重放入场动效） */
+  const doneTokens = useMemo(
+    () =>
+      stage === 'done' && result
+        ? diffTokens(usedLlm && rawText ? rawText : result, result)
+        : [],
+    [stage, result, usedLlm, rawText, resultId],
+  );
   useEffect(() => {
     if (stage !== 'done' || !result) return;
     const h = Math.min(Math.max(196 + doneTextH, WIN_NORMAL.h), 560);
@@ -275,18 +506,11 @@ export default function Overlay() {
         setStage(p.stage);
         setMessage(p.message ?? '');
         if (p.stage === 'recording') {
-          setSecs(0);
           setRawText('');
           setPartial('');
           setResult('');
           setUsedLlm(false);
           setTiming({});
-          setLevels(Array(BAR_COUNT).fill(0));
-        }
-        // 新一轮 AI 优化开始 / 离开优化阶段：清空流式缓冲
-        if (p.stage === 'optimizing' || p.stage === 'recording') {
-          setLlmText('');
-          setLlmThinking('');
         }
         if (p.sound) {
           if (p.stage === 'recording') playTones([620, 880]);
@@ -325,24 +549,14 @@ export default function Overlay() {
         setNotice(null);
       },
     );
-    const un7 = listen<number>('sn-level', (e) => {
-      setLevels((prev) => {
-        const next = prev.slice(1);
-        next.push(Math.max(0.05, Math.min(1, e.payload * 3.5)));
-        return next;
-      });
-    });
-    const un8 = listen<{ title: string; above?: boolean }>('sn-target', (e) => {
+    const un7 = listen<{ title: string; above?: boolean }>('sn-target', (e) => {
       setTarget(e.payload.title || '');
       setAboveInput(e.payload.above !== false);
     });
-    const un9 = listen<boolean>('sn-retryable', (e) => {
+    const un8 = listen<boolean>('sn-retryable', (e) => {
       setRetryable(!!e.payload);
       if (e.payload) setRetrying(false);
     });
-    const timer = setInterval(() => {
-      if (stageRef.current === 'recording') setSecs((s) => +(s + 0.2).toFixed(1));
-    }, 200);
     return () => {
       un1.then((f) => f());
       un2.then((f) => f());
@@ -352,8 +566,6 @@ export default function Overlay() {
       un6.then((f) => f());
       un7.then((f) => f());
       un8.then((f) => f());
-      un9.then((f) => f());
-      clearInterval(timer);
     };
   }, []);
 
@@ -381,11 +593,14 @@ export default function Overlay() {
     setOptimizing(true);
     setNotice(null);
     reoptStreamRef.current = true;
+    streamTextRef.current = '';
     try {
       const t = await optimizeText(editText, reoptMode || undefined);
       setEditText(t);
       setNotice({ ok: true, msg: '已重新优化' });
     } catch (e) {
+      // 失败时保留已流出的部分文本（与旧版逐 token 回填的行为一致）
+      if (streamTextRef.current) setEditText(streamTextRef.current);
       setNotice({ ok: false, msg: `重新优化失败：${String(e)}` });
     } finally {
       reoptStreamRef.current = false;
@@ -401,11 +616,6 @@ export default function Overlay() {
   }, [notice]);
 
   if (stage === 'idle') return <div className="h-screen w-screen" />;
-
-  const doneTokens =
-    stage === 'done' && result
-      ? diffTokens(usedLlm && rawText ? rawText : result, result)
-      : [];
 
   // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红
   const glow =
@@ -535,26 +745,16 @@ export default function Overlay() {
                     正在聆听…
                   </div>
                   <div className="text-[11px] leading-4 text-slate-500">
-                    {meta?.skip ? '快速模式 · 不经 AI 优化' : meta?.asrModel || ''}
+                    {meta?.skip
+                      ? '快速模式 · 不经 AI 优化'
+                      : meta?.translate
+                        ? `翻译模式 · 输出${langName(translateTarget)}`
+                        : (meta?.asrModel ?? '')}
                   </div>
                 </div>
-                <span className="ml-auto font-mono text-[13px] tabular-nums text-slate-400">
-                  {secs.toFixed(1)}s
-                </span>
+                <RecTimer />
               </div>
-              <div className="mt-3 flex h-9 items-center gap-[3px]">
-                {levels.map((v, i) => (
-                  <span
-                    key={i}
-                    className="flex-1 rounded-full bg-gradient-to-t from-sky-500/90 to-indigo-400/90 transition-[height,opacity] duration-100"
-                    style={{
-                      height: `${Math.max(5, v * 34)}px`,
-                      opacity: 0.35 + v * 0.65,
-                      boxShadow: v > 0.5 ? '0 0 8px rgba(56,189,248,0.45)' : undefined,
-                    }}
-                  />
-                ))}
-              </div>
+              <LevelBars />
               {/* 流式实时字幕 */}
               {partial && (
                 <div className="mt-2 flex max-h-14 flex-col justify-end overflow-hidden text-[13px] leading-6 text-slate-300">
@@ -589,72 +789,7 @@ export default function Overlay() {
           )}
 
           {((stage === 'transcribing' && (rawText || partial)) || stage === 'optimizing') && (
-            <div className="anim-rise">
-              <div className="flex items-center gap-3">
-                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-500/15">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                    <path
-                      d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"
-                      fill="#818cf0"
-                    />
-                  </svg>
-                </span>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1 text-[13.5px] font-medium text-slate-100">
-                    {stage === 'optimizing' && llmText ? 'AI 优化结果' : 'AI 纠错与优化中'}
-                    {!(stage === 'optimizing' && llmText) && (
-                      <>
-                        <span className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400" />
-                        <span
-                          className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400"
-                          style={{ animationDelay: '0.15s' }}
-                        />
-                        <span
-                          className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400"
-                          style={{ animationDelay: '0.3s' }}
-                        />
-                      </>
-                    )}
-                  </div>
-                  <div className="text-[11px] text-slate-500">
-                    {meta?.llmModel ? `${meta.asrModel} → ${meta.llmModel}` : ''}
-                  </div>
-                </div>
-              </div>
-
-              {stage === 'optimizing' && llmText ? (
-                /* 流式正文：逐字增长 + 光标，自动滚到最新 */
-                <div
-                  ref={llmStreamRef}
-                  className="sn-scroll mt-2.5 max-h-[170px] overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-indigo-400/15 bg-indigo-500/[0.06] px-3 py-2 text-[13.5px] leading-[1.85] text-slate-100"
-                >
-                  {llmText}
-                  <span className="llm-cursor text-indigo-300">▍</span>
-                </div>
-              ) : stage === 'optimizing' && llmThinking ? (
-                /* 思考型模型：正文未出，先暗色展示思考片段 */
-                <div className="mt-2.5 rounded-lg border border-white/[0.05] bg-black/20 px-3 py-2">
-                  <div className="text-[10px] text-slate-600">深度思考中…</div>
-                  <div className="mt-0.5 line-clamp-2 break-all text-[11px] leading-5 text-slate-500">
-                    {llmThinking}
-                  </div>
-                </div>
-              ) : (
-                <div className="relative mt-3 max-h-[84px] overflow-hidden pl-11 text-[13px] leading-6 text-slate-400/90">
-                  {rawText || partial}
-                  <span
-                    className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-[rgba(16,17,38,0.97)] to-transparent"
-                    aria-hidden
-                  />
-                </div>
-              )}
-
-              {stage === 'optimizing' && llmText && (
-                <div className="mt-1.5 line-clamp-1 pl-1 text-[10px] text-slate-600">
-                  原文：{rawText}
-                </div>
-              )}
-            </div>
+            <LlmStream stage={stage} meta={meta} rawText={rawText} partial={partial} />
           )}
 
           {stage === 'review' && (

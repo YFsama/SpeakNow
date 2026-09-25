@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 
 /* ============ 通用卡片区块 ============ */
 
@@ -77,12 +77,18 @@ export function TextInput({
   placeholder,
   type = 'text',
   mono = false,
+  onBlur,
+  onKeyDown,
 }: {
   value: string | null | undefined;
   onChange: (v: string) => void;
   placeholder?: string;
   type?: string;
   mono?: boolean;
+  /** 失焦回调：供延迟提交类输入（如数字钳制字段）在 blur 时规范化提交 */
+  onBlur?: () => void;
+  /** 按键回调：如数字输入按 Enter 视同失焦立即提交 */
+  onKeyDown?: (e: ReactKeyboardEvent<HTMLInputElement>) => void;
 }) {
   return (
     <input
@@ -91,6 +97,8 @@ export function TextInput({
       placeholder={placeholder}
       spellCheck={false}
       onChange={(e) => onChange(e.target.value)}
+      onBlur={onBlur}
+      onKeyDown={onKeyDown}
       className={`${inputBase} ${mono ? 'font-mono text-xs leading-6' : ''}`}
     />
   );

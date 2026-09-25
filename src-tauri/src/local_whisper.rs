@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use candle_core::{Device, IndexOp, Tensor, D};
-use candle_nn::ops::softmax;
+use candle_nn::ops::{log_softmax, softmax};
 use candle_transformers::models::whisper::{self as m, audio};
 use candle_transformers::quantized_var_builder as qvb;
 use rand::distr::weighted::WeightedIndex;
@@ -156,6 +156,15 @@ pub async fn download(app: &AppHandle, id: &str, mirror: &str) -> Result<()> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         bail!("已有模型下载任务进行中");
     }
+    // Drop 守卫复位：models_root 等提前出错（或下载中 panic）也不能让标志
+    // 卡在 true——否则此后每次下载都报「已有任务进行中」直到重启
+    struct ResetOnDrop<'a>(&'a AtomicBool);
+    impl Drop for ResetOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _reset = ResetOnDrop(&DOWNLOADING);
     let root = models_root(app)?;
     let emit_app = app.clone();
     let result = download_to(&root, id, mirror, &move |file: &str, dl: u64, total: u64| {
@@ -170,7 +179,6 @@ pub async fn download(app: &AppHandle, id: &str, mirror: &str) -> Result<()> {
         );
     })
     .await;
-    DOWNLOADING.store(false, Ordering::SeqCst);
     let _ = app.emit("sn-models-changed", ());
     result
 }
@@ -226,6 +234,15 @@ where
         }
         writer.flush().await?;
         drop(writer);
+        // 完整性：代理/服务器提前断流而传输层不报错时，半截 .part 一旦
+        // rename 成正式文件会被状态检查当成「已下载」，加载才报玄学错误
+        if total > 0 && downloaded != total {
+            let _ = tokio::fs::remove_file(&part).await;
+            bail!(
+                "下载 {} 不完整（{downloaded}/{total} 字节），请重试",
+                file
+            );
+        }
         tokio::fs::rename(&part, &target).await?;
         on_progress(file, downloaded, total);
     }
@@ -291,7 +308,7 @@ fn load_cached(root: &Path2, id: &str) -> Result<Arc<Mutex<Cached>>> {
             bail!("本地模型 {id} 尚未下载（缺少 {f}）");
         }
     }
-    if let Some(hit) = CACHE.lock().unwrap().get(id) {
+    if let Some(hit) = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
         return Ok(hit.clone());
     }
 
@@ -303,7 +320,7 @@ fn load_cached(root: &Path2, id: &str) -> Result<Arc<Mutex<Cached>>> {
 
     let device = Device::Cpu;
     let model = if d.quantized {
-        let vb = qvb::VarBuilder::from_gguf(&dir.join(d.weights), &device)?;
+        let vb = qvb::VarBuilder::from_gguf(dir.join(d.weights), &device)?;
         Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?)
     } else {
         let vb = unsafe {
@@ -317,10 +334,12 @@ fn load_cached(root: &Path2, id: &str) -> Result<Arc<Mutex<Cached>>> {
     };
 
     let cached = Arc::new(Mutex::new(Cached { model, tokenizer }));
-    CACHE
-        .lock()
-        .unwrap()
-        .insert(id.to_string(), cached.clone());
+    {
+        let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 只保留当前模型：切换模型后旧权重（最大约 1GB 提交内存）不再常驻
+        cache.retain(|k, _| k == id);
+        cache.insert(id.to_string(), cached.clone());
+    }
     Ok(cached)
 }
 
@@ -398,14 +417,14 @@ impl Decoder {
 
         // 每段只做一次编码器前向；解码器交叉注意力使用其输出
         let audio_features = {
-            let mut cached = self.cached.lock().unwrap();
+            let mut cached = self.cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             cached.model.encoder_forward(mel, true)?
         };
 
         // 注：candle 的 Whisper 解码器为位置编码重算设计，每步需喂完整序列（release 下速度足够）
         for step in 0..((self.config()?.max_target_positions - 1) / 2) {
             let (logits_raw, seq) = {
-                let mut cached = self.cached.lock().unwrap();
+                let mut cached = self.cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let cds =
                     Tensor::from_vec(tokens.clone(), (1, tokens.len()), mel.device())?;
                 let ys = cached
@@ -419,8 +438,10 @@ impl Decoder {
                 (logits, seq)
             };
             let _ = seq;
-            // candle 的 softmax 即 log-softmax
-            let logprobs = softmax(&logits_raw, D::Minus1)?.to_vec1::<f32>()?;
+            // log_softmax：后续 avg_logprob / no_speech_prob / 温度采样全部
+            // 以对数概率为前提（曾误用普通 softmax：静音守卫与置信度回退
+            // 永远不触发、采样权重近均匀）
+            let logprobs = log_softmax(&logits_raw, D::Minus1)?.to_vec1::<f32>()?;
 
             if step == 0 {
                 no_speech_prob = logprobs
@@ -493,7 +514,7 @@ impl Decoder {
 
     /// 自动检测语言（利用首段编码器输出对语言 token 做 argmax）
     fn detect_language(&mut self, mel: &Tensor) -> Result<u32> {
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = self.cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq_len = mel.dims3()?.2;
         let mel = mel.narrow(
             2,
@@ -523,7 +544,7 @@ impl Decoder {
     }
 
     fn config(&self) -> Result<m::Config> {
-        Ok(self.cached.lock().unwrap().model.config().clone())
+        Ok(self.cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.config().clone())
     }
 }
 
@@ -553,8 +574,8 @@ pub fn transcribe_in(
     language: &str,
 ) -> Result<String> {
     let cached = load_cached(root, id)?;
-    let tokenizer = cached.lock().unwrap().tokenizer.clone();
-    let is_multilingual = cached.lock().unwrap().model.is_multilingual();
+    let tokenizer = cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tokenizer.clone();
+    let is_multilingual = cached.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.is_multilingual();
 
     let mut dec = Decoder {
         cached,
@@ -566,17 +587,13 @@ pub fn transcribe_in(
         bail!("音频内容为空");
     }
 
-    // 30 秒分块
+    // 30 秒分块（pcm 非空保证 chunks 至少一段）
     let chunk_len = m::N_SAMPLES;
-    let mut chunks: Vec<Vec<f32>> = pcm.chunks(chunk_len).map(|c| c.to_vec()).collect();
-    if chunks.is_empty() {
-        chunks.push(vec![0f32; 16_000]);
-    }
+    let chunks: Vec<Vec<f32>> = pcm.chunks(chunk_len).map(|c| c.to_vec()).collect();
 
     let device = Device::Cpu;
     let mut texts: Vec<String> = Vec::new();
     let mut detected: Option<u32> = None;
-    let zh_lang_token = token_id(&tokenizer, "<|zh|>").ok();
     let zh_lang_token = LANGUAGES
         .iter()
         .find(|(c, _)| *c == "zh")

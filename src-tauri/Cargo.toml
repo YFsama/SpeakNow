@@ -1,13 +1,13 @@
 [package]
 name = "speaknow"
-version = "0.4.7"
+version = "0.4.8"
 description = "语音输入助手：全局快捷键 → 大模型 ASR 转写 → AI 纠错优化 → 自动输入到任意输入框"
 authors = ["SpeakNow Contributors"]
 license = "MIT"
 repository = "https://github.com/YFsama/SpeakNow"
 readme = "README.md"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.80"
 
 [lib]
 name = "speaknow_lib"
@@ -24,7 +24,7 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cpal = "0.15"
-reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "blocking", "default-tls", "http2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "fs", "io-util", "net"] }
 axum = { version = "0.8", features = ["ws"] }
 anyhow = "1"
@@ -36,13 +36,16 @@ candle-nn = "0.11"
 candle-transformers = "0.11"
 enigo = "0.6"
 rand = "0.9"
-tokenizers = "0.21"
+tokenizers = { version = "0.22", default-features = false }
 zhconv = "0.4.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 strip = true
 lto = "thin"
+# 单编译单元：二进制再小几个百分点，热路径（candle 矩阵乘）调度更好；
+# 代价是发布构建慢 20-40%
+codegen-units = 1
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"

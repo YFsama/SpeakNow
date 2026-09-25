@@ -5,6 +5,7 @@ mod display_api;
 mod events;
 mod history;
 mod hotkey;
+mod http;
 mod inject;
 mod llm;
 pub mod local_whisper;
@@ -19,9 +20,8 @@ mod wav;
 pub mod win_volume;
 pub mod caret;
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -38,19 +38,11 @@ pub struct PendingReview {
 /// 全局共享的应用状态
 pub struct Ctx {
     pub config: Mutex<Option<config::Config>>,
-    pub recording: Mutex<Option<audio::Recording>>,
-    pub watcher_cancel: Arc<AtomicBool>,
-    /// 快速模式（跳过 AI 优化）标记，start 时置位、run 时消费
-    pub skip_llm_next: AtomicBool,
+    /// 当前录音会话（音频句柄 + 会话状态）：None = 空闲。会话标志与流式
+    /// 分段状态都封装在 pipeline::Session 里，随会话生灭
+    pub recording: Mutex<Option<(audio::Recording, std::sync::Arc<pipeline::Session>)>>,
     /// 预览卡悬停暂停自动隐藏
     pub overlay_pinned: AtomicBool,
-    /// 流式分段会话状态
-    pub stream_active: AtomicBool,
-    pub stream_done: AtomicBool,
-    pub stream_finished: AtomicBool,
-    pub stream_cut: AtomicUsize,
-    pub stream_queue: Mutex<VecDeque<Vec<i16>>>,
-    pub stream_texts: Mutex<Vec<String>>,
     /// 预览编辑待确认内容
     pub pending_review: Mutex<Option<PendingReview>>,
     /// 最近一次失败/为空的录音（供「重试」）：(采样, 是否来自设置页)
@@ -64,8 +56,7 @@ pub struct Ctx {
 impl Ctx {
     pub fn hotkey_mode(&self) -> String {
         self.config
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|c| c.hotkey.mode.clone())
             .unwrap_or_else(|| "toggle".into())
@@ -76,8 +67,7 @@ impl Ctx {
 fn get_config(app: AppHandle) -> config::Config {
     app.state::<Ctx>()
         .config
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default()
 }
@@ -112,8 +102,7 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
     let old = app
         .state::<Ctx>()
         .config
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default();
     if let Err(e) = config::save(&app, &config) {
@@ -121,7 +110,7 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
         return Err(e.to_string());
     }
     trace_save(&app, &format!("写文件 {}ms", t0.elapsed().as_millis()));
-    *app.state::<Ctx>().config.lock().unwrap() = Some(config.clone());
+    *app.state::<Ctx>().config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config.clone());
     trace_save(&app, &format!("内存更新 {}ms", t0.elapsed().as_millis()));
 
     let mut messages = vec!["已保存".to_string()];
@@ -152,6 +141,15 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
     if old.asr.provider == "local" && config.asr.provider != "local" {
         let h = app.clone();
         tauri::async_runtime::spawn_blocking(move || qwen_asr::shutdown(&h));
+    }
+    // 托盘快切菜单展示当前模式/翻译目标：设置页改动后同步重建。
+    // 经独立线程派发到主线程——不等待主线程空闲，避免保存被卡
+    if config.llm.mode != old.llm.mode || config.llm.translate_target != old.llm.translate_target {
+        let h = app.clone();
+        std::thread::spawn(move || {
+            let h2 = h.clone();
+            let _ = h.run_on_main_thread(move || crate::tray::rebuild_menu(&h2));
+        });
     }
     let _ = app.emit("sn-config-changed", ());
     trace_save(&app, &format!("完成 {}ms", t0.elapsed().as_millis()));
@@ -202,7 +200,7 @@ fn apply_autostart(app: &AppHandle, want: bool) -> Result<(), String> {
 fn reset_config(app: AppHandle) -> Result<config::Config, String> {
     let cfg = config::Config::default();
     config::save(&app, &cfg).map_err(|e| e.to_string())?;
-    *app.state::<Ctx>().config.lock().unwrap() = Some(cfg.clone());
+    *app.state::<Ctx>().config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg.clone());
     // 后台线程重注册（apply 需经主线程派发，勿在主线程同步等待）
     let h = app.clone();
     let hk = cfg.hotkey.clone();
@@ -459,34 +457,6 @@ async fn mic_diagnose(device: Option<String>) -> Result<serde_json::Value, Strin
     }))
 }
 
-/// 逐个设备短测，找出真正有声音的输入端点
-#[tauri::command]
-async fn scan_devices() -> Result<Vec<serde_json::Value>, String> {
-    let devs = audio::list_inputs();
-    tauri::async_runtime::spawn_blocking(move || {
-        devs.iter()
-            .map(|d| {
-                let r = audio::mic_test(Some(&d.name), false, 0.0, 900, |_| {});
-                let (peak, avg, ok) = match r {
-                    Ok(r) => (r.peak_level, r.avg_level, true),
-                    Err(_) => (-1.0, -1.0, false),
-                };
-                serde_json::json!({
-                    "name": d.name,
-                    "isDefault": d.is_default,
-                    "channels": d.channels,
-                    "sampleRate": d.sample_rate,
-                    "peakPercent": peak,
-                    "avgPercent": avg,
-                    "ok": ok,
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
 /// 同时打开所有输入设备并发采集：一次说话即可看到哪个端点真正有声音。
 /// 期间向前端发送 sn-mic-level-all 事件（{ 设备名: 当前电平 }）用于实时条形图。
 #[tauri::command]
@@ -572,14 +542,19 @@ async fn set_mic_hw_level(
 #[tauri::command]
 async fn retry_last(app: AppHandle) -> Result<String, String> {
     let state = app.state::<Ctx>();
-    let Some((samples, from_ui)) = state.last_audio.lock().unwrap().take() else {
+    let Some((samples, from_ui)) = state.last_audio.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
         return Err("没有可重试的录音".into());
     };
-    let cfg = state.config.lock().unwrap().clone().unwrap_or_default();
-    drop(state);
+    let mut cfg = state.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default();
+    // 凭据组在此展开（与其余路径一致）：迁移后内联字段已清空，
+    // 不解析会导致重试静默降级到本地模型 / 跳过 AI 优化
+    cfg.asr = cfg.resolved_asr();
+    cfg.llm = cfg.resolved_llm();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        pipeline::process_audio(handle, cfg, samples, from_ui, false).await;
+        // 重试无活跃会话：不做流式等待，直接整段识别；无停录静音信息，
+        // 粘贴前的说话探测保守执行
+        pipeline::process_audio(handle, cfg, samples, from_ui, false, None, None).await;
     });
     Ok("正在重试识别…".into())
 }
@@ -632,20 +607,20 @@ async fn auto_calibrate(device: Option<String>) -> Result<serde_json::Value, Str
     }
     let target = 0.6f32;
     let db = (target / peak).log10() * 20.0;
-    let suggested = (db.max(0.0).min(40.0) * 2.0).round() / 2.0;
+    let suggested = (db.clamp(0.0, 40.0) * 2.0).round() / 2.0;
     Ok(serde_json::json!({
         "peakPercent": r.peak_level,
         "suggestedDb": suggested,
     }))
 }
 
-/// 从设置页面手动触发录音（from_ui=true：结束时只复制结果，不自动输入）
+/// 从设置页面手动触发录音（from_ui=true：结束时只复制结果，不自动输入；
+/// 标志随会话保存，VAD/超时等自动收尾同样保持测试语义）
 #[tauri::command]
 async fn start_recording(app: AppHandle, from_ui: bool) -> Result<String, String> {
     // 设备初始化可能阻塞（无线麦重连等），移出主线程
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = from_ui;
-        pipeline::start(&app, false)?;
+        pipeline::start(&app, false, false, from_ui)?;
         Ok::<String, String>("ok".into())
     })
     .await
@@ -655,16 +630,22 @@ async fn start_recording(app: AppHandle, from_ui: bool) -> Result<String, String
 #[tauri::command]
 async fn stop_recording(app: AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        pipeline::stop(&app, true)?;
+        pipeline::stop(&app)?;
         Ok::<String, String>("ok".into())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// 用一小段静音音频验证 ASR 接口连通性与鉴权（本地模式则校验模型文件）
+/// 用一小段静音音频验证 ASR 接口连通性与鉴权（本地模式则校验模型文件）。
+/// providers：凭据组列表——ASR 配置里的 providerId 引用它，命中时以凭据组为准
 #[tauri::command]
-async fn test_asr(app: AppHandle, config: config::AsrConfig) -> Result<String, String> {
+async fn test_asr(
+    app: AppHandle,
+    config: config::AsrConfig,
+    providers: Vec<config::ProviderProfile>,
+) -> Result<String, String> {
+    let config = config.resolved(&providers);
     if config.provider == "local" {
         let id = config.local_model.clone();
         if id == qwen_asr::MODEL_ID {
@@ -778,8 +759,13 @@ async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, S
     Ok(ids)
 }
 
+/// 侧通 AI 优化接口（providers：凭据组，providerId 命中时以凭据组为准）
 #[tauri::command]
-async fn test_llm(config: config::LlmConfig) -> Result<String, String> {
+async fn test_llm(
+    config: config::LlmConfig,
+    providers: Vec<config::ProviderProfile>,
+) -> Result<String, String> {
+    let config = config.resolved(&providers);
     match llm::optimize(&config, "这是一句用于侧连通性测试的语音转写文本，请原样纠错后输出。").await {
         Ok(t) => Ok(format!("连接成功 ✓ 模型返回：{t}")),
         Err(e) => Err(format!("{e:#}")),
@@ -807,17 +793,24 @@ async fn regenerate(app: AppHandle, ts: i64) -> Result<history::HistoryItem, Str
     let cfg = app
         .state::<Ctx>()
         .config
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default();
-    if !cfg.llm.enabled || cfg.llm.base_url.trim().is_empty() {
+    // 展开凭据组引用后再判断可用性（内联字段可能为空、凭据在 providers 里）
+    let llm_cfg = cfg.resolved_llm();
+    if !llm_cfg.enabled || llm_cfg.base_url.trim().is_empty() {
         return Err("AI 优化未启用，请先在「AI 优化」中开启并保存".into());
     }
     let raw = history::find_raw(&app, ts).ok_or("未找到该条记录")?;
-    let text = llm::optimize(&cfg.llm, &raw)
+    let text = llm::optimize(&llm_cfg, &raw)
         .await
         .map_err(|e| format!("重新优化失败: {e:#}"))?;
+    // 翻译双语输出与直接输入路径保持一致：原文一行 + 译文一行
+    let text = if llm_cfg.mode == "translate" && llm_cfg.translate_output == "bilingual" {
+        format!("{raw}\n{text}")
+    } else {
+        text
+    };
     history::update_final(&app, ts, &text).ok_or("更新记录失败")?;
     history::load(&app)
         .into_iter()
@@ -832,7 +825,7 @@ fn copy_text(text: String) -> Result<(), String> {
 
 #[tauri::command]
 fn dismiss_overlay(app: AppHandle) {
-    *app.state::<Ctx>().pending_review.lock().unwrap() = None;
+    *app.state::<Ctx>().pending_review.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     overlay::hide(&app);
     pipeline::emit_status(&app, "idle", "", false);
 }
@@ -843,15 +836,13 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
     let pending = app
         .state::<Ctx>()
         .pending_review
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .ok_or("没有待确认的输入")?;
     let cfg = app
         .state::<Ctx>()
         .config
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default();
 
@@ -891,13 +882,13 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
 /// 预览编辑：取消本次输入
 #[tauri::command]
 fn cancel_review(app: AppHandle) {
-    *app.state::<Ctx>().pending_review.lock().unwrap() = None;
+    *app.state::<Ctx>().pending_review.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     overlay::hide(&app);
     pipeline::emit_status(&app, "idle", "", false);
 }
 
 /// 预览编辑：对编辑框内容重新调用 AI 优化（流式，结果逐字回到编辑框）。
-/// mode 可选覆盖本次优化模式（correct / polish / prompt），缺省用已保存配置。
+/// mode 可选覆盖本次优化模式（correct / polish / prompt / translate），缺省用已保存配置。
 #[tauri::command]
 async fn optimize_text(
     app: AppHandle,
@@ -907,22 +898,28 @@ async fn optimize_text(
     let cfg = app
         .state::<Ctx>()
         .config
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default();
-    if !cfg.llm.enabled || cfg.llm.base_url.trim().is_empty() {
+    let mut llm_cfg = cfg.resolved_llm();
+    if !llm_cfg.enabled || llm_cfg.base_url.trim().is_empty() {
         return Err("AI 优化未启用，请先在「AI 优化」页开启并保存".into());
     }
-    let mut llm_cfg = cfg.llm.clone();
     if let Some(m) = mode.as_deref() {
-        if matches!(m, "correct" | "polish" | "prompt") {
+        if matches!(m, "correct" | "polish" | "prompt" | "translate") {
             llm_cfg.mode = m.to_string();
         }
     }
-    llm::optimize_streaming(&llm_cfg, &text, &app, None, None)
+    let out = llm::optimize_streaming(&llm_cfg, &text, &app, None, None)
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?;
+    // 翻译双语输出与直接输入路径保持一致：原文一行 + 译文一行
+    let out = if llm_cfg.mode == "translate" && llm_cfg.translate_output == "bilingual" {
+        format!("{text}\n{out}")
+    } else {
+        out
+    };
+    Ok(out)
 }
 
 /// 悬浮窗预览卡悬停时暂停自动隐藏
@@ -946,11 +943,6 @@ fn export_text(app: AppHandle, filename: String, content: String) -> Result<Stri
     Ok(path.display().to_string())
 }
 
-#[tauri::command]
-fn show_main(app: AppHandle) {
-    tray::open_main_window(&app);
-}
-
 /* ---------- 外接显示（硬件字幕屏）API ---------- */
 
 /// 外接显示服务当前状态（运行中/端口/可访问 URL/最近错误）
@@ -959,10 +951,33 @@ fn display_status() -> serde_json::Value {
     display_api::status()
 }
 
+/// 判定 URL 是否指向本机或 RFC1918 私网（仅 http）——解析后按 IP/主机
+/// 精确判定，字符串前缀匹配会被 `http://10.evil.com` 这类数字开头的
+/// DNS 域名绕过
+fn is_private_host(u: &str) -> bool {
+    let parsed = match reqwest::Url::parse(u) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // IPv6 字面量带方括号（[::1]），解析前剥掉
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 /// 在系统默认浏览器打开指定 URL（仅用于展示本服务自己的地址）
 #[tauri::command]
 fn open_display_page(url: String) -> Result<(), String> {
-    if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:") && !url.starts_with("http://192.168.") && !url.starts_with("http://10.") && !url.starts_with("http://172.") {
+    if !is_private_host(&url) {
         return Err("仅允许打开本机或局域网地址".into());
     }
     #[cfg(target_os = "windows")]
@@ -979,11 +994,6 @@ fn open_display_page(url: String) -> Result<(), String> {
     };
     cmd.spawn().map_err(|e| format!("打开失败：{e}"))?;
     Ok(())
-}
-
-#[tauri::command]
-fn quit_app(app: AppHandle) {
-    app.exit(0);
 }
 
 /// 本应用当前是否以管理员身份运行（管理员窗口注入按键需要）
@@ -1058,15 +1068,7 @@ pub fn run() {
         .manage(Ctx {
             config: Mutex::new(None),
             recording: Mutex::new(None),
-            watcher_cancel: Arc::new(AtomicBool::new(false)),
-            skip_llm_next: AtomicBool::new(false),
             overlay_pinned: AtomicBool::new(false),
-            stream_active: AtomicBool::new(false),
-            stream_done: AtomicBool::new(false),
-            stream_finished: AtomicBool::new(true),
-            stream_cut: AtomicUsize::new(0),
-            stream_queue: Mutex::new(VecDeque::new()),
-            stream_texts: Mutex::new(Vec::new()),
             pending_review: Mutex::new(None),
             last_audio: Mutex::new(None),
             overlay_manual: AtomicBool::new(false),
@@ -1074,7 +1076,7 @@ pub fn run() {
         })
         .setup(|app| {
             let cfg = config::load(app.handle());
-            *app.state::<Ctx>().config.lock().unwrap() = Some(cfg.clone());
+            *app.state::<Ctx>().config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg.clone());
             // 先清掉上次崩溃/强杀遗留的 llama-server（曾以 ~10GB 提交内存常驻多日，
             // 加重系统内存压力导致白屏/卡死），本次会话按需重新拉起并纳入 Job Object
             {
@@ -1103,8 +1105,12 @@ pub fn run() {
                     }
                 });
             }
-            // 外接显示（硬件字幕屏）API：开机自启
-            display_api::apply(&cfg.external_display);
+            // 外接显示（硬件字幕屏）API：开机自启。绑定/就绪等待最坏可到
+            // 秒级（端口被占重试 + 就绪超时），放后台线程，不拖慢启动
+            {
+                let ext = cfg.external_display.clone();
+                std::thread::spawn(move || display_api::apply(&ext));
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1112,7 +1118,7 @@ pub fn run() {
                 if window.label() == "main" {
                     let keep_in_tray = {
                         let state = window.app_handle().state::<Ctx>();
-                        let guard = state.config.lock().unwrap();
+                        let guard = state.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         guard
                             .as_ref()
                             .map(|c| c.general.close_to_tray)
@@ -1131,8 +1137,7 @@ pub fn run() {
                         .app_handle()
                         .state::<Ctx>()
                         .config
-                        .lock()
-                        .unwrap()
+                        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
                     if let Some(cfg) = cfg {
                         if let Err(e) = config::save(window.app_handle(), &cfg) {
@@ -1155,7 +1160,6 @@ pub fn run() {
             mic_test_all,
             mic_hw_levels,
             set_mic_hw_level,
-            scan_devices,
             open_mic_settings,
             start_recording,
             stop_recording,
@@ -1179,8 +1183,6 @@ pub fn run() {
             confirm_edit,
             cancel_review,
             optimize_text,
-            show_main,
-            quit_app,
             display_status,
             open_display_page,
             is_elevated,
@@ -1195,4 +1197,32 @@ pub fn run() {
                 qwen_asr::shutdown(app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_private_host;
+
+    #[test]
+    fn private_host_accepts_loopback_and_private_ranges() {
+        assert!(is_private_host("http://127.0.0.1:8866/display"));
+        assert!(is_private_host("http://localhost:8866/display"));
+        assert!(is_private_host("http://[::1]:8866/display"));
+        assert!(is_private_host("http://192.168.1.5:8866/display"));
+        assert!(is_private_host("http://10.0.0.8:8866/display"));
+        assert!(is_private_host("http://172.16.0.2:8866/display"));
+    }
+
+    #[test]
+    fn private_host_rejects_lookalikes_and_public_hosts() {
+        // 数字开头的前缀仿冒域名——旧字符串前缀匹配会全部放行
+        assert!(!is_private_host("http://10.evil.com/display"));
+        assert!(!is_private_host("http://192.168.evil.com/x"));
+        assert!(!is_private_host("http://172.evil.com/x"));
+        // 公网与协议限制
+        assert!(!is_private_host("http://example.com/display"));
+        assert!(!is_private_host("http://8.8.8.8/x"));
+        assert!(!is_private_host("https://127.0.0.1:8866/x"));
+        assert!(!is_private_host("172.32.0.1"));
+    }
 }

@@ -11,9 +11,17 @@ fn mouse_location() -> Option<(i32, i32)> {
     Enigo::new(&Settings::default()).ok()?.location().ok()
 }
 
-/// 界面缩放后的实际窗口逻辑尺寸：前端用 body.zoom 缩放卡片并同步放大窗口，
-/// 定位与工作区夹紧必须按放大后的尺寸计算，否则大缩放下卡片会越出屏幕
-fn overlay_size(app: &AppHandle) -> (f64, f64) {
+/// 界面缩放后的实际窗口逻辑尺寸：优先读窗口当前真实内尺寸（done 阶段前端
+/// 会把窗口撑高、且新会话 show() 时可能尚未复位），按过期常数定位会让长大
+/// 的卡片压住它本要避开的输入框；读不到再退回基准常数 × 缩放
+fn overlay_size(app: &AppHandle, win: &tauri::WebviewWindow) -> (f64, f64) {
+    if let Ok(size) = win.inner_size() {
+        let scale = win.scale_factor().unwrap_or(1.0);
+        let s = size.to_logical::<f64>(scale);
+        if s.width >= 300.0 && s.height >= 120.0 {
+            return (s.width, s.height);
+        }
+    }
     let scale = app
         .state::<crate::Ctx>()
         .config
@@ -44,13 +52,13 @@ pub fn show(app: &AppHandle) {
     }
 
     // 优先：贴近正在输入的输入框（ZCode/Codex 等聊天式输入框上方）
-    let (ov_w, ov_h) = overlay_size(app);
+    let (ov_w, ov_h) = overlay_size(app, &win);
     if let Some(((x, y, above), title)) = crate::caret::overlay_position(ov_w, ov_h) {
         let _ = win.set_position(tauri::PhysicalPosition::new(
             x.round() as i32,
             y.round() as i32,
         ));
-        let _ = crate::events::emit(
+        crate::events::emit(
             app,
             "sn-target",
             serde_json::json!({

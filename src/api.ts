@@ -8,6 +8,7 @@ import type {
   LlmConfig,
   LocalModelStatus,
   MicTestResult,
+  ProviderProfile,
 } from './types';
 
 export const isMac =
@@ -67,7 +68,6 @@ export interface DeviceScanRow {
   channelPeaks?: number[];
   frames?: number;
 }
-export const scanDevices = () => invoke<DeviceScanRow[]>('scan_devices');
 /** 同时打开所有输入设备并发采集（一次说话对比全部端点），期间发送 sn-mic-level-all 事件 */
 export const micTestAll = (durationMs = 3200) =>
   invoke<DeviceScanRow[]>('mic_test_all', { durationMs });
@@ -97,8 +97,8 @@ export const setMicHwLevel = (
 export const startRecording = () =>
   invoke<string>('start_recording', { fromUi: true });
 export const stopRecording = () => invoke<string>('stop_recording');
-export const testAsr = (config: AsrConfig) =>
-  invoke<string>('test_asr', { config });
+export const testAsr = (config: AsrConfig, providers: ProviderProfile[]) =>
+  invoke<string>('test_asr', { config, providers });
 export const builtinModels = () =>
   invoke<LocalModelStatus[]>('builtin_models');
 export const downloadBuiltin = (id: string, mirror: string) =>
@@ -108,8 +108,8 @@ export const deleteBuiltin = (id: string) =>
   invoke('delete_builtin', { id });
 export const listLlmModels = (baseUrl: string, apiKey: string) =>
   invoke<string[]>('list_models', { baseUrl, apiKey });
-export const testLlm = (config: LlmConfig) =>
-  invoke<string>('test_llm', { config });
+export const testLlm = (config: LlmConfig, providers: ProviderProfile[]) =>
+  invoke<string>('test_llm', { config, providers });
 export const getHistory = () => invoke<HistoryItem[]>('get_history');
 export const clearHistory = () => invoke('clear_history');
 export const deleteHistory = (ts: number) => invoke('delete_history', { ts });
@@ -127,7 +127,7 @@ export const exportText = (filename: string, content: string) =>
   invoke<string>('export_text', { filename, content });
 export const confirmEdit = (text: string) => invoke('confirm_edit', { text });
 export const cancelReview = () => invoke('cancel_review');
-/** 审阅窗口重新优化；mode 可覆盖本次模式（correct / polish / prompt），结果流式逐字回填 */
+/** 审阅窗口重新优化；mode 可覆盖本次模式（correct / polish / prompt / translate），结果流式逐字回填 */
 export const optimizeText = (text: string, mode?: string) =>
   invoke<string>('optimize_text', { text, mode: mode ?? null });
 
@@ -202,16 +202,6 @@ function prettyPart(part: string): string {
   if (/^F\d{1,2}$/.test(part)) return part;
   if (/^Numpad\d$/.test(part)) return 'Num' + part.slice(6);
   return CODE_LABELS[part] ?? part;
-}
-
-/** 把 "ctrl+shift+Space" 这样的内部表示格式化为用户可读形式 */
-export function prettyShortcut(s: string): string {
-  if (!s) return '';
-  return s
-    .split('+')
-    .filter(Boolean)
-    .map(prettyPart)
-    .join(isMac ? '' : ' + ');
 }
 
 /** 拆分为可渲染的键位徽章数组 */

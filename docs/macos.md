@@ -22,7 +22,7 @@ CI 产物未做开发者签名与公证，首次打开会被 Gatekeeper 拦截�
 | 权限 | 用途 | 时机 |
 |---|---|---|
 | **麦克风** | 采集语音（Info.plist 已声明用途） | 首次录音 |
-| **辅助功能（Accessibility）** | 全局快捷键监听 + 模拟 ⌘V 粘贴 / 键入 | 首次按下快捷键时 |
+| **辅助功能（Accessibility）** | 模拟 ⌘V 粘贴 / 键入（全局快捷键经系统热键注册，**不需要**此权限） | 首次粘贴输入时 |
 | **输入监控（Input Monitoring）** | 部分系统版本上 enigo 需要它模拟按键 | 视系统提示 |
 
 授权辅助功能后如仍无响应，重启一次应用让权限生效。
@@ -55,6 +55,6 @@ open src-tauri/target/release/bundle/macos/   # 或直接运行 .app
 | 系统麦克风音量读取/调节 | ✅ | 不支持（软件增益仍可用） |
 | 「终端键入」输出模式 | ✅ | 不适用（Mac 终端均支持 ⌘V） |
 | 管理员提权（UIPI）相关 | ✅ | 不适用 |
-| 本地 Whisper / Qwen3-ASR | 可启用 GPU 加速 | CPU 推理，较慢；Mac 上建议用云端 ASR |
+| 本地 Whisper | CPU 推理 | 同左（较慢）；Qwen3-ASR 引擎仅限 Windows。Mac 上建议用云端 ASR |
 
 配置与数据目录：`~/Library/Application Support/com.speaknow.app/`。

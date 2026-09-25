@@ -38,10 +38,10 @@ pub fn join_transcripts(parts: &[String]) -> String {
             out.push_str(p);
             continue;
         }
-        let ends_punct = out.chars().last().map_or(false, punct);
-        let starts_punct = p.chars().next().map_or(false, punct);
-        let latin_edge = out.chars().last().map_or(false, |c| c.is_ascii())
-            && p.chars().next().map_or(false, |c| c.is_ascii());
+        let ends_punct = out.chars().last().is_some_and(punct);
+        let starts_punct = p.chars().next().is_some_and(punct);
+        let latin_edge = out.chars().last().is_some_and(|c| c.is_ascii())
+            && p.chars().next().is_some_and(|c| c.is_ascii());
         if !ends_punct && !starts_punct {
             out.push(if latin_edge { ' ' } else { '，' });
         } else if latin_edge && !starts_punct {
@@ -113,14 +113,15 @@ pub async fn transcribe(
     }
     // GLM-ASR 热词联动：AI 术语表的规范写法自动并入 ASR 热词——
     // 专有名词在识别源头就倾向于正确写法，比事后靠 LLM 纠正可靠得多。
-    // 仅对智谱接口启用：其余兼容接口对多余表单字段的容忍度未知。
+    // 仅对智谱接口启用（主机名精确匹配 open.bigmodel.cn，避免子串误命中
+    // bigmodel-proxy.example.com 之类把术语表发给无关端点）：
+    // 其余兼容接口对多余表单字段的容忍度未知。
     let mut http_cfg = cfg.clone();
-    if http_cfg.base_url.to_lowercase().contains("bigmodel") {
+    if is_bigmodel_host(&http_cfg.base_url) {
         let glossary = app
             .state::<crate::Ctx>()
             .config
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .unwrap_or_default()
             .llm
@@ -132,6 +133,15 @@ pub async fn transcribe(
     transcribe_http_chunked(&http_cfg, samples).await
 }
 
+/// 主机是否智谱 bigmodel（解析 URL 后精确比较，子串包含会误命中代理域名）
+fn is_bigmodel_host(base: &str) -> bool {
+    let parsed = match reqwest::Url::parse(base.trim().trim_end_matches('/')) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    parsed.host_str().map(|h| h.eq_ignore_ascii_case("open.bigmodel.cn")).unwrap_or(false)
+}
+
 /// 合并 ASR 热词与 LLM 术语表（术语行取「=」左侧的规范写法），去重、上限 100
 fn merge_hotwords(existing: &str, glossary: &str) -> String {
     let glossary_terms = glossary
@@ -140,7 +150,7 @@ fn merge_hotwords(existing: &str, glossary: &str) -> String {
     let mut seen: Vec<String> = Vec::new();
     let mut merged: Vec<&str> = Vec::new();
     for term in existing
-        .split(|c| c == '\n' || c == ',' || c == '，')
+        .split(['\n', ',', '，'])
         .map(str::trim)
         .chain(glossary_terms)
     {
@@ -226,9 +236,9 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
     if base.is_empty() {
         bail!("尚未配置 ASR 接口地址");
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_sec.max(5)))
-        .build()?;
+    // 共享客户端（连接复用）：超时按请求覆盖
+    let client = &*crate::http::CLIENT;
+    let req_timeout = Duration::from_secs(cfg.timeout_sec.max(5));
 
     let (url, resp) = match &kind {
         RequestKind::Mimo(body) => {
@@ -237,7 +247,10 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
             } else {
                 format!("/{}", cfg.endpoint_path)
             };
-            let mut req = client.post(format!("{base}{path}")).json(body);
+            let mut req = client
+                .post(format!("{base}{path}"))
+                .timeout(req_timeout)
+                .json(body);
             if !cfg.api_key.trim().is_empty() {
                 req = req.bearer_auth(cfg.api_key.trim());
             }
@@ -264,7 +277,7 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
             // 热词：换行/逗号分隔 → JSON 数组（GLM-ASR 等支持）
             let hotwords: Vec<String> = cfg
                 .hotwords
-                .split(|c| c == '\n' || c == ',' || c == '，')
+                .split(['\n', ',', '，'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .take(100)
@@ -274,7 +287,7 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
                 form = form.text("hotwords", serde_json::to_string(&hotwords)?);
             }
 
-            let mut req = client.post(&url).multipart(form);
+            let mut req = client.post(&url).timeout(req_timeout).multipart(form);
             if !cfg.api_key.trim().is_empty() {
                 req = req.bearer_auth(cfg.api_key.trim());
             }
@@ -357,7 +370,20 @@ fn extract_text(body: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_transcripts, merge_hotwords};
+    use super::{is_bigmodel_host, join_transcripts, merge_hotwords};
+
+    #[test]
+    fn bigmodel_host_matches_exactly() {
+        assert!(is_bigmodel_host("https://open.bigmodel.cn/api/paas/v4"));
+        assert!(is_bigmodel_host(
+            "https://OPEN.BIGMODEL.CN/api/paas/v4/"
+        ));
+        // 子串命中但主机不同：不得把术语表发给这些端点
+        assert!(!is_bigmodel_host("https://bigmodel-proxy.example.com/api"));
+        assert!(!is_bigmodel_host("https://open.bigmodel.cn.evil.com/api"));
+        assert!(!is_bigmodel_host("https://api.deepseek.com"));
+        assert!(!is_bigmodel_host("not a url"));
+    }
 
     #[test]
     fn merge_dedups_and_strips_aliases() {

@@ -65,16 +65,26 @@ mod imp {
     /// 官方值 10024（本版 windows crate 未导出）
     const UIA_TEXT_PATTERN2_ID: UIA_PATTERN_ID = UIA_PATTERN_ID(10024);
 
-    struct ComGuard;
+    /// COM 初始化守卫。热键回调运行在 tao 的 STA 主线程上——对该线程
+    /// CoInitializeEx(MULTITHREADED) 返回 RPC_E_CHANGED_MODE，旧实现直接
+    /// 放弃，导致热键路径（主用法）的光标跟随三级策略全部失效、悬浮窗
+    /// 永远回退到屏幕底部。正确做法：模式冲突时视为「借用」线程上已初始
+    /// 化的 COM（可用，只是不归我们所有），跳过配对的 CoUninitialize。
+    struct ComGuard {
+        /// true = 本线程成功初始化（含 S_FALSE 重入），需要配对 CoUninitialize
+        owned: bool,
+    }
     impl ComGuard {
-        fn new() -> windows::core::Result<Self> {
-            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-            Ok(ComGuard)
+        fn new() -> Self {
+            let owned = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            ComGuard { owned }
         }
     }
     impl Drop for ComGuard {
         fn drop(&mut self) {
-            unsafe { CoUninitialize() };
+            if self.owned {
+                unsafe { CoUninitialize() };
+            }
         }
     }
 
@@ -124,7 +134,7 @@ mod imp {
             }
             let mut vals = Vec::with_capacity(n);
             for i in 0..n.min(16) {
-                let idx = (lb + i as i32) as i32;
+                let idx = lb + i as i32;
                 let mut v = 0f64;
                 if SafeArrayGetElement(psa, &idx, &mut v as *mut f64 as *mut core::ffi::c_void)
                     .is_err()
@@ -143,13 +153,15 @@ mod imp {
     }
 
     pub fn focused_anchor() -> Option<TargetInfo> {
-        let _com = ComGuard::new().ok()?;
+        let _com = ComGuard::new();
         unsafe {
             let fg = GetForegroundWindow();
-            let title = window_title(fg);
-            if title.is_empty() {
+            if fg.is_invalid() {
                 return None;
             }
+            // 空标题（启动画面/UWP 框架窗口）不应中断锚点探测——标题只用于
+            // sn-target 展示，定位链照常走
+            let title = window_title(fg);
 
             // 1) UIA 光标（TextPattern2 → TextPattern GetSelection）
             if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_ALL) {

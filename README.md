@@ -18,6 +18,7 @@
 
 - **全局快捷键**：默认 `Ctrl+Shift+Space`，支持「按一下开始/结束」与「按住说话」两种模式，可改绑任意组合键
 - **快速模式第二快捷键**：跳过 AI 优化直接输出原文，追求极致速度
+- **翻译模式快捷键（可选）**：本次听写强制翻译——说完直接输出目标语言译文，不改默认模式
 - **静音自动结束（VAD）**：检测到停止说话自动收音，可调灵敏度与静音时长
 - **自动输入**：默认剪贴板粘贴（瞬时、支持多行、**自动还原剪贴板内容**），可选模拟键盘逐字输入；可自动回车提交；老式终端可切 `Shift+Insert`
 - **预览编辑模式**：可选「输入前确认」——结果先显示在悬浮窗中，可手动编辑、重新 AI 优化，再确认输入
@@ -40,10 +41,11 @@
 - **语气词清理**：自动去除「嗯 / 呃 / yeah」等口头音与呼吸声幻觉
 - **长语音自动分段**：云端 30 秒限制自动按 28s 分段拼接，网络抖动自动重试
 
-### AI 纠错与优化
+### AI 纠错、润色与翻译
 
+- **统一 API 凭据组**：同一家服务商只需填一次 Key——「AI 优化」页集中管理凭据（地址 + Key），语音识别与 AI 优化共用（如智谱一个 Key 同用 GLM-ASR 与 GLM 纠错）；旧配置自动迁移
 - 转写结果再经大模型处理：**GLM / DeepSeek / Kimi / OpenAI** 预设，以及**本地 Ollama / LM Studio / llama.cpp（免 Key）**，可一键拉取本机模型列表
-- 三种模式：**仅纠错**（修同音字与标点）/ **纠错 + 润色**（整理为书面表达）/ **优化为编程提示词**（把口述整理成给 Codex/AI 的高质量指令）
+- 四种模式：**仅纠错**（修同音字与标点）/ **纠错 + 润色**（整理为书面表达）/ **优化为编程提示词**（把口述整理成给 Codex/AI 的高质量指令）/ **翻译**（说完直接输出目标语言译文，支持第二目标语言与双语对照输出；托盘菜单可随时切换模式与目标语言）
 - 支持自定义术语表与完全自定义指令模板（`{text}` 占位符）
 
 ### 悬浮窗（跟随光标）
@@ -103,9 +105,9 @@ npm run tauri build            # Windows 下生成 NSIS 安装包；macOS 下生
 
 产物位置：
 
-- Windows 安装包：`src-tauri/target/release/bundle/nsis/SpeakNow_0.4.6_x64-setup.exe`
+- Windows 安装包：`src-tauri/target/release/bundle/nsis/SpeakNow_0.4.8_x64-setup.exe`
 - Windows 绿色单文件：`src-tauri/target/release/speaknow.exe`（免安装直接运行）
-- macOS：`src-tauri/target/release/bundle/dmg/SpeakNow_0.4.6_aarch64.dmg`
+- macOS：`src-tauri/target/release/bundle/dmg/SpeakNow_0.4.8_aarch64.dmg`
 
 各平台安装包（含 macOS Apple Silicon DMG）也可直接从 [Releases](https://github.com/YFsama/SpeakNow/releases) 下载。macOS 的权限授权与 Gatekeeper 说明见 [docs/macos.md](./docs/macos.md)。
 
@@ -114,9 +116,9 @@ npm run tauri build            # Windows 下生成 NSIS 安装包；macOS 下生
 ## 📖 使用说明
 
 1. 首次启动后在「语音识别」选择引擎：
-   - **MiMo / 云端 API**：填入 API Key，点「测试连接」验证（推荐[智谱开放平台](https://bigmodel.cn)，一个 Key 同时用于 GLM-ASR 与 GLM 纠错）
-   - **本地离线**：在模型卡片点「↓ 下载」（Whisper Base 291MB 起步；追求中文准确率选 Qwen3-ASR，需约 2.4GB 磁盘与 8GB+ 内存，有 NVIDIA/AAMD/Intel 独显会自动启用 GPU 加速）
-2. 「AI 优化」可选开启并配置模型（无 Key 可用本地 Ollama：先 `ollama pull qwen3:4b`）
+   - **MiMo / 云端 API**：推荐先在「AI 优化」页顶部添加** API 凭据组**（填地址与 Key，一个智谱 Key 可同时用于 GLM-ASR 与 GLM 纠错），再在两页选择该凭据组，点「测试连接」验证（推荐[智谱开放平台](https://bigmodel.cn)）
+   - **本地离线**：在模型卡片点「↓ 下载」（Whisper Base 291MB 起步；追求中文准确率选 Qwen3-ASR，需约 2.4GB 磁盘与 8GB+ 内存，有 NVIDIA/AMD/Intel 独显会自动启用 GPU 加速；Qwen3-ASR 仅 Windows）
+2. 「AI 优化」可选开启并配置模型（无 Key 可用本地 Ollama：先 `ollama pull qwen3:4b`）；需要跨语言输入时把模式切到「翻译」或设一个翻译快捷键
 3. 「麦克风」选择设备并测试电平（无线麦建议跑一次「自动校准」）
 4. 打开任意输入框 → `Ctrl+Shift+Space` 说话 → 松开/再按一下 → 文字自动输入
 

@@ -1,12 +1,37 @@
 export type HotkeyMode = 'hold' | 'toggle';
-export type LlmMode = 'correct' | 'polish' | 'prompt';
+export type LlmMode = 'correct' | 'polish' | 'prompt' | 'translate';
 export type PasteMethod = 'clipboard' | 'typing';
 export type PasteKey = 'auto' | 'ctrl+v' | 'ctrl+shift+v' | 'shift+insert' | 'terminal-typing';
+
+/** 翻译目标语言候选（代码 → 展示名），与后端 config::TRANSLATE_LANGS 保持一致 */
+export const TRANSLATE_LANGS: ReadonlyArray<[string, string]> = [
+  ['zh', '中文'],
+  ['en', 'English'],
+  ['ja', '日本語'],
+  ['ko', '한국어'],
+  ['fr', 'Français'],
+  ['de', 'Deutsch'],
+  ['es', 'Español'],
+  ['ru', 'Русский'],
+];
+
+export const langName = (code: string) =>
+  TRANSLATE_LANGS.find(([c]) => c === code)?.[1] ?? code;
+
+/** 统一 API 凭据组：一处维护 base_url + api_key，语音识别与 AI 优化共同引用 */
+export interface ProviderProfile {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+}
 
 export interface HotkeyConfig {
   key: string;
   /** 快速模式快捷键（可选）：跳过 AI 优化直接输出原文 */
   keyQuick: string;
+  /** 翻译模式快捷键（可选）：本次听写强制翻译，输出目标语言译文 */
+  keyTranslate: string;
   mode: HotkeyMode;
   enabled: boolean;
 }
@@ -31,6 +56,8 @@ export interface AudioConfig {
 export interface AsrConfig {
   /** http（云端/自建接口）| local（内置离线 Whisper） */
   provider: 'http' | 'local' | 'mimo';
+  /** 引用凭据组 id：命中时以凭据组的 baseUrl/apiKey 为准，空则用下方内联字段 */
+  providerId?: string;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -45,7 +72,7 @@ export interface AsrConfig {
   mirror: string;
   /** 边说边出字：录音期间按停顿自动分段识别 */
   streaming: boolean;
-  // **u8EBA6C148BCD6E057406**
+  /** 清理语气词（「嗯/呃/yeah」等口头音与呼吸声幻觉） */
   stripFillers: boolean;
 }
 
@@ -66,6 +93,8 @@ export interface LocalModelStatus {
 
 export interface LlmConfig {
   enabled: boolean;
+  /** 引用凭据组 id：命中时以凭据组的 baseUrl/apiKey 为准，空则用下方内联字段 */
+  providerId?: string;
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -73,6 +102,12 @@ export interface LlmConfig {
   glossary: string;
   customPrompt: string;
   timeoutSec: number;
+  /** 翻译目标语言代码（见 TRANSLATE_LANGS） */
+  translateTarget: string;
+  /** 第二目标语言：识别语言==目标语言时改译为此语言（如目标 en、第二 zh：说中出英、说英出中） */
+  translateSecondTarget: string;
+  /** translation（仅译文）| bilingual（原文 + 译文两行） */
+  translateOutput: 'translation' | 'bilingual';
 }
 
 export interface OutputConfig {
@@ -111,6 +146,8 @@ export interface ExternalDisplayConfig {
 }
 
 export interface Config {
+  /** 统一 API 凭据组（v2 配置；旧配置启动时自动迁移） */
+  providers: ProviderProfile[];
   hotkey: HotkeyConfig;
   audio: AudioConfig;
   asr: AsrConfig;
@@ -118,6 +155,21 @@ export interface Config {
   output: OutputConfig;
   general: GeneralConfig;
   externalDisplay: ExternalDisplayConfig;
+}
+
+/** 展开凭据组引用后的生效凭据（providerId 命中 → 凭据组，否则内联字段） */
+export function resolvedAsrCreds(cfg: Config): { baseUrl: string; apiKey: string } {
+  const p = cfg.providers?.find((x) => x.id === cfg.asr.providerId);
+  return p
+    ? { baseUrl: p.baseUrl, apiKey: p.apiKey }
+    : { baseUrl: cfg.asr.baseUrl, apiKey: cfg.asr.apiKey };
+}
+
+export function resolvedLlmCreds(cfg: Config): { baseUrl: string; apiKey: string } {
+  const p = cfg.providers?.find((x) => x.id === cfg.llm.providerId);
+  return p
+    ? { baseUrl: p.baseUrl, apiKey: p.apiKey }
+    : { baseUrl: cfg.llm.baseUrl, apiKey: cfg.llm.apiKey };
 }
 
 export interface HistoryItem {
@@ -137,18 +189,14 @@ export type Stage =
   | 'done'
   | 'error';
 
-export interface StatusPayload {
-  stage: Stage;
-  message: string;
-  sound?: boolean;
-}
-
 /** 一次会话使用的模型链路（Rust 在识别开始时广播） */
 export interface MetaPayload {
   asrModel: string;
   llmEnabled: boolean;
   llmModel: string;
   skip: boolean;
+  /** 本次会话为翻译模式 */
+  translate?: boolean;
 }
 
 /** 输入设备（含默认标记与规格） */
@@ -181,7 +229,7 @@ export type TabId =
 /** 各设置分页共享的 props */
 export interface TabProps {
   cfg: Config;
-  set: <K extends keyof Config>(key: K, patch: Partial<Config[K]>) => void;
+  set: <K extends keyof Config>(key: K, patch: Partial<Config[K]> | Config[K]) => void;
   toast: (s: string) => void;
   navigate: (tab: TabId) => void;
   stage: Stage;

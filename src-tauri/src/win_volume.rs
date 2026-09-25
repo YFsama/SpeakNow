@@ -2,11 +2,11 @@
 //! 以及驱动层硬件 dB 增益（DeviceTopology → IAudioVolumeLevel，如 Mic Boost / 麦克风加强）
 #![cfg(target_os = "windows")]
 
-use windows::core::{Interface, IUnknown};
+use windows::core::Interface;
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, Endpoints::IAudioEndpointVolume, IAudioVolumeLevel, IConnector,
+    eCapture, eConsole, Endpoints::IAudioEndpointVolume, IAudioVolumeLevel,
     IDeviceTopology, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, IPart,
-    IPartsList, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -175,10 +175,48 @@ fn part_name(p: &IPart) -> String {
 }
 
 fn push_part(p: IPart, visited: &mut Vec<*mut core::ffi::c_void>, queue: &mut Vec<IPart>) {
-    let key = unsafe { p.as_raw() };
+    let key = p.as_raw();
     if !visited.contains(&key) {
         visited.push(key);
         queue.push(p);
+    }
+}
+
+/// BFS 遍历设备拓扑的全部子单元，对实现 IAudioVolumeLevel 的每个子单元
+/// 调用 f。hw_levels_in（收集列表）与 set_hw_level（按名定位写入）共用
+/// 同一条遍历：此前 set 只查直接连接器邻居，深一层的 Mic Boost 会
+/// 「列表里显示、设置时静默失败」
+unsafe fn visit_hw_levels(dev: &IMMDevice, mut f: impl FnMut(&IPart, &IAudioVolumeLevel)) {
+    let Ok(topo) = dev.Activate::<IDeviceTopology>(CLSCTX_ALL, None) else {
+        return;
+    };
+    let Ok(count) = topo.GetConnectorCount() else {
+        return;
+    };
+    // BFS：从端点拓扑的连接器走到相邻（适配器）拓扑，再沿 EnumPartsIncoming 深入
+    let mut visited: Vec<*mut core::ffi::c_void> = Vec::new();
+    let mut queue: Vec<IPart> = Vec::new();
+    for i in 0..count {
+        let Ok(conn) = topo.GetConnector(i) else { continue };
+        let Ok(peer) = conn.GetConnectedTo() else { continue };
+        if let Ok(p) = peer.cast::<IPart>() {
+            push_part(p, &mut visited, &mut queue);
+        }
+    }
+    while let Some(p) = queue.pop() {
+        if let Ok(vol) = p.cast::<IAudioVolumeLevel>() {
+            f(&p, &vol);
+        }
+        // 继续向物理插孔方向遍历
+        if let Ok(list) = p.EnumPartsIncoming() {
+            if let Ok(n) = list.GetCount() {
+                for i in 0..n {
+                    if let Ok(sub) = list.GetPart(i) {
+                        push_part(sub, &mut visited, &mut queue);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -186,57 +224,26 @@ fn push_part(p: IPart, visited: &mut Vec<*mut core::ffi::c_void>, queue: &mut Ve
 fn hw_levels_in(dev: &IMMDevice) -> Vec<HwLevel> {
     let mut out: Vec<HwLevel> = Vec::new();
     unsafe {
-        let Ok(topo) = dev.Activate::<IDeviceTopology>(CLSCTX_ALL, None) else {
-            return out;
-        };
-        let Ok(count) = topo.GetConnectorCount() else {
-            return out;
-        };
-
-        // BFS：从端点拓扑的连接器走到相邻（适配器）拓扑，再沿 EnumPartsIncoming 深入
-        let mut visited: Vec<*mut core::ffi::c_void> = Vec::new();
-        let mut queue: Vec<IPart> = Vec::new();
-        for i in 0..count {
-            let Ok(conn) = topo.GetConnector(i) else { continue };
-            let Ok(peer) = conn.GetConnectedTo() else { continue };
-            if let Ok(p) = peer.cast::<IPart>() {
-                push_part(p, &mut visited, &mut queue);
-            }
-        }
-
-        while let Some(p) = queue.pop() {
-            // 该子单元若实现 IAudioVolumeLevel，记录其 dB 范围
-            if let Ok(vol) = p.cast::<IAudioVolumeLevel>() {
-                let (mut min, mut max, mut step) = (0f32, 0f32, 0f32);
-                if vol.GetChannelCount().unwrap_or(0) > 0
-                    && vol.GetLevelRange(0, &mut min, &mut max, &mut step).is_ok()
-                {
-                    if let Ok(cur) = vol.GetLevel(0) {
-                        let name = part_name(&p);
-                        if !name.is_empty() {
-                            out.push(HwLevel {
-                                name,
-                                channels: vol.GetChannelCount().unwrap_or(1),
-                                min_db: min,
-                                max_db: max,
-                                step_db: step,
-                                cur_db: cur,
-                            });
-                        }
+        visit_hw_levels(dev, |p, vol| {
+            let (mut min, mut max, mut step) = (0f32, 0f32, 0f32);
+            if vol.GetChannelCount().unwrap_or(0) > 0
+                && vol.GetLevelRange(0, &mut min, &mut max, &mut step).is_ok()
+            {
+                if let Ok(cur) = vol.GetLevel(0) {
+                    let name = part_name(p);
+                    if !name.is_empty() {
+                        out.push(HwLevel {
+                            name,
+                            channels: vol.GetChannelCount().unwrap_or(1),
+                            min_db: min,
+                            max_db: max,
+                            step_db: step,
+                            cur_db: cur,
+                        });
                     }
                 }
             }
-            // 继续向物理插孔方向遍历
-            if let Ok(list) = p.EnumPartsIncoming() {
-                if let Ok(n) = list.GetCount() {
-                    for i in 0..n {
-                        if let Ok(sub) = list.GetPart(i) {
-                            push_part(sub, &mut visited, &mut queue);
-                        }
-                    }
-                }
-            }
-        }
+        });
     }
     out.sort_by(|a, b| {
         b.max_db
@@ -260,34 +267,35 @@ pub fn hw_levels(device: Option<&str>) -> Vec<HwLevel> {
     }
 }
 
-/// 设置某个硬件 dB 控件（按名称匹配），对齐到步进网格后写入所有声道
+/// 设置某个硬件 dB 控件（按名称匹配），对齐到步进网格后写入所有声道。
+/// 与 hw_levels 同一条拓扑遍历：列表里出现的控件一定设得到
 pub fn set_hw_level(device: Option<&str>, name: &str, db: f32) -> Option<f32> {
     let _com = ComGuard::new().ok()?;
     let en = enumerator().ok()?;
     let (dev, _) = target_device(&en, device)?;
+    let mut result: Option<f32> = None;
     unsafe {
-        let topo: IDeviceTopology = dev.Activate(CLSCTX_ALL, None).ok()?;
-        let count = topo.GetConnectorCount().ok()?;
-        for i in 0..count {
-            let Ok(conn) = topo.GetConnector(i) else { continue };
-            let Ok(peer) = conn.GetConnectedTo() else { continue };
-            let Ok(p) = peer.cast::<IPart>() else { continue };
-            if part_name(&p) == name {
-                let vol = p.cast::<IAudioVolumeLevel>().ok()?;
-                let (mut min, mut max, mut step) = (0f32, 0f32, 0f32);
-                vol.GetLevelRange(0, &mut min, &mut max, &mut step).ok()?;
-                let mut v = db.clamp(min, max);
-                if step > 0.0 {
-                    v = ((v - min) / step).round() * step + min;
-                    v = v.clamp(min, max);
-                }
-                let chs = vol.GetChannelCount().ok().unwrap_or(1);
-                for ch in 0..chs.max(1) {
-                    vol.SetLevel(ch, v, None).ok()?;
-                }
-                return Some(v);
+        visit_hw_levels(&dev, |p, vol| {
+            if result.is_some() || part_name(p) != name {
+                return;
             }
-        }
+            let (mut min, mut max, mut step) = (0f32, 0f32, 0f32);
+            if vol.GetLevelRange(0, &mut min, &mut max, &mut step).is_err() {
+                return;
+            }
+            let mut v = db.clamp(min, max);
+            if step > 0.0 {
+                v = ((v - min) / step).round() * step + min;
+                v = v.clamp(min, max);
+            }
+            let chs = vol.GetChannelCount().unwrap_or(1);
+            for ch in 0..chs.max(1) {
+                if vol.SetLevel(ch, v, None).is_err() {
+                    return;
+                }
+            }
+            result = Some(v);
+        });
     }
-    None
+    result
 }

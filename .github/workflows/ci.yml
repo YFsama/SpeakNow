@@ -39,6 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Version consistency (tauri.conf / package.json / Cargo.toml)
+        shell: bash
+        run: |
+          V1=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          V2=$(node -p "require('./package.json').version")
+          V3=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$V1" != "$V2" ] || [ "$V1" != "$V3" ]; then
+            echo "::error::版本不一致 tauri.conf.json=$V1 package.json=$V2 Cargo.toml=$V3"
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -89,12 +100,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows: NSIS installer (.exe)
+          # Windows: NSIS installer (.exe)——唯一负责创建 Release 的臂
+          # （双臂同时创建会撞车，输家上传失败且重跑时两臂全跳过）
           - os: windows-latest
             args: ""
-          # macOS: Apple Silicon (aarch64) .app + .dmg
+            asset: "x64-setup.exe"
+          # macOS: Apple Silicon (aarch64) .app + .dmg——等 Release 出现后上传
           - os: macos-latest
             args: "--target aarch64-apple-darwin"
+            asset: "aarch64.dmg"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -105,6 +119,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ matrix.asset }}
         run: |
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           TAG="v${VERSION}"
@@ -112,12 +127,30 @@ jobs:
             echo "version=${VERSION}"
             echo "tag=${TAG}"
           } >> "$GITHUB_OUTPUT"
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            # macOS 臂不创建 Release：等 Windows 臂建好（构建最长约半小时）
+            if [ "${ASSET}" != "x64-setup.exe" ]; then
+              for i in $(seq 1 90); do
+                if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+                  break
+                fi
+                sleep 30
+              done
+              if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+                echo "::error::等待创建 Release ${TAG} 超时（Windows 臂可能失败）。请重跑本工作流：已存在的产物会跳过，只补缺失平台。"
+                exit 1
+              fi
+            else
+              echo "New version ${TAG} detected, building."
+            fi
+          fi
+          # Release 已存在：本平台产物也在才算发布完成——重跑只补缺的那一臂
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | grep -q "${ASSET}"; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${TAG} already exists, skipping."
+            echo "Release ${TAG} already has ${ASSET}, skipping."
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "New version ${TAG} detected, building."
+            echo "Release ${TAG} exists but ${ASSET} missing, building."
           fi
 
       - name: Extract release notes from CHANGELOG

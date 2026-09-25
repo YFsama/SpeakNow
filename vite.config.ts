@@ -29,6 +29,14 @@ export default defineConfig({
         main: new URL('./index.html', import.meta.url).pathname,
         overlay: new URL('./overlay.html', import.meta.url).pathname,
       },
+      output: {
+        // 共享依赖（主窗口与悬浮窗都用）单独成块，并命名为 vendor——
+        // 否则 Rollup 默认会把共享块叫作入口名（如误导性的 "styles"）。
+        // 两个入口直接 import 的是 react-dom/client（非 react-dom 入口），须一并列入
+        manualChunks: {
+          vendor: ['react', 'react-dom', 'react-dom/client', '@tauri-apps/api'],
+        },
+      },
     },
   },
 });

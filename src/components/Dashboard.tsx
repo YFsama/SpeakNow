@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import type { Stage, TabProps } from '../types';
+import { resolvedAsrCreds, resolvedLlmCreds } from '../types';
 import { shortcutChips } from '../api';
 import { Button, Toggle } from './Controls';
 
@@ -69,7 +70,10 @@ export default function Dashboard({
     const chars = history.reduce((n, h) => n + h.final.length, 0);
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    const today = history.filter((h) => h.ts * 1000 >= todayStart.getTime()).length;
+    // 历史时间戳旧记录为秒、新记录为毫秒，统一折算后比较
+    const today = history.filter(
+      (h) => (h.ts < 1e12 ? h.ts * 1000 : h.ts) >= todayStart.getTime(),
+    ).length;
     const proc = history
       .map((h) => (h.asrMs ?? 0) + (h.llmMs ?? 0))
       .filter((v) => v > 0);
@@ -86,7 +90,10 @@ export default function Dashboard({
   const asrLocalReady =
     cfg.asr.provider === 'local' &&
     localModels.find((m) => m.id === cfg.asr.localModel)?.downloaded === true;
-  const llmIsLocal = /\/\/(localhost|127\.0\.0\.1)/.test(cfg.llm.baseUrl);
+  // 凭据组模式下 Key 存在 providers 里，须按引用解析后再判断
+  const asrCreds = resolvedAsrCreds(cfg);
+  const llmCreds = resolvedLlmCreds(cfg);
+  const llmIsLocal = /\/\/(localhost|127\.0\.0\.1)/.test(llmCreds.baseUrl);
 
   const checklist = [
     cfg.asr.provider === 'local'
@@ -98,17 +105,19 @@ export default function Dashboard({
           tab: 'asr' as const,
         }
       : {
-          ok: cfg.asr.apiKey.trim() !== '',
+          ok: asrCreds.apiKey.trim() !== '',
           label:
-            cfg.asr.apiKey.trim() !== '' ? '云端 ASR 已配置' : 'ASR API Key 未填写',
+            asrCreds.apiKey.trim() !== ''
+              ? '云端 ASR 已配置'
+              : 'ASR API Key 未填写（可在「AI 优化」页凭据组统一配置）',
           tab: 'asr' as const,
         },
     {
-      ok: !cfg.llm.enabled || llmIsLocal || cfg.llm.apiKey.trim() !== '',
+      ok: !cfg.llm.enabled || llmIsLocal || llmCreds.apiKey.trim() !== '',
       label: cfg.llm.enabled
         ? llmIsLocal
           ? 'AI 优化 · 本地服务（免 Key）'
-          : cfg.llm.apiKey.trim() !== ''
+          : llmCreds.apiKey.trim() !== ''
             ? 'AI 优化已配置'
             : 'AI 优化已开启但 Key 未填写'
         : 'AI 优化未开启（可选）',
@@ -374,9 +383,9 @@ export default function Dashboard({
             </button>
           </div>
           <div className="space-y-2">
-            {history.slice(0, 3).map((h) => (
+            {history.slice(0, 3).map((h, idx) => (
               <div
-                key={h.ts}
+                key={`${h.ts}-${idx}`}
                 className="card-lift truncate rounded-lg border border-white/[0.05] bg-black/20 px-3.5 py-2.5 text-[13px] text-slate-300"
               >
                 {h.final}

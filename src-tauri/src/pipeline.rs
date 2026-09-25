@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,35 +27,71 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn toggle(app: &AppHandle, skip_llm: bool) {
+/// 托盘 / 切换模式：正在录音则停止，否则开始。
+/// `skip_llm`：快速模式（跳过 AI 优化）；`translate`：本次听写强制翻译模式
+pub fn toggle(app: &AppHandle, skip_llm: bool, translate: bool) {
     let now = now_ms();
-    let last = LAST_TOGGLE_MS.load(Ordering::SeqCst);
-    if last > 0 && now.saturating_sub(last) < 300 {
-        crate::trace_pipeline(
-            app,
-            &format!("toggle 忽略（{}ms 内重复，疑按键抖动）", now - last),
-        );
-        return;
+    // CAS 去抖：load/store 两步在并发 toggle 下有双双通过的间隙
+    let mut last = LAST_TOGGLE_MS.load(Ordering::SeqCst);
+    loop {
+        if last > 0 && now.saturating_sub(last) < 300 {
+            crate::trace_pipeline(
+                app,
+                &format!("toggle 忽略（{}ms 内重复，疑按键抖动）", now - last),
+            );
+            return;
+        }
+        match LAST_TOGGLE_MS.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(l) => last = l,
+        }
     }
-    LAST_TOGGLE_MS.store(now, Ordering::SeqCst);
     crate::trace_pipeline(app, "toggle（热键）");
-    let recording = app.state::<Ctx>().recording.lock().unwrap().is_some();
+    let recording = app.state::<Ctx>().recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
     if recording {
-        let _ = stop(app, false);
-    } else if let Err(e) = start(app, skip_llm) {
+        let _ = stop(app);
+    } else if let Err(e) = start(app, skip_llm, translate, false) {
         eprintln!("[speaknow] 开始录音失败: {e}");
         emit_status(app, "error", &format!("开始录音失败：{e}"), false);
         hide_later(app, 3000);
     }
 }
 
+/// 一次录音会话的全部状态。旧版这些是全局单份、由 start() 重置——上一会话
+/// 尚在收尾的 watch / 流式分段 worker / run 若跨过重置点，会消费新会话的
+/// 标志、把旧分段推进新队列（字幕重复 / 串话 / 快速模式标志被抢）。现在
+/// 状态随会话创建、随会话消亡，各线程只碰自己这份 Arc。
+pub struct Session {
+    /// 会话代数：start() 递增的全局计数，旧会话的晚到结果据此作废
+    pub gen: u64,
+    /// 设置页发起（结束时只复制不输入）。跟随会话而非 stop 调用方：
+    /// VAD / 最长时长 / 设备错误等自动收尾路径同样保持测试语义
+    pub from_ui: bool,
+    /// 快速模式（跳过 AI 优化）
+    pub skip_llm: bool,
+    /// 本次强制翻译模式
+    pub translate: bool,
+    /// 流式分段开启
+    pub streaming: bool,
+    /// watch 线程退出信号（stop 时置位；仅本会话线程可见，start() 重置不了它）
+    pub cancel: AtomicBool,
+    /// 流式分段游标 / 队列 / 收尾状态（仅本会话的 watch / worker / run 访问）
+    pub stream_cut: AtomicUsize,
+    pub stream_done: AtomicBool,
+    pub stream_finished: AtomicBool,
+    pub stream_queue: Mutex<VecDeque<Vec<i16>>>,
+    pub stream_texts: Mutex<Vec<String>>,
+}
+
 /// skip_llm=true：本次会话跳过 AI 优化（快速模式）
-pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
+/// translate=true：本次会话强制「翻译」模式（输出目标语言译文，经 LLM）
+/// from_ui=true：由设置页发起（结束时只复制结果，不模拟输入）
+pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) -> Result<(), String> {
     let state = app.state::<Ctx>();
-    if state.recording.lock().unwrap().is_some() {
+    if state.recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
         return Ok(());
     }
-    let cfg = state.config.lock().unwrap().clone().unwrap_or_default();
+    let cfg = state.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default();
 
     let rec = audio::start(
         cfg.audio.device.as_deref(),
@@ -62,36 +99,48 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
         cfg.audio.gain_db,
     )
     .map_err(|e| format!("{e:#}"))?;
-    *state.recording.lock().unwrap() = Some(rec);
+    let shared = rec.shared.clone();
+    // 开流后再上锁检查写入：并发双触发（按键弹跳 / UI 与热键同拍）时，
+    // 后到者发现已在录音，丢弃自己多开的流（Drop 即停流），不覆盖进行中的会话
+    let mut slot = state.recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_some() {
+        drop(slot);
+        return Ok(());
+    }
     // 新会话开启：作废仍在处理中的上一代结果
-    state.run_gen.fetch_add(1, Ordering::SeqCst);
-    let gen = state.run_gen.load(Ordering::SeqCst);
+    let gen = state.run_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let dev_label = cfg
         .audio
         .device
         .clone()
         .unwrap_or_else(|| "系统默认".to_string());
     crate::trace_pipeline(app, &format!("start 录音（gen {gen} · {dev_label}）"));
-    state.watcher_cancel.store(false, Ordering::SeqCst);
-    state.skip_llm_next.store(skip_llm, Ordering::SeqCst);
-
-    // 流式分段会话状态
     let streaming = cfg.asr.streaming;
-    state.stream_active.store(streaming, Ordering::SeqCst);
-    state.stream_done.store(false, Ordering::SeqCst);
-    state.stream_finished.store(!streaming, Ordering::SeqCst);
-    state.stream_cut.store(0, Ordering::SeqCst);
-    state.stream_queue.lock().unwrap().clear();
-    state.stream_texts.lock().unwrap().clear();
-    let cancel = Arc::clone(&state.watcher_cancel);
+    // 快速模式跳过 LLM，翻译无从谈起：翻译标志仅在非快速会话生效
+    let sess = Arc::new(Session {
+        gen,
+        from_ui,
+        skip_llm,
+        translate: !skip_llm && translate,
+        streaming,
+        cancel: AtomicBool::new(false),
+        stream_cut: AtomicUsize::new(0),
+        stream_done: AtomicBool::new(false),
+        stream_finished: AtomicBool::new(!streaming),
+        stream_queue: Mutex::new(VecDeque::new()),
+        stream_texts: Mutex::new(Vec::new()),
+    });
+    *slot = Some((rec, sess.clone()));
+    drop(slot);
     let sound = cfg.general.sound_feedback;
-    drop(state);
 
     if streaming {
         let handle = app.clone();
-        let asr_cfg = cfg.asr.clone();
+        // 凭据组在此展开：分段识别使用录音开始时刻的凭据快照
+        let asr_cfg = cfg.resolved_asr();
+        let worker_sess = sess.clone();
         tauri::async_runtime::spawn(async move {
-            segment_worker(handle, asr_cfg).await;
+            segment_worker(handle, asr_cfg, worker_sess).await;
         });
     }
 
@@ -99,24 +148,44 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
         overlay::show(app);
     }
     events::emit(app, "sn-retryable", serde_json::json!(false));
-    let hint = match (cfg.hotkey.mode.as_str(), skip_llm) {
-        ("hold", false) => "松开快捷键结束并输入",
-        ("hold", true) => "松开快捷键结束（快速模式 · 不经 AI）",
-        (_, false) => "再次按下快捷键结束并输入",
-        (_, true) => "再次按下快捷键结束（快速模式 · 不经 AI）",
+    // 翻译提示只在 LLM 真正可用时显示（凭据组解析后判定；LLM 未配置时
+    // run() 会静默退回默认模式，提前剧透「翻译为 X」只会误导）
+    let llm_ready = {
+        let rl = cfg.resolved_llm();
+        rl.enabled && !rl.base_url.trim().is_empty()
     };
-    emit_status(app, "recording", hint, sound);
+    let force_translate = !skip_llm && translate && llm_ready;
+    let hold = cfg.hotkey.mode == "hold";
+    let hint = if skip_llm {
+        if hold {
+            "松开快捷键结束（快速模式 · 不经 AI）".to_string()
+        } else {
+            "再次按下快捷键结束（快速模式 · 不经 AI）".to_string()
+        }
+    } else if force_translate {
+        let target = crate::config::lang_name(&cfg.llm.translate_target);
+        if hold {
+            format!("松开快捷键结束（翻译为 {target}）")
+        } else {
+            format!("再次按下快捷键结束（翻译为 {target}）")
+        }
+    } else if hold {
+        "松开快捷键结束并输入".to_string()
+    } else {
+        "再次按下快捷键结束并输入".to_string()
+    };
+    emit_status(app, "recording", &hint, sound);
 
     let handle = app.clone();
     let watch_device = cfg.audio.device.clone();
     thread::spawn(move || {
         watch(
             handle,
-            cancel,
+            sess,
+            shared,
             cfg.audio.vad_enabled,
             cfg.audio.vad_silence_ms,
             cfg.audio.max_duration_sec,
-            streaming,
             watch_device,
             cfg.audio.gain_db,
             cfg.audio.auto_gain,
@@ -125,16 +194,20 @@ pub fn start(app: &AppHandle, skip_llm: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 流式分段消费者：按顺序识别队列中的分段并推送实时字幕
-async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig) {
+/// 流式分段消费者：按顺序识别本会话队列中的分段并推送实时字幕。
+/// 会话被新录音取代（run_gen 前移）即退出——旧 worker 若继续存活，
+/// 会与新会话的 worker 分流同一条队列，造成分段乱序与跨会话串话。
+async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig, sess: Arc<Session>) {
     loop {
-        let seg = app.state::<Ctx>().stream_queue.lock().unwrap().pop_front();
+        if app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != sess.gen {
+            return;
+        }
+        let seg = sess.stream_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
         match seg {
             Some(samples) => match asr::transcribe(&app, &asr_cfg, &samples).await {
                 Ok(t) if !t.trim().is_empty() => {
                     let joined = {
-                        let state = app.state::<Ctx>();
-                        let mut texts = state.stream_texts.lock().unwrap();
+                        let mut texts = sess.stream_texts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         texts.push(t);
                         asr::join_transcripts(&texts)
                     };
@@ -144,13 +217,13 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig) {
                 Err(e) => eprintln!("[speaknow] 流式分段识别失败: {e:#}"),
             },
             None => {
-                if app.state::<Ctx>().stream_done.load(Ordering::SeqCst) {
-                    app.state::<Ctx>()
-                        .stream_finished
-                        .store(true, Ordering::SeqCst);
+                if sess.stream_done.load(Ordering::SeqCst) {
+                    sess.stream_finished.store(true, Ordering::SeqCst);
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(120)).await;
+                // 25ms 粒度：最后一个分段入队后最多等一拍就被消费
+                // （原 120ms 在流式收尾路径白等）
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
@@ -254,80 +327,81 @@ impl Agc {
     }
 }
 
-/// 电平上报 + VAD 静音自动结束 + 最长时长保护 + 流式分段切分 + 录音期 AGC
+/// 电平上报 + VAD 静音自动结束 + 最长时长保护 + 流式分段切分 + 录音期 AGC。
+/// 直接持有本会话的音频共享状态与 Session：不读任何会被 start() 重置的
+/// 全局量，旧会话的 watch 线程绝不会驱动新会话的录音。
 #[allow(clippy::too_many_arguments)]
 fn watch(
     app: AppHandle,
-    cancel: Arc<AtomicBool>,
+    sess: Arc<Session>,
+    shared: Arc<audio::Shared>,
     vad_enabled: bool,
     silence_ms: u64,
     max_sec: u64,
-    streaming: bool,
     device: Option<String>,
     base_gain_db: f32,
     auto_gain: bool,
 ) {
     let mut agc = Agc::new(base_gain_db, auto_gain);
+    let streaming = sess.streaming;
     loop {
         thread::sleep(Duration::from_millis(100));
-        if cancel.load(Ordering::SeqCst) {
+        if sess.cancel.load(Ordering::SeqCst) {
             break;
         }
-        let info = {
-            let state = app.state::<Ctx>();
-            let guard = state.recording.lock().unwrap();
-            guard.as_ref().map(|r| {
-                let level = r.shared.level();
-                // AGC 决策与写入都在持锁期间完成，避免与下一次调节竞争
-                if let Some(db) = agc.on_tick(level) {
-                    r.shared.set_gain_db(db);
-                }
-                (
-                    level,
-                    r.shared.silence_ms(),
-                    r.shared.elapsed_ms(),
-                    r.shared.len(),
-                    r.shared.rate(),
-                )
-            })
-        };
-        let Some((level, silence, elapsed_ms, len, rate)) = info else {
-            break;
-        };
+        let level = shared.level();
+        // AGC 决策状态（agc）为本线程独占；增益写入是原子操作
+        if let Some(db) = agc.on_tick(level) {
+            shared.set_gain_db(db);
+        }
+        let silence = shared.silence_ms();
+        let elapsed_ms = shared.elapsed_ms();
+        let len = shared.len();
+        let rate = shared.rate();
+        let stream_err = shared.take_stream_error();
         events::emit(&app, "sn-level", serde_json::json!(level));
 
-        // 流式分段：静音 700ms 或单段满 10s 时切一段送识别
+        // 音频设备丢失（拔出/蓝牙断连/驱动异常）：立即收尾识别已采集部分，
+        // 而不是挂到 VAD 误停让用户以为「说完没反应」
+        if let Some(err) = stream_err {
+            crate::trace_pipeline(&app, &format!("音频流错误，自动收尾：{err}"));
+            let _ = stop(&app);
+            break;
+        }
+
+        // 流式分段：静音 700ms 或单段满 10s 时切一段送识别。
+        // CAS 占位（cut→MAX→len）与 run() 的尾部收尾互斥：两边同拍
+        // 取到同一游标会把同一段音频入队两次（重复语句）
         if streaming && len > 0 {
-            let cut = app.state::<Ctx>().stream_cut.load(Ordering::SeqCst);
-            if len > cut {
+            let cut = sess.stream_cut.load(Ordering::SeqCst);
+            if cut != usize::MAX && len > cut {
                 let unsent_secs = (len - cut) as f64 / rate as f64;
-                if unsent_secs >= 10.0 || (silence > 700 && unsent_secs > 0.9) {
-                    let seg = {
-                        let state = app.state::<Ctx>();
-                        let guard = state.recording.lock().unwrap();
-                        guard.as_ref().map(|r| r.shared.take_range(cut))
-                    };
-                    if let Some(seg) = seg {
-                        let seg16 = audio::to_16k_i16(&seg, rate);
-                        app.state::<Ctx>()
-                            .stream_queue
-                            .lock()
-                            .unwrap()
-                            .push_back(seg16);
-                        app.state::<Ctx>().stream_cut.store(len, Ordering::SeqCst);
+                if (unsent_secs >= 10.0 || (silence > 700 && unsent_secs > 0.9))
+                    && sess
+                        .stream_cut
+                        .compare_exchange(cut, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        let seg = shared.take_range(cut);
+                        if !seg.is_empty() {
+                            let seg16 = audio::to_16k_i16(&seg, rate);
+                            sess.stream_queue
+                                .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push_back(seg16);
+                        }
+                        sess.stream_cut.store(len, Ordering::SeqCst);
                     }
-                }
             }
         }
 
         if vad_enabled && elapsed_ms > 900 && silence > silence_ms {
             crate::trace_pipeline(&app, "VAD 静音自动结束");
-            let _ = stop(&app, false);
+            let _ = stop(&app);
             break;
         }
         if elapsed_ms > max_sec * 1000 {
             crate::trace_pipeline(&app, "达到最长时长自动结束");
-            let _ = stop(&app, false);
+            let _ = stop(&app);
             break;
         }
     }
@@ -354,38 +428,45 @@ fn watch(
     }
 }
 
-/// from_ui=true：由设置页触发（只复制结果，不模拟输入，避免打字打进出设置页）
-pub fn stop(app: &AppHandle, from_ui: bool) -> Result<(), String> {
-    crate::trace_pipeline(
-        app,
-        if from_ui {
-            "stop（设置页）"
-        } else {
-            "stop"
-        },
-    );
+/// 结束当前录音会话。from_ui 等会话语义随 Session 走（start 时定型），
+/// 任何收尾路径（热键松开 / VAD / 最长时长 / 设备错误 / 设置页）行为一致。
+pub fn stop(app: &AppHandle) -> Result<(), String> {
+    crate::trace_pipeline(app, "stop");
     let state = app.state::<Ctx>();
-    state.watcher_cancel.store(true, Ordering::SeqCst);
-    let Some(rec) = state.recording.lock().unwrap().take() else {
+    // 取会话与置 cancel 都作用于同一份 Session：start() 无法重置它，
+    // 新会话开始再早也不会让本会话的 watch 线程“复活”
+    let Some((rec, sess)) = state.recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
         return Ok(());
     };
-    let cfg = state.config.lock().unwrap().clone().unwrap_or_default();
-    drop(state);
+    sess.cancel.store(true, Ordering::SeqCst);
+    let cfg = state.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default();
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        run(handle, cfg, rec, from_ui).await;
+        run(handle, cfg, rec, sess).await;
     });
     Ok(())
 }
 
-async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, from_ui: bool) {
-    let skip_llm = app
-        .state::<Ctx>()
-        .skip_llm_next
-        .swap(false, Ordering::SeqCst);
+async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, sess: Arc<Session>) {
+    // 会话标志在 start 时已定型，此处只读取——旧会话的 run 不可能
+    // 消费到新会话的快速/翻译标志（旧版全局 swap 的竞态窗口）
+    let skip_llm = sess.skip_llm;
+    let force_translate = sess.translate;
+    let from_ui = sess.from_ui;
+    // 展开凭据组引用：此后链路只看内联字段（录音开始时刻的凭据快照，
+    // 录音进行中改配置不影响本次会话）
+    let asr_resolved = cfg.resolved_asr();
+    let llm_resolved = cfg.resolved_llm();
+    let mut cfg = cfg;
+    cfg.asr = asr_resolved;
+    cfg.llm = llm_resolved;
     let llm_active = cfg.llm.enabled && !skip_llm && !cfg.llm.base_url.trim().is_empty();
-    let streaming = app.state::<Ctx>().stream_active.load(Ordering::SeqCst);
+    // 翻译快捷键强制翻译模式；LLM 未启用/未配置时静默退回默认行为
+    let translating = force_translate && llm_active;
+    if translating {
+        cfg.llm.mode = "translate".into();
+    }
 
     // 告知悬浮窗本次使用的模型链路
     let asr_label = if cfg.asr.provider == "local" {
@@ -405,41 +486,70 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, from_ui: bool) 
             "llmEnabled": llm_active,
             "llmModel": cfg.llm.model,
             "skip": skip_llm,
+            "translate": translating || (llm_active && cfg.llm.mode == "translate"),
         }),
     );
 
-    // 流式：把剩余尾部入队并标记收尾
-    if streaming {
-        let cut = app.state::<Ctx>().stream_cut.load(Ordering::SeqCst);
+    // 流式：把剩余尾部入队并标记收尾（全是本会话自己的队列）。
+    // 切段互斥：CAS 把游标推到 usize::MAX 占位——watch 的切段路径见到
+    // MAX 即放弃，杜绝 stop 与 watch 同拍取到同一游标导致尾部重复入队
+    if sess.streaming {
         let rate = rec.shared.rate();
-        let tail = rec.shared.take_range(cut);
-        if !tail.is_empty() {
-            let seg16 = audio::to_16k_i16(&tail, rate);
-            app.state::<Ctx>()
-                .stream_queue
-                .lock()
-                .unwrap()
-                .push_back(seg16);
+        let mut cut = sess.stream_cut.load(Ordering::SeqCst);
+        for _ in 0..10 {
+            if sess
+                .stream_cut
+                .compare_exchange(cut, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let tail = rec.shared.take_range(cut);
+                if !tail.is_empty() {
+                    let seg16 = audio::to_16k_i16(&tail, rate);
+                    sess.stream_queue
+                        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_back(seg16);
+                }
+                break;
+            }
+            cut = sess.stream_cut.load(Ordering::SeqCst);
+            if cut == usize::MAX {
+                break; // watch 正持占位切段，它切完会推进游标
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        app.state::<Ctx>().stream_done.store(true, Ordering::SeqCst);
+        sess.stream_done.store(true, Ordering::SeqCst);
     }
 
+    // 说话探测门控依据：录音以多长静音收尾 + 停录时刻（静音收尾且管线
+    // 耗时短 → 粘贴前跳过 ~300ms 的麦克风探测录音）
+    let stop_info = Some((rec.shared.silence_ms(), Instant::now()));
     let captured = audio::finish(rec);
-    process_audio(app, cfg, captured.samples, from_ui, skip_llm).await;
+    let stream = if sess.streaming { Some(sess) } else { None };
+    process_audio(app, cfg, captured.samples, from_ui, skip_llm, stream, stop_info).await;
 }
 
-/// 录音结束后的处理流水线（识别 → AI 优化 → 输入）；重试也走这里
+/// 录音结束后的处理流水线（识别 → AI 优化 → 输入）；重试也走这里。
+/// `stream`：本会话的流式分段状态；重试没有活跃会话，传 None 整段识别，
+/// 也不再等待/合流任何流式状态（旧版重试会误等新录音的流式会话）。
+/// `stop_info`：(录音收尾时的静音时长, 停录时刻)——供粘贴路径判定可否
+/// 跳过说话探测；重试传 None（无从判定，保守探测）
 pub async fn process_audio(
     app: AppHandle,
     cfg: Config,
     samples: Vec<i16>,
     from_ui: bool,
     skip_llm: bool,
+    stream: Option<Arc<Session>>,
+    stop_info: Option<(u64, Instant)>,
 ) {
-    let streaming = app.state::<Ctx>().stream_active.load(Ordering::SeqCst);
+    let streaming = stream.is_some();
     let llm_active = cfg.llm.enabled && !skip_llm && !cfg.llm.base_url.trim().is_empty();
-    // 本代会话标识：若处理期间用户开始了新录音，本代结果作废，不再输入
-    let gen = app.state::<Ctx>().run_gen.load(Ordering::SeqCst);
+    // 本代会话标识：若处理期间用户开始了新录音，本代结果作废，不再输入。
+    // 重试无会话：以当前代数为准（重试期间新录音开始同样作废）
+    let gen = stream
+        .as_ref()
+        .map(|s| s.gen)
+        .unwrap_or_else(|| app.state::<Ctx>().run_gen.load(Ordering::SeqCst));
 
     // 极短录音视为误触，温和忽略（不识别、不写入历史）
     let duration_secs = samples.len() as f64 / 16_000.0;
@@ -459,22 +569,26 @@ pub async fn process_audio(
     emit_status(&app, "transcribing", asr_note, false);
     let t_asr = Instant::now();
 
-    let raw = if streaming {
-        // 等待分段 worker 处理完队列（上限 30 秒）
+    let raw = if let Some(sess) = stream.as_ref() {
+        // 等待本会话分段 worker 处理完队列（上限 30 秒；会话被新录音
+        // 取代时立即放弃等待，由后置的代数检查统一作废）
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if app.state::<Ctx>().stream_finished.load(Ordering::SeqCst) {
+            if sess.stream_finished.load(Ordering::SeqCst) {
+                break;
+            }
+            if app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != sess.gen {
+                eprintln!("[speaknow] 流式收尾被新录音取代");
                 break;
             }
             if Instant::now() > deadline {
                 eprintln!("[speaknow] 等待流式分段超时");
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
         let joined = {
-            let state = app.state::<Ctx>();
-            let texts = state.stream_texts.lock().unwrap();
+            let texts = sess.stream_texts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             asr::join_transcripts(&texts)
         };
         if joined.trim().is_empty() {
@@ -492,7 +606,7 @@ pub async fn process_audio(
         Err(e) => {
             eprintln!("[speaknow] ASR 失败: {e:#}");
             // 保留音频供「重试」
-            *app.state::<Ctx>().last_audio.lock().unwrap() = Some((samples.clone(), from_ui));
+            *app.state::<Ctx>().last_audio.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((samples.clone(), from_ui));
             events::emit(&app, "sn-retryable", serde_json::json!(true));
             finish_status(
                 &app,
@@ -533,7 +647,7 @@ pub async fn process_audio(
     };
 
     if raw.trim().is_empty() {
-        *app.state::<Ctx>().last_audio.lock().unwrap() = Some((samples.clone(), from_ui));
+        *app.state::<Ctx>().last_audio.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((samples.clone(), from_ui));
         events::emit(&app, "sn-retryable", serde_json::json!(true));
         finish_status(
             &app,
@@ -545,15 +659,16 @@ pub async fn process_audio(
         return;
     }
 
-    // 第一时间把原始转写推给悬浮窗预览（AI 优化期间即可阅读）
-    events::emit(&app, "sn-raw", serde_json::json!({ "text": raw }));
-
-    // 会话已过期：新录音已开始，本代结果不再输入（防止旧文本晚到覆盖新输入）
+    // 会话已过期：新录音已开始，本代结果不再上屏、不再输入（防止旧文本
+    // 晚到覆盖新输入；先于 sn-raw，过期转写连悬浮窗都不闪现）
     if gen != app.state::<Ctx>().run_gen.load(Ordering::SeqCst) {
         crate::trace_pipeline(&app, &format!("识别完成但已过期（gen {gen}），跳过输入"));
         finish_status(&app, "done", "已跳过（已被新的录音取代）", 2000, false);
         return;
     }
+
+    // 第一时间把原始转写推给悬浮窗预览（AI 优化期间即可阅读）
+    events::emit(&app, "sn-raw", serde_json::json!({ "text": raw }));
 
     let mut final_text = raw.clone();
     let mut llm_ms = 0u64;
@@ -567,7 +682,14 @@ pub async fn process_audio(
         let stale = move || stale_app.state::<Ctx>().run_gen.load(Ordering::SeqCst) != gen;
         match llm::optimize_streaming(&cfg.llm, &raw, &app, Some(&first_token), Some(&stale)).await
         {
-            Ok(t) if !t.trim().is_empty() => final_text = t,
+            Ok(t) if !t.trim().is_empty() => {
+                final_text = t;
+                // 翻译双语输出：原文一行 + 译文一行（原文取语气词清理后的转写，
+                // 方便核对面板/历史里对照原意）
+                if cfg.llm.mode == "translate" && cfg.llm.translate_output == "bilingual" {
+                    final_text = format!("{raw}\n{final_text}");
+                }
+            }
             Ok(_) => {
                 // 空正文（思考烧尽预算且重试仍空 / 模型异常）：不再静默吞掉，让用户知道为何是原文
                 crate::trace_pipeline(
@@ -580,7 +702,8 @@ pub async fn process_audio(
                     "AI 未返回正文，使用原始识别结果…",
                     false,
                 );
-                thread::sleep(Duration::from_millis(700));
+                // 提示停留：异步 sleep，不阻塞 tokio 工作线程
+                tokio::time::sleep(Duration::from_millis(700)).await;
             }
             Err(e) => {
                 // 被新录音取代：直接放弃本代结果，不再回退输入旧文本
@@ -591,7 +714,7 @@ pub async fn process_audio(
                 }
                 eprintln!("[speaknow] AI 优化失败: {e:#}");
                 emit_status(&app, "optimizing", "AI 优化失败，使用原始识别结果…", false);
-                thread::sleep(Duration::from_millis(600));
+                tokio::time::sleep(Duration::from_millis(600)).await;
             }
         }
         llm_ms = t_llm.elapsed().as_millis() as u64;
@@ -646,7 +769,7 @@ pub async fn process_audio(
     // 预览编辑模式：结果进入悬浮窗编辑器，确认后再输入。
     // 本地悬浮窗被抑制（外接显示独占）时无处编辑，退回直接输入。
     if cfg.output.review && cfg.output.auto_paste && !suppress_local_overlay(&cfg) {
-        *app.state::<Ctx>().pending_review.lock().unwrap() = Some(PendingReview {
+        *app.state::<Ctx>().pending_review.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingReview {
             raw: raw.clone(),
             final_text: final_text.clone(),
             asr_ms,
@@ -672,6 +795,7 @@ pub async fn process_audio(
         gen,
         llm_first_ms,
         duration_secs,
+        stop_info,
     )
     .await;
 }
@@ -689,6 +813,7 @@ pub async fn finish_and_input(
     gen: u64,
     llm_first_ms: u64,
     audio_secs: f64,
+    stop_info: Option<(u64, Instant)>,
 ) {
     history::push(app, raw, final_text, asr_ms, llm_ms);
     events::emit(
@@ -715,8 +840,13 @@ pub async fn finish_and_input(
         } else {
             "已输入到光标处".to_string()
         };
-        // paste_text 内部要等待用户松键/焦点回归（可能 1~2 秒），放阻塞线程池；
-        // 说话门限取 VAD 阈值（%）并设下限，探测到正在说话时暂缓输入
+        // paste_text_checked 内部要等待用户松键/焦点回归（可能 1~2 秒），放阻塞线程池；
+        // 说话门限取 VAD 阈值（%）并设下限，探测到正在说话时暂缓输入。
+        // quiet_stop：静音收尾（≥600ms，VAD 停录即如此）且停录到此刻 ≤2s——
+        // 正在说话概率极低，跳过那次 ~300ms 的探测录音；重试无从判定则保守探测
+        let quiet_stop = stop_info
+            .map(|(silence, at)| silence >= 600 && at.elapsed() <= Duration::from_millis(2000))
+            .unwrap_or(false);
         let out_cfg = cfg.output.clone();
         let text = final_text.to_string();
         let device = cfg.audio.device.clone();
@@ -730,6 +860,7 @@ pub async fn finish_and_input(
                 superseded,
                 device.as_deref(),
                 Some(voice_gate),
+                quiet_stop,
             )
         })
         .await
@@ -777,27 +908,44 @@ fn finish_status(app: &AppHandle, stage: &str, msg: &str, hide_after_ms: u64, so
     hide_later(app, hide_after_ms);
 }
 
+/// 悬浮窗延迟隐藏的共享倒计时（ms，0 = 无待隐藏）。单一 reaper 线程消费，
+/// hide_later 只重置数值——旧版每次调用 spawn 一条线程，预览卡钉住（悬停
+/// 阅读）期间线程无限累积常驻；现在钉多久都只有这一条 reaper。
+static HIDE_REMAINING_MS: AtomicU64 = AtomicU64::new(0);
+static HIDE_REAPER: Once = Once::new();
+
 /// 延迟隐藏悬浮窗；期间若悬停（pinned）则计时暂停，若开始新录音则取消
 pub fn hide_later(app: &AppHandle, ms: u64) {
-    let handle = app.clone();
-    thread::spawn(move || {
-        let mut shown_ms: u64 = 0;
-        loop {
+    HIDE_REMAINING_MS.store(ms.max(100), Ordering::SeqCst);
+    HIDE_REAPER.call_once(|| {
+        let handle = app.clone();
+        thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(100));
-            let recording = handle.state::<Ctx>().recording.lock().unwrap().is_some();
-            if recording {
-                return;
+            let state = handle.state::<Ctx>();
+            if state.recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                // 新录音开始：取消隐藏倒计时
+                HIDE_REMAINING_MS.store(0, Ordering::SeqCst);
+                continue;
             }
-            if handle.state::<Ctx>().overlay_pinned.load(Ordering::SeqCst) {
+            if state.overlay_pinned.load(Ordering::SeqCst) {
                 continue; // 悬停阅读中，计时暂停
             }
-            shown_ms += 100;
-            if shown_ms >= ms {
+            let left = HIDE_REMAINING_MS.load(Ordering::SeqCst);
+            if left == 0 {
+                continue;
+            }
+            let new = left.saturating_sub(100);
+            if HIDE_REMAINING_MS
+                .compare_exchange(left, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue; // 并发重置了倒计时，按新值重新计
+            }
+            if new == 0 {
                 overlay::hide(&handle);
                 emit_status(&handle, "idle", "", false);
-                return;
             }
-        }
+        });
     });
 }
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,6 +11,41 @@ use crate::config::OutputConfig;
 /// 串行化粘贴：同一时刻只允许一条粘贴流程操作剪贴板/发按键。
 /// 没有它，快速连续两次听写会交叉写剪贴板，出现「新话说完却粘出上一句」。
 static PASTE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// 粘贴世代计数：新一轮 paste_text_checked 开始时递增。延迟恢复线程
+/// 检查世代未变才执行恢复，防止过期恢复覆盖新一轮粘贴写入的内容
+static PASTE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 粘贴前保存的用户剪贴板内容：文本或图像。恢复时按原类型写回——
+/// 此前只按文本处理，用户复制的截图/设计稿会被听写文本静默清掉
+enum SavedClipboard {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+}
+
+fn save_clipboard_content() -> Option<SavedClipboard> {
+    let mut c = arboard::Clipboard::new().ok()?;
+    if let Ok(t) = c.get_text() {
+        if !t.is_empty() {
+            return Some(SavedClipboard::Text(t));
+        }
+    }
+    c.get_image().ok().map(SavedClipboard::Image)
+}
+
+fn restore_clipboard_content(saved: &SavedClipboard) {
+    let Ok(mut c) = arboard::Clipboard::new() else {
+        return;
+    };
+    match saved {
+        SavedClipboard::Text(t) => {
+            let _ = c.set_text(t.clone());
+        }
+        SavedClipboard::Image(img) => {
+            let _ = c.set_image(img.clone());
+        }
+    }
+}
 
 /// 本应用当前是否以管理员身份运行
 #[cfg(target_os = "windows")]
@@ -188,20 +224,67 @@ mod win {
     }
 }
 
+/* ---------- macOS 按键状态探测（CoreGraphics 公开 C API，无需额外依赖） ---------- */
+#[cfg(target_os = "macos")]
+mod mac {
+    // kCGEventSourceStateCombinedSessionState；CGEventSourceKeyState 是稳定公开 API，
+    // Tauri 在 macOS 上已链接 CoreGraphics，直接 extern 声明即可调用。
+    const STATE_COMBINED_SESSION: u32 = 0;
+    /// 左右修饰键虚拟键码（HIToolbox/Events.h 的 kVK_* 常量值）
+    const MODIFIER_VKEYS: &[u16] = &[
+        54, // kVK_RightCommand
+        55, // kVK_Command
+        56, // kVK_Shift
+        58, // kVK_Option
+        59, // kVK_Control
+        60, // kVK_RightShift
+        61, // kVK_RightOption
+        62, // kVK_RightControl
+    ];
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceKeyState(state: u32, key: u16) -> bool;
+    }
+
+    /// 用户是否仍物理按着修饰键（⌘/⌃/⌥/⇧，左右键都查）
+    pub fn modifiers_held() -> bool {
+        unsafe {
+            MODIFIER_VKEYS
+                .iter()
+                .any(|&k| CGEventSourceKeyState(STATE_COMBINED_SESSION, k))
+        }
+    }
+}
+
+/// 用户是否仍物理按着修饰键。Windows 读 GetAsyncKeyState，macOS 读
+/// CGEventSourceKeyState；Linux 无该探测路径。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn any_modifiers_held() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win::modifiers_held()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::modifiers_held()
+    }
+}
+
 /// 等待用户物理松开修饰键（超时后放弃等待继续执行）
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn wait_modifiers_released(timeout_ms: u64, bail: &dyn Fn() -> bool) -> bool {
     let step = Duration::from_millis(25);
     for _ in 0..(timeout_ms / 25) {
         if bail() {
             return false; // 已被新的录音取代，立即放弃
         }
-        if !win::modifiers_held() {
+        if !any_modifiers_held() {
             break;
         }
         thread::sleep(step);
     }
-    thread::sleep(Duration::from_millis(40)); // 松键事件传播余量
+    thread::sleep(Duration::from_millis(20)); // 松键事件传播余量
     !bail()
 }
 
@@ -252,7 +335,8 @@ fn copy_verified(text: &str) -> Result<()> {
             continue;
         }
         drop(cb); // 立即释放剪贴板，别自己占着锁
-        thread::sleep(Duration::from_millis(20)); // 给同步类工具一点落地时间
+        // 直接读回校验（读回+序号双重证明写入生效即通过）；失败才进入
+        // 等待重试——成功路径不再固定睡 20ms
         let read_ok = arboard::Clipboard::new()
             .ok()
             .and_then(|mut c| c.get_text().ok())
@@ -284,7 +368,7 @@ pub fn copy_only(text: &str) -> Result<()> {
 
 /// 把文字输入到当前焦点窗口（无条件执行；用户在预览编辑里点「输入」等场景使用）
 pub fn paste_text(cfg: &OutputConfig, text: &str) -> Result<()> {
-    match paste_text_checked(cfg, text, Arc::new(|| false), None, None) {
+    match paste_text_checked(cfg, text, Arc::new(|| false), None, None, false) {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
@@ -296,14 +380,17 @@ pub fn paste_text(cfg: &OutputConfig, text: &str) -> Result<()> {
 /// `voice_gate`：麦克风说话峰值百分比阈值（如 2.5）——粘贴前探测到用户正在
 /// 说话时暂缓输入（最多约 6 秒），杜绝「我正说着下一句，旧结果突然被敲进来」。
 /// 检查点：等待结束写入剪贴板前、发粘贴键前——覆盖 LLM 与各等待期间新录音开始的窗口。
+/// `quiet_stop`：调用方确认「录音以静音收尾且管线耗时很短」，可跳过说话探测
+/// （探测本身要开一次 ~220ms 的录音流，是粘贴路径最大的固定延迟）
 pub fn paste_text_checked(
     cfg: &OutputConfig,
     text: &str,
     superseded: Arc<dyn Fn() -> bool + Send + Sync>,
     device: Option<&str>,
     voice_gate: Option<f32>,
+    quiet_stop: bool,
 ) -> Result<bool> {
-    let _lock = PASTE_LOCK.lock().unwrap();
+    let _lock = PASTE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // 「被新录音取代」：放弃自动输入，但结果留在剪贴板供手动粘贴（右键/Ctrl+V）
     macro_rules! skip {
@@ -324,7 +411,7 @@ pub fn paste_text_checked(
         if !wait_foreground_foreign(800, &bail) {
             skip!();
         }
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(30));
         if superseded() {
             skip!();
         }
@@ -334,26 +421,42 @@ pub fn paste_text_checked(
             ));
         }
     }
-    #[cfg(not(target_os = "windows"))]
-    thread::sleep(Duration::from_millis(60));
+    // macOS：热键的 ⌘/⌃/⌥/⇧ 还按着时注入 ⌘V 会变成组合键（终端等应用不再触发
+    // 粘贴，「按了没反应」的最常见原因）——与 Windows 同样先等物理松键再发送
+    #[cfg(target_os = "macos")]
+    {
+        let bail = || superseded();
+        if !wait_modifiers_released(1500, &bail) {
+            skip!();
+        }
+        thread::sleep(Duration::from_millis(30));
+        if superseded() {
+            skip!();
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    thread::sleep(Duration::from_millis(30));
     if superseded() {
         skip!();
     }
 
     // 说话探测：用户正在说话时暂缓输入（录音已被取代的场景之外，还存在
     // 「录音意外早停、用户未重新按键继续说」的情况——此时无法用代数判断，
-    // 用麦克风活动兜底：正在说话就等，安静了再输入）
+    // 用麦克风活动兜底：正在说话就等，安静了再输入）。
+    // quiet_stop 跳过：静音收尾 + 管线耗时短 → 正在说话概率极低
     if let Some(thr) = voice_gate {
-        let t0 = std::time::Instant::now();
-        while t0.elapsed() < Duration::from_secs(6) {
-            if superseded() {
-                skip!();
-            }
-            match crate::audio::mic_test(device, false, 0.0, 220, |_| {}) {
-                Ok(r) if r.peak_level >= thr => {
-                    thread::sleep(Duration::from_millis(350));
+        if !quiet_stop {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < Duration::from_secs(6) {
+                if superseded() {
+                    skip!();
                 }
-                _ => break, // 安静（或探测失败）→ 继续输入
+                match crate::audio::mic_test(device, false, 0.0, 220, |_| {}) {
+                    Ok(r) if r.peak_level >= thr => {
+                        thread::sleep(Duration::from_millis(350));
+                    }
+                    _ => break, // 安静（或探测失败）→ 继续输入
+                }
             }
         }
     }
@@ -376,31 +479,31 @@ pub fn paste_text_checked(
         };
 
     if cfg.method == "typing" || terminal_typing {
-        let t = text.to_string();
-        let auto_submit = cfg.auto_submit;
-        thread::spawn(move || {
-            if let Ok(mut e) = new_enigo() {
-                let _ = e.text(&t);
-                if auto_submit {
-                    thread::sleep(Duration::from_millis(120));
-                    let _ = e.key(Key::Return, Direction::Click);
-                }
-            }
-        });
+        // 同步执行并把错误上抛：模拟键入失败（macOS 未授予辅助功能权限是最常见
+        // 原因）必须让用户看见，静默丢弃会表现为「按了快捷键但什么都没输入」
+        let mut e = new_enigo()?;
+        e.text(text).map_err(|err| {
+            anyhow::anyhow!(
+                "模拟键盘输入失败：{err}（macOS 需在 系统设置 → 隐私与安全性 → 辅助功能 中授权本应用；也可在「输出」改用剪贴板粘贴）"
+            )
+        })?;
+        if cfg.auto_submit {
+            thread::sleep(Duration::from_millis(120));
+            e.key(Key::Return, Direction::Click)
+                .map_err(|err| anyhow::anyhow!("模拟回车失败: {err}"))?;
+        }
         return Ok(true);
     }
 
     let saved = if cfg.restore_clipboard {
-        arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
+        save_clipboard_content()
     } else {
         None
     };
 
     copy_verified(text)?;
-    // 校验通过后给系统一点传播时间，再发粘贴键
-    thread::sleep(Duration::from_millis(120));
+    // 校验通过（读回一致 + 序号前移已证明写入生效）后留一小段传播余量
+    thread::sleep(Duration::from_millis(30));
 
     // auto：终端窗口按类型选粘贴键（WT/WSL 等 Unix 风格 → Ctrl+Shift+V；
     // conhost/PuTTY → Shift+Insert），其余用 Ctrl+V；terminal-typing 的
@@ -442,7 +545,17 @@ pub fn paste_text_checked(
     if superseded() {
         skip!();
     }
-    send_paste_key(effective_key)?;
+    // 粘贴世代：新一轮粘贴开始即 +1。延迟恢复线程据此放弃过期的恢复，
+    // 避免「上一次粘贴的恢复线程把新一次粘贴刚写入的相同文本覆盖回旧内容」
+    // （Windows 有序号守卫，mac/Linux 无——世代令牌跨平台兜底）
+    let paste_gen = PASTE_GEN.fetch_add(1, Ordering::SeqCst);
+    if let Err(e) = send_paste_key(effective_key) {
+        // 粘贴键失败也必须恢复用户原剪贴板：copy_verified 已把原内容覆盖掉
+        if let Some(prev) = saved.as_ref() {
+            restore_clipboard_content(prev);
+        }
+        return Err(e);
+    }
 
     // 延迟恢复原剪贴板：必须晚于目标应用读取剪贴板的时刻。双重守卫：
     // ① 剪贴板序号未变（期间用户/任何程序都没动过剪贴板，含下一次听写已写入相同文本的情况）
@@ -453,18 +566,21 @@ pub fn paste_text_checked(
         let mark = text.to_string();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(2000));
+            // 已有新一轮粘贴：本恢复过期，放弃
+            if PASTE_GEN.load(Ordering::SeqCst) != paste_gen {
+                return;
+            }
             #[cfg(target_os = "windows")]
             if clipboard_seq() != seq_after_set {
                 return;
             }
-            if let Ok(mut c) = arboard::Clipboard::new() {
-                let unchanged = c
-                    .get_text()
-                    .map(|cur| cur == mark)
-                    .unwrap_or(false);
-                if unchanged {
-                    let _ = c.set_text(prev);
-                }
+            let unchanged = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut c| c.get_text().ok())
+                .map(|cur| cur == mark)
+                .unwrap_or(false);
+            if unchanged {
+                restore_clipboard_content(&prev);
             }
         });
     }

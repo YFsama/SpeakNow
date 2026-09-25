@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,8 @@ pub struct Shared {
     /// 当前软件增益（线性 × 1000）。存原子量：录音期间 AGC 可实时调节，
     /// cpal 回调每个音频块重新读取，避免重建音频流
     gain_milli: AtomicU32,
+    /// 音频流错误（设备拔出/蓝牙断连/驱动异常）。回调线程写入，watch 线程取走
+    stream_error: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -69,6 +71,12 @@ impl Shared {
         wav::encode(&pcm, TARGET_RATE)
     }
 
+    /// 取走音频流错误（如有）。设备丢失后继续挂着只会 VAD 误停/空识别，
+    /// watch 线程据此立即收尾并提示
+    pub fn take_stream_error(&self) -> Option<String> {
+        self.stream_error.lock().ok().and_then(|mut e| e.take())
+    }
+
     /// 当前已缓存采样数（原始采样率，单声道）
     pub fn len(&self) -> usize {
         self.samples.lock().map(|s| s.len()).unwrap_or(0)
@@ -99,12 +107,18 @@ pub fn to_16k_i16(samples: &[f32], from_rate: u32) -> Vec<i16> {
 pub struct Recording {
     pub shared: Arc<Shared>,
     stop_flag: Arc<AtomicBool>,
+    stop_signal: Arc<(Mutex<()>, Condvar)>,
     owner: Option<JoinHandle<()>>,
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        let (lock, cv) = &*self.stop_signal;
+        // 持锁唤醒：确保 owner 不可能恰好正处于「已读标志、未进 wait」的间隙
+        let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cv.notify_all();
+        drop(_guard);
         if let Some(t) = self.owner.take() {
             let _ = t.join();
         }
@@ -199,14 +213,19 @@ pub fn start(
         last_voice_ms: AtomicU64::new(0),
         channel_peaks: Mutex::new(Vec::new()),
         gain_milli: AtomicU32::new(1000),
+        stream_error: Mutex::new(None),
     });
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // 停止信号唤醒：原实现 20ms 轮询 stop_flag，停止平均晚一拍（≤20ms）才
+    // 被发现——改用 Condvar 即时唤醒（信号量语义：Mutex 只作 Condvar 载体）
+    let stop_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
     let dev_name = device.map(str::to_string);
     shared.set_gain_db(gain_db);
 
     let thread_shared = shared.clone();
     let thread_flag = stop_flag.clone();
+    let thread_signal = stop_signal.clone();
 
     let owner = thread::spawn(move || {
         let init = || -> anyhow::Result<cpal::Stream> {
@@ -219,7 +238,19 @@ pub fn start(
                 .sample_rate
                 .store(config.sample_rate.0, Ordering::SeqCst);
 
-            let err_fn = |err| eprintln!("[speaknow] 音频流错误: {err}");
+            // 错误回调：记录到 Shared（仅打印的话，设备拔出/断连后录音会一直
+            // 挂到 VAD 误停，表现为「说完没反应」）；watch 线程检测后收尾
+            let err_fn = {
+                let s = thread_shared.clone();
+                move |err: cpal::StreamError| {
+                    eprintln!("[speaknow] 音频流错误: {err}");
+                    if let Ok(mut slot) = s.stream_error.lock() {
+                        if slot.is_none() {
+                            *slot = Some(err.to_string());
+                        }
+                    }
+                }
+            };
             let stream = match sample_format {
                 cpal::SampleFormat::F32 => device.build_input_stream(
                     &config,
@@ -269,9 +300,15 @@ pub fn start(
         match init() {
             Ok(stream) => {
                 let _ = tx.send(Ok(()));
+                let (lock, cv) = &*thread_signal;
+                let mut g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 while !thread_flag.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
+                    // 500ms 超时仅作保险（唤醒信号丢失时也能退出）
+                    (g, _) = cv
+                        .wait_timeout(g, Duration::from_millis(500))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+                drop(g);
                 drop(stream); // 在创建它的线程上销毁
                 std::thread::sleep(Duration::from_millis(60)); // 等尾部数据入队
             }
@@ -285,6 +322,7 @@ pub fn start(
         Ok(Ok(())) => Ok(Recording {
             shared,
             stop_flag,
+            stop_signal,
             owner: Some(owner),
         }),
         Ok(Err(e)) => {
@@ -305,7 +343,7 @@ fn push_block(data: &[f32], shared: &Shared, channels: u32, vad_threshold: f32) 
 
     // 各声道独立峰值（诊断）
     {
-        let mut peaks = shared.channel_peaks.lock().unwrap();
+        let mut peaks = shared.channel_peaks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if peaks.len() != ch {
             peaks.clear();
             peaks.resize(ch, 0.0);
@@ -358,22 +396,22 @@ fn push_block(data: &[f32], shared: &Shared, channels: u32, vad_threshold: f32) 
 pub struct Captured {
     /// 16kHz 单声道 16bit 采样
     pub samples: Vec<i16>,
-    pub duration_secs: f64,
 }
 
 /// 结束录音并收集结果：重采样到 16kHz 单声道
 pub fn finish(rec: Recording) -> Captured {
     let shared = rec.shared.clone();
-    drop(rec); // 触发 Drop：停止音频线程并等待尾部数据
-    thread::sleep(Duration::from_millis(40));
+    drop(rec); // 触发 Drop：停止音频线程并等待尾部数据（owner 已等 60ms 尾拍）
 
-    let samples = shared.samples.lock().map(|s| s.clone()).unwrap_or_default();
-    let rate = shared.sample_rate.load(Ordering::Relaxed);
-    let secs = if rate == 0 {
-        0.0
-    } else {
-        samples.len() as f64 / rate as f64
+    // owner join 之后已无并发写者：直接拿走缓冲，避免整段克隆
+    let samples = {
+        let mut buf = shared
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *buf)
     };
+    let rate = shared.sample_rate.load(Ordering::Relaxed);
 
     let resampled = resample_linear(&samples, rate, TARGET_RATE);
     let pcm: Vec<i16> = resampled
@@ -381,25 +419,51 @@ pub fn finish(rec: Recording) -> Captured {
         .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
         .collect();
 
-    Captured {
-        samples: pcm,
-        duration_secs: secs,
-    }
+    Captured { samples: pcm }
 }
 
 pub fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || input.is_empty() {
         return input.to_vec();
     }
+    // 降采样抗混叠预滤波：线性插值本身不抗混叠——48k→16k 时 8kHz 以上的
+    // 齿音能量会折叠进语音频段干扰识别。先做宽度≈降采样比的滑动平均
+    // （box 滤波，前缀和 O(n)）把超奈奎斯特能量压掉再插值；奇数窗裁掉
+    // 前 (w-1)/2 个样本做零相位对齐（box 是线性相位滤波器，中心对齐后
+    // 不引入群延迟，带内波形不因此失真）
+    let src: Vec<f32> = {
+        let ratio = from as f64 / to as f64;
+        if ratio < 1.9 {
+            input.to_vec()
+        } else {
+            let w = ratio.round().max(2.0) as usize;
+            // 前缀和（含首 0），窗口 [i-w+1, i] 不足宽度按实际覆盖数平均
+            let mut prefix = Vec::with_capacity(input.len() + 1);
+            prefix.push(0f32);
+            let mut acc = 0f32;
+            for s in input {
+                acc += s;
+                prefix.push(acc);
+            }
+            let filtered: Vec<f32> = (0..input.len())
+                .map(|i| {
+                    let lo = i.saturating_sub(w - 1);
+                    (prefix[i + 1] - prefix[lo]) / (i - lo + 1) as f32
+                })
+                .collect();
+            let shift = (w - 1) / 2;
+            filtered[shift.min(filtered.len())..].to_vec()
+        }
+    };
     let ratio = to as f64 / from as f64;
     let n = ((input.len() as f64) * ratio).round() as usize;
     (0..n)
         .map(|i| {
             let p = i as f64 / ratio;
             let i0 = p.floor() as usize;
-            let i1 = (i0 + 1).min(input.len() - 1);
+            let i1 = (i0 + 1).min(src.len() - 1);
             let t = (p - i0 as f64) as f32;
-            input[i0] * (1.0 - t) + input[i1] * t
+            src[i0] * (1.0 - t) + src[i1] * t
         })
         .collect()
 }
@@ -570,4 +634,54 @@ pub fn mic_test<F: Fn(f32)>(
             base64::engine::general_purpose::STANDARD.encode(w)
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_linear;
+
+    #[test]
+    fn resample_identity_and_length() {
+        let input = vec![0.1f32, 0.2, 0.3];
+        assert_eq!(resample_linear(&input, 16_000, 16_000), input);
+        // 1 秒 48k → 16k：输出恰 16k 样本
+        let one_sec: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.001).sin()).collect();
+        assert_eq!(resample_linear(&one_sec, 48_000, 16_000).len(), 16_000);
+    }
+
+    /// 1kHz 正弦（远离奈奎斯特）经 48k→16k 后应保真
+    #[test]
+    fn resample_keeps_in_band_signal() {
+        let freq = 1_000.0f32;
+        let input: Vec<f32> = (0..48_000)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin())
+            .collect();
+        let out = resample_linear(&input, 48_000, 16_000);
+        let direct: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 16_000.0).sin())
+            .collect();
+        // 跳过头尾半周期（滑动平均的边界效应），带内幅值误差应很小
+        let max_err = out[500..15_500]
+            .iter()
+            .zip(&direct[500..15_500])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.05, "带内失真 {max_err}");
+    }
+
+    /// 12kHz 正弦在 48k→16k 下超出 8k 奈奎斯特：抗混叠预滤波必须显著压低
+    /// （不滤波时会整体折叠成 4kHz 假信号，幅值不减）。测量跳过首尾
+    /// 热身/收尾区（部分窗口的瞬态，真实录音中无害）
+    #[test]
+    fn resample_attenuates_above_nyquist() {
+        let freq = 12_000.0f32;
+        let input: Vec<f32> = (0..48_000)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin())
+            .collect();
+        let out = resample_linear(&input, 48_000, 16_000);
+        let steady = &out[100..out.len() - 100];
+        let peak = steady.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // 3 抽头 box 在 12kHz 的理论增益 1/3；留裕量断言
+        assert!(peak < 0.45, "超奈奎斯特分量未被压低：peak {peak}");
+    }
 }

@@ -5,7 +5,7 @@
 //! - `GET /api/events`   WebSocket 事件流（预留 API，供客户自行开发硬件端）
 //! - `GET /api/status`   JSON 服务信息（健康检查 / 预留）
 //!
-//! 事件信封：`{"v":1,"type":"status|partial|raw|result|delta|level|meta|target|hello","data":{...},"ts":...}`
+//! 事件信封：`{"v":1,"type":"status|partial|raw|result|delta|level|meta|target|review|retryable|gain-learned|hello","data":{...},"ts":...}`
 //! 客户端必须忽略未知 type 与未知字段（前向兼容），详见 docs/external-display-api.md。
 
 use std::sync::{Mutex, OnceLock};
@@ -39,7 +39,17 @@ fn bus() -> &'static broadcast::Sender<String> {
 /// 事件入口：pipeline/llm/overlay 的每条 sn-* 事件都经此转发给已连接的外接设备。
 /// 无连接时 send 返回错误，直接忽略（零开销）。
 pub fn publish(name: &str, payload: &serde_json::Value) {
-    let ty = name.strip_prefix("sn-").unwrap_or(name);
+    // 无订阅者直接返回：信封构造 + 序列化在录音期每 100ms（sn-level）、
+    // AI 流式期每个 token 都会跑一次，白产生分配与 CPU
+    if bus().receiver_count() == 0 {
+        return;
+    }
+    // 线名 = 内部事件名去掉 sn- 前缀；个别名称按对外文档口径归一
+    // （sn-llm-delta → delta，与 remote_display.html / API 文档一致）
+    let ty = match name.strip_prefix("sn-").unwrap_or(name) {
+        "llm-delta" => "delta",
+        other => other,
+    };
     let envelope = serde_json::json!({
         "v": PROTOCOL_VERSION,
         "type": ty,
@@ -63,7 +73,7 @@ static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// 按配置启停服务。仅 enabled/port/allowLan 变化才重启；
 /// hideLocalOverlay 属于本地行为，无需动服务（已连接的硬件不断线）。
 pub fn apply(cfg: &ExternalDisplayConfig) {
-    let mut guard = SERVER.lock().unwrap();
+    let mut guard = SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(r) = guard.as_ref() {
         if cfg.enabled && r.port == cfg.port && r.allow_lan == cfg.allow_lan {
             return;
@@ -72,7 +82,7 @@ pub fn apply(cfg: &ExternalDisplayConfig) {
     if let Some(r) = guard.take() {
         let _ = r.shutdown.send(true);
     }
-    *LAST_ERROR.lock().unwrap() = None;
+    *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     if !cfg.enabled {
         return;
     }
@@ -109,8 +119,18 @@ pub fn apply(cfg: &ExternalDisplayConfig) {
                 shutdown: shut_tx,
             });
         }
-        Ok(Err(e)) => *LAST_ERROR.lock().unwrap() = Some(e),
-        Err(_) => *LAST_ERROR.lock().unwrap() = Some("服务启动超时".into()),
+        Ok(Err(e)) => *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e),
+        Err(_) => {
+            // 就绪超时但服务线程可能仍在绑定/启动：同样登记 Running（带
+            // shutdown 句柄），否则这个可能存活的服务变成无主进程，
+            // 下次 apply 停不掉、status 也看不到
+            *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some("服务启动超时".into());
+            *guard = Some(Running {
+                port,
+                allow_lan: cfg.allow_lan,
+                shutdown: shut_tx,
+            });
+        }
     }
 }
 
@@ -135,8 +155,8 @@ async fn bind_with_retry(
 
 /// 当前服务状态（供设置页展示）
 pub fn status() -> serde_json::Value {
-    let guard = SERVER.lock().unwrap();
-    let error = LAST_ERROR.lock().unwrap().clone();
+    let guard = SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let error = LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     match guard.as_ref() {
         Some(r) => serde_json::json!({
             "running": true,
