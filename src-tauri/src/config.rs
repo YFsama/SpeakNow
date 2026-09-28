@@ -14,6 +14,10 @@ pub struct Config {
     pub audio: AudioConfig,
     pub asr: AsrConfig,
     pub llm: LlmConfig,
+    /// 划词翻译（DeepL 式客户端体验）：取词 → 翻译 → 悬浮窗卡片 → 复制/替换
+    pub translate: TranslateConfig,
+    /// 截图取词（OCR）：框选屏幕区域 → 本地识别 → 悬浮窗卡片 → 复制/翻译/输入
+    pub ocr: OcrConfig,
     pub output: OutputConfig,
     pub general: GeneralConfig,
     pub external_display: ExternalDisplayConfig,
@@ -72,6 +76,10 @@ pub struct HotkeyConfig {
     pub key_quick: String,
     /// 翻译模式快捷键（可选）：本次听写强制用「翻译」模式，输出目标语言译文
     pub key_translate: String,
+    /// 划词翻译快捷键（可选）：翻译任意应用中选中的文字（弹悬浮窗，可复制/替换）
+    pub key_translate_sel: String,
+    /// 截图取词快捷键（可选）：框选屏幕区域 OCR 识别（弹悬浮窗，可复制/翻译/输入）
+    pub key_ocr: String,
     /// hold（按住说话）/ toggle（按一下开始/结束）
     pub mode: String,
     pub enabled: bool,
@@ -83,6 +91,8 @@ impl Default for HotkeyConfig {
             key: "ctrl+shift+Space".into(),
             key_quick: String::new(),
             key_translate: String::new(),
+            key_translate_sel: String::new(),
+            key_ocr: String::new(),
             mode: "toggle".into(),
             enabled: true,
         }
@@ -238,6 +248,79 @@ impl LlmConfig {
             c.api_key = p.api_key.clone();
         }
         c
+    }
+}
+
+/// 划词翻译行为配置。目标语言与听写翻译共用 llm.translate_target
+/// （托盘 / 悬浮窗语言条 / 设置页切换，一处生效）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TranslateConfig {
+    /// 译文出来后自动复制到剪贴板
+    pub auto_copy: bool,
+    /// 强制模拟复制取词：跳过 UIA 直接发 Ctrl+C/Cmd+C 读剪贴板
+    /// （兼容 UIA 取不到文字的应用；默认 UIA 优先、失败自动降级）
+    pub forced_copy: bool,
+    /// 「替换原文」时在译文前加「翻 」标记，肉眼可辨、防误替换（可关）
+    pub replace_marker: bool,
+    /// 黑名单（每行一个关键字）：前台窗口标题或进程名命中时不触发划词翻译。
+    /// 防终端（Ctrl+C 是中断）、密码管理器等场景误触发
+    pub blacklist: String,
+    /// 复制即翻译：监听剪贴板变化，复制文字后自动弹出翻译卡片。
+    /// 默认关闭——开启后复制的内容都会发给 AI 接口，敏感场景慎用
+    pub clipboard_watch: bool,
+    /// 结构化文本智能翻译：检测到 JSON / YAML / properties 等结构时只翻译字符串值，
+    /// 键名、注释与格式原样保留（默认开启）
+    pub structured_translate: bool,
+    /// 翻译引擎：cloud（云端 LLM，默认，质量最优）| local（本地 llama.cpp，离线·隐私·免费）
+    pub engine: String,
+    /// 本地引擎模型 id（见 local_llm::MODELS；未下载时翻译会给出引导）
+    pub local_model: String,
+}
+
+impl Default for TranslateConfig {
+    fn default() -> Self {
+        Self {
+            auto_copy: false,
+            forced_copy: false,
+            replace_marker: false,
+            blacklist: String::new(),
+            clipboard_watch: false,
+            structured_translate: true,
+            engine: "cloud".into(),
+            local_model: "qwen3-4b-instruct".into(),
+        }
+    }
+}
+
+/// 截图取词（OCR）配置。引擎分层（调研结论见 docs/ocr-research.md）：
+/// system = Windows 系统内置离线引擎（零下载零依赖，M1 快路径）；
+/// ppocr / vlm 预留给后续质量档（ort + PP-OCRv5 / llama.cpp + PaddleOCR-VL）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OcrConfig {
+    /// 功能总开关（关闭后热键/托盘不响应）
+    pub enabled: bool,
+    /// 识别引擎：system（Windows.Media.Ocr）| ppocr | vlm（后两者为预留位）
+    pub engine: String,
+    /// 识别语言：auto（跟随系统用户语言）或 BCP-47 前缀（zh / en / ja / ko …），
+    /// 对应系统 OCR 语言包
+    pub language: String,
+    /// 识别完成后不弹 OCR 卡片，直接进入翻译流程（截图翻译一键链）
+    pub auto_translate: bool,
+    /// 识别完成后自动把文本复制到剪贴板
+    pub copy_on_capture: bool,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            engine: "system".into(),
+            language: "auto".into(),
+            auto_translate: false,
+            copy_on_capture: false,
+        }
     }
 }
 

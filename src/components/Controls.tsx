@@ -109,11 +109,14 @@ export function TextArea({
   onChange,
   placeholder,
   rows = 3,
+  onKeyDown,
 }: {
   value: string | null | undefined;
   onChange: (v: string) => void;
   placeholder?: string;
   rows?: number;
+  /** 按键回调：如工作台 Ctrl+Enter 直接触发翻译 */
+  onKeyDown?: (e: ReactKeyboardEvent<HTMLTextAreaElement>) => void;
 }) {
   return (
     <textarea
@@ -122,6 +125,7 @@ export function TextArea({
       spellCheck={false}
       rows={rows}
       onChange={(e) => onChange(e.target.value)}
+      onKeyDown={onKeyDown}
       className={`${inputBase} resize-y leading-6`}
     />
   );
@@ -279,12 +283,15 @@ export function Button({
   kind = 'ghost',
   disabled,
   full = false,
+  title,
 }: {
   children: ReactNode;
   onClick?: () => void;
   kind?: 'primary' | 'ghost' | 'danger' | 'subtle';
   disabled?: boolean;
   full?: boolean;
+  /** 悬停提示 */
+  title?: string;
 }) {
   const base =
     'inline-flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100';
@@ -303,6 +310,7 @@ export function Button({
       type="button"
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={`${base} ${kinds[kind]} ${full ? 'w-full' : ''}`}
     >
       {children}

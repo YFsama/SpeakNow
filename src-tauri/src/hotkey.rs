@@ -75,6 +75,26 @@ pub fn apply(app: &AppHandle, hk: &HotkeyConfig) -> Result<()> {
             )
         })?;
     }
+    // 划词翻译快捷键：翻译任意应用中选中的文字（DeepL 客户端式体验）
+    if !hk.key_translate_sel.trim().is_empty() {
+        let shortcut = parse_shortcut(&hk.key_translate_sel)?;
+        gs.on_shortcut(shortcut, handle_event).map_err(|e| {
+            anyhow!(
+                "注册划词翻译快捷键 {} 失败（可能已被其他应用占用）: {e}",
+                hk.key_translate_sel
+            )
+        })?;
+    }
+    // 截图取词快捷键：框选屏幕区域 OCR 识别（复制/翻译/输入）
+    if !hk.key_ocr.trim().is_empty() {
+        let shortcut = parse_shortcut(&hk.key_ocr)?;
+        gs.on_shortcut(shortcut, handle_event).map_err(|e| {
+            anyhow!(
+                "注册截图取词快捷键 {} 失败（可能已被其他应用占用）: {e}",
+                hk.key_ocr
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -94,6 +114,33 @@ fn handle_event(app: &AppHandle, sc: &Shortcut, event: ShortcutEvent) {
         && parse_shortcut(&hk.key_translate)
             .map(|t| t == *sc)
             .unwrap_or(false);
+    let is_translate_sel = !is_quick
+        && !is_translate
+        && !hk.key_translate_sel.is_empty()
+        && parse_shortcut(&hk.key_translate_sel)
+            .map(|t| t == *sc)
+            .unwrap_or(false);
+    let is_ocr = !is_quick
+        && !is_translate
+        && !is_translate_sel
+        && !hk.key_ocr.is_empty()
+        && parse_shortcut(&hk.key_ocr)
+            .map(|t| t == *sc)
+            .unwrap_or(false);
+
+    // 划词翻译独立于听写会话：取词含按键模拟与剪贴板轮询（阻塞可达秒级），
+    // 放独立线程执行，不占住热键回调线程
+    if is_translate_sel && event.state() == ShortcutState::Pressed {
+        let h = app.clone();
+        std::thread::spawn(move || crate::translate::translate_selection(&h));
+        return;
+    }
+
+    // 截图取词同样独立：弹选区窗 + GDI 截屏 + OCR 全在后台完成
+    if is_ocr && event.state() == ShortcutState::Pressed {
+        crate::ocr::start_capture(app);
+        return;
+    }
 
     match event.state() {
         ShortcutState::Pressed => {

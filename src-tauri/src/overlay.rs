@@ -6,6 +6,36 @@ const OVERLAY_LABEL: &str = "overlay";
 const OVERLAY_W: f64 = 560.0;
 const OVERLAY_H: f64 = 320.0;
 
+/// 无激活窗口开关（Windows）：开启后点击卡片（复制/替换/语言条）不再把焦点从
+/// 目标应用抢走——选区保持存活，「替换原文」因此必定有落点；DeepL / pot 式弹窗
+/// 的标准做法。审阅编辑需要打字，进入前关闭该标志恢复可激活。
+#[cfg(target_os = "windows")]
+fn set_no_activate(app: &AppHandle, on: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+    let Some(win) = app.get_webview_window(OVERLAY_LABEL) else {
+        return;
+    };
+    let Ok(hwnd) = win.hwnd() else {
+        return;
+    };
+    unsafe {
+        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let want = if on {
+            cur | WS_EX_NOACTIVATE.0 as isize
+        } else {
+            cur & !(WS_EX_NOACTIVATE.0 as isize)
+        };
+        if want != cur {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_no_activate(_app: &AppHandle, _on: bool) {}
+
 fn mouse_location() -> Option<(i32, i32)> {
     use enigo::{Enigo, Mouse, Settings};
     Enigo::new(&Settings::default()).ok()?.location().ok()
@@ -40,6 +70,8 @@ pub fn show(app: &AppHandle) {
         return;
     };
     let _ = win.set_always_on_top(true);
+    // 展示型卡片（聆听/结果/翻译）一律不抢焦点：点击按钮不打断目标应用
+    set_no_activate(app, true);
 
     // 用户拖动过：保持当前位置
     if app
@@ -136,9 +168,11 @@ pub fn hide(app: &AppHandle) {
     }
 }
 
-/// 预览编辑模式：显示并聚焦悬浮窗（用户需要打字编辑）
+/// 预览编辑模式：显示并聚焦悬浮窗（用户需要打字编辑——show() 会开启无激活
+/// 标志，这里在其后关掉，否则窗口收不到键盘焦点）
 pub fn show_review(app: &AppHandle) {
     show(app);
+    set_no_activate(app, false);
     if let Some(win) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = win.set_focus();
     }

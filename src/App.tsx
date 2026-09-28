@@ -38,6 +38,12 @@ const AsrTab = lazy(() =>
 const LlmTab = lazy(() =>
   import('./components/tabs/LlmTab').then((m) => ({ default: m.LlmTab })),
 );
+const TranslateTab = lazy(() =>
+  import('./components/tabs/TranslateTab').then((m) => ({ default: m.TranslateTab })),
+);
+const OcrTab = lazy(() =>
+  import('./components/tabs/OcrTab').then((m) => ({ default: m.OcrTab })),
+);
 const OutputTab = lazy(() =>
   import('./components/tabs/OutputTab').then((m) => ({ default: m.OutputTab })),
 );
@@ -57,6 +63,8 @@ const NAV: { id: TabId; icon: string; label: string }[] = [
   { id: 'mic', icon: '🎙️', label: '麦克风' },
   { id: 'asr', icon: '📝', label: '语音识别' },
   { id: 'llm', icon: '✨', label: 'AI 优化' },
+  { id: 'translate', icon: '🌐', label: '翻译' },
+  { id: 'ocr', icon: '📷', label: '截图取词' },
   { id: 'output', icon: '⌨', label: '输入方式' },
   { id: 'display', icon: '📡', label: '外接显示' },
   { id: 'history', icon: '🕘', label: '历史' },
@@ -321,6 +329,7 @@ export default function App() {
   const hotkeyChips = shortcutChips(cfg.hotkey.key);
   const quickChips = shortcutChips(cfg.hotkey.keyQuick);
   const translateChips = shortcutChips(cfg.hotkey.keyTranslate);
+  const translateSelChips = shortcutChips(cfg.hotkey.keyTranslateSel);
 
   const tabProps = {
     cfg,
@@ -427,6 +436,11 @@ export default function App() {
                     翻译
                   </span>
                 )}
+                {translateSelChips.length > 0 && (
+                  <span className="ml-1 rounded border border-teal-400/25 bg-teal-400/10 px-1 py-0.5 text-[9.5px] text-teal-300">
+                    划词
+                  </span>
+                )}
               </div>
             )}
           </div>
@@ -448,6 +462,8 @@ export default function App() {
             {tab === 'mic' && <MicTab {...tabProps} />}
             {tab === 'asr' && <AsrTab {...tabProps} />}
             {tab === 'llm' && <LlmTab {...tabProps} />}
+            {tab === 'translate' && <TranslateTab {...tabProps} />}
+            {tab === 'ocr' && <OcrTab {...tabProps} />}
             {tab === 'output' && <OutputTab {...tabProps} />}
             {tab === 'display' && <DisplayTab {...tabProps} />}
             {tab === 'history' && <HistoryTab {...tabProps} />}

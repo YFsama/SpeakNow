@@ -12,18 +12,37 @@ use crate::config::OutputConfig;
 /// 没有它，快速连续两次听写会交叉写剪贴板，出现「新话说完却粘出上一句」。
 static PASTE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// 本应用最近一次写入剪贴板的文本。剪贴板监听（复制即翻译）据此跳过
+/// 自身写入，杜绝「复制译文 → 监听又把译文翻一遍」的自激励循环；
+/// 听写输出 / OCR 自动复制同理不触发
+static LAST_OWN_TEXT: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+fn note_own_text(t: &str) {
+    *LAST_OWN_TEXT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(t.to_string());
+}
+
+/// 最近一次由本应用写入剪贴板的文本（供剪贴板监听比对）
+pub fn last_own_clipboard_text() -> Option<String> {
+    LAST_OWN_TEXT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// 粘贴世代计数：新一轮 paste_text_checked 开始时递增。延迟恢复线程
 /// 检查世代未变才执行恢复，防止过期恢复覆盖新一轮粘贴写入的内容
 static PASTE_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 粘贴前保存的用户剪贴板内容：文本或图像。恢复时按原类型写回——
 /// 此前只按文本处理，用户复制的截图/设计稿会被听写文本静默清掉
-enum SavedClipboard {
+pub(crate) enum SavedClipboard {
     Text(String),
     Image(arboard::ImageData<'static>),
 }
 
-fn save_clipboard_content() -> Option<SavedClipboard> {
+pub(crate) fn save_clipboard_content() -> Option<SavedClipboard> {
     let mut c = arboard::Clipboard::new().ok()?;
     if let Ok(t) = c.get_text() {
         if !t.is_empty() {
@@ -33,7 +52,7 @@ fn save_clipboard_content() -> Option<SavedClipboard> {
     c.get_image().ok().map(SavedClipboard::Image)
 }
 
-fn restore_clipboard_content(saved: &SavedClipboard) {
+pub(crate) fn restore_clipboard_content(saved: &SavedClipboard) {
     let Ok(mut c) = arboard::Clipboard::new() else {
         return;
     };
@@ -51,6 +70,48 @@ fn restore_clipboard_content(saved: &SavedClipboard) {
 #[cfg(target_os = "windows")]
 pub fn win_elevated() -> bool {
     win::app_elevated()
+}
+
+/* ---------- 供划词翻译（selection）复用的探测助手 ---------- */
+
+/// 前台窗口进程名（如 "Chrome.exe"），取不到返回空串
+#[cfg(target_os = "windows")]
+pub fn foreground_process_name() -> String {
+    let (pid, ok) = win::foreground_pid();
+    if ok && pid != 0 {
+        win::process_name(pid)
+    } else {
+        String::new()
+    }
+}
+
+/// 前台是否终端类窗口（终端里模拟 Ctrl+C 是中断信号，划词翻译须避开）
+#[cfg(target_os = "windows")]
+pub fn foreground_is_terminal() -> bool {
+    win::foreground_is_terminal()
+}
+
+/// 前台窗口提权而本应用没有（UIPI 会拦截模拟按键）：返回阻断者进程名
+#[cfg(target_os = "windows")]
+pub fn foreground_uipi_blocker() -> Option<String> {
+    win::uipi_blocker()
+}
+
+/// 当前剪贴板序号（任何程序写剪贴板都会 +1；判定模拟复制是否生效）
+#[cfg(target_os = "windows")]
+pub fn clipboard_seq_now() -> u64 {
+    clipboard_seq()
+}
+
+/// 等待用户物理松开修饰键（热键的 Ctrl/⌘ 还按着时发 C 会变成组合键，不再是复制）
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn wait_modifiers_free(timeout_ms: u64) -> bool {
+    wait_modifiers_released(timeout_ms, &|| false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn wait_modifiers_free(_timeout_ms: u64) -> bool {
+    true
 }
 
 /* ---------- Windows 前台窗口 / 按键状态探测 ---------- */
@@ -71,7 +132,7 @@ mod win {
     };
 
     /// 进程可执行文件名（如 "WindowsTerminal.exe"），取不到时回退 "pid:N"
-    fn process_name(pid: u32) -> String {
+    pub fn process_name(pid: u32) -> String {
         unsafe {
             let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
                 return format!("pid:{pid}");
@@ -112,7 +173,7 @@ mod win {
         }
     }
 
-    fn foreground_pid() -> (u32, bool) {
+    pub(crate) fn foreground_pid() -> (u32, bool) {
         unsafe {
             let hwnd = GetForegroundWindow();
             if hwnd.0.is_null() {
@@ -347,6 +408,7 @@ fn copy_verified(text: &str) -> Result<()> {
         #[cfg(not(target_os = "windows"))]
         let seq_ok = true;
         if read_ok && seq_ok {
+            note_own_text(text);
             return Ok(());
         }
         if attempt == waits.len() - 1 {
@@ -363,6 +425,7 @@ pub fn copy_only(text: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("无法访问剪贴板")?;
     cb.set_text(text.to_string())
         .context("写入剪贴板失败")?;
+    note_own_text(text);
     Ok(())
 }
 

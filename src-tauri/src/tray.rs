@@ -23,6 +23,9 @@ fn current_config(app: &AppHandle) -> crate::config::Config {
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let record = MenuItem::with_id(app, "record", "开始 / 停止录音", true, None::<&str>)?;
+    let translate_sel =
+        MenuItem::with_id(app, "translate_sel", "划词翻译选中文字", true, None::<&str>)?;
+    let ocr_item = MenuItem::with_id(app, "ocr", "截图取词（框选识别）", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "打开设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 SpeakNow", true, None::<&str>)?;
 
@@ -80,7 +83,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let sep2 = PredefinedMenuItem::separator(app)?;
     Menu::with_items(
         app,
-        &[&record, &show, &sep1, &mode_menu, &lang_menu, &sep2, &quit],
+        &[&record, &translate_sel, &ocr_item, &show, &sep1, &mode_menu, &lang_menu, &sep2, &quit],
     )
 }
 
@@ -114,6 +117,13 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id().as_ref().to_string();
     match id.as_str() {
         "record" => pipeline::toggle(app, false, false),
+        "translate_sel" => {
+            // 取词含按键模拟与剪贴板轮询（阻塞），放独立线程；托盘菜单收起后
+            // 焦点回到原窗口，选区仍在即可取词
+            let h = app.clone();
+            std::thread::spawn(move || crate::translate::translate_selection(&h));
+        }
+        "ocr" => crate::ocr::start_capture(app),
         "show" => open_main_window(app),
         "quit" => app.exit(0),
         _ => {

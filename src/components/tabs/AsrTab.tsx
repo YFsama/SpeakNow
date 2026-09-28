@@ -367,7 +367,8 @@ export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: Tab
             <div className="space-y-2">
               {/* Qwen3-ASR 引擎（llama.cpp Vulkan/CPU）目前仅支持 Windows，mac 上隐藏卡片避免误选 */}
               {localModels
-                .filter((m) => !(isMac && m.kind === 'qwen'))
+                // ppocr 属于「截图取词」页的模型，不在语音识别页展示
+                .filter((m) => !(isMac && m.kind === 'qwen') && m.kind !== 'ppocr')
                 .map((m) => {
                 const selected = cfg.asr.localModel === m.id;
                 const prog = progress[m.id];

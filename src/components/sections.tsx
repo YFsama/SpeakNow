@@ -4,6 +4,7 @@ export { HotkeyTab } from './tabs/HotkeyTab';
 export { MicTab } from './tabs/MicTab';
 export { AsrTab } from './tabs/AsrTab';
 export { LlmTab } from './tabs/LlmTab';
+export { TranslateTab } from './tabs/TranslateTab';
 export { OutputTab } from './tabs/OutputTab';
 export { DisplayTab } from './tabs/DisplayTab';
 export { HistoryTab } from './tabs/HistoryTab';

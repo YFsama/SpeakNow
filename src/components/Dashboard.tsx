@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import type { Stage, TabProps } from '../types';
 import { resolvedAsrCreds, resolvedLlmCreds } from '../types';
-import { shortcutChips } from '../api';
+import { ocrCapture, shortcutChips, translateSelection } from '../api';
 import { Button, Toggle } from './Controls';
 
 const STAGE_INFO: Record<
@@ -86,6 +86,9 @@ export default function Dashboard({
   const info = STAGE_INFO[stage];
   const hotkeyChips = shortcutChips(cfg.hotkey.key);
   const quickChips = shortcutChips(cfg.hotkey.keyQuick);
+  const translateChips = shortcutChips(cfg.hotkey.keyTranslate);
+  const selChips = shortcutChips(cfg.hotkey.keyTranslateSel);
+  const ocrChips = shortcutChips(cfg.hotkey.keyOcr);
 
   const asrLocalReady =
     cfg.asr.provider === 'local' &&
@@ -163,7 +166,23 @@ export default function Dashboard({
               {statusMsg && stage === 'error' ? statusMsg : info.hint}
             </div>
           </div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+            <Button
+              onClick={() => {
+                void translateSelection().catch(() => {});
+              }}
+              title="先在任意应用选中文字，点击后贴近选区弹出翻译卡片"
+            >
+              🌐 翻译选中文字
+            </Button>
+            <Button
+              onClick={() => {
+                void ocrCapture().catch(() => {});
+              }}
+              title="框选屏幕任意区域，本地离线识别出文字（可复制/翻译/输入）"
+            >
+              📷 截图取词
+            </Button>
             <Button kind="primary" onClick={onRecordToggle}>
               {recording ? '■ 结束并识别' : '🎤 试录一段'}
             </Button>
@@ -195,6 +214,36 @@ export default function Dashboard({
                 </span>
               ))}
               <span className="text-[10.5px] text-amber-300/80">快速 · 不经 AI</span>
+            </span>
+          )}
+          {translateChips.length > 0 && (
+            <span className="flex items-center gap-1.5">
+              {translateChips.map((c, i) => (
+                <span key={i} className="kbd !border-emerald-400/25 !text-emerald-300">
+                  {c}
+                </span>
+              ))}
+              <span className="text-[10.5px] text-emerald-300/80">翻译</span>
+            </span>
+          )}
+          {selChips.length > 0 && (
+            <span className="flex items-center gap-1.5">
+              {selChips.map((c, i) => (
+                <span key={i} className="kbd !border-teal-400/25 !text-teal-300">
+                  {c}
+                </span>
+              ))}
+              <span className="text-[10.5px] text-teal-300/80">划词</span>
+            </span>
+          )}
+          {ocrChips.length > 0 && (
+            <span className="flex items-center gap-1.5">
+              {ocrChips.map((c, i) => (
+                <span key={i} className="kbd !border-sky-400/25 !text-sky-300">
+                  {c}
+                </span>
+              ))}
+              <span className="text-[10.5px] text-sky-300/80">截图取词</span>
             </span>
           )}
           <span className="ml-auto text-[11px] text-slate-600">修改 ›</span>
@@ -282,6 +331,12 @@ export default function Dashboard({
             onChange={(enabled) => set('llm', { enabled })}
             label="AI 纠错与优化"
             desc="关闭后直接输出 ASR 原文，速度最快"
+          />
+          <Toggle
+            checked={cfg.translate.clipboardWatch}
+            onChange={(clipboardWatch) => set('translate', { clipboardWatch })}
+            label="复制即翻译"
+            desc="在任意应用复制文字后自动弹出翻译卡片；复制的敏感内容也会发给 AI 接口（可在「翻译」页加黑名单）"
           />
           <Toggle
             checked={cfg.general.showOverlay}

@@ -36,6 +36,12 @@ const LLM_PRESETS = [
     model: 'kimi-k2-0905-preview',
   },
   {
+    value: 'qwenmt',
+    label: '阿里 Qwen-MT（翻译专用 API，需 DashScope Key）',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-mt-turbo',
+  },
+  {
     value: 'ollama',
     label: 'Ollama 本地（免 Key，推荐小模型 qwen3:4b）',
     baseUrl: 'http://localhost:11434/v1',

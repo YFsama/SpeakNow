@@ -28,10 +28,14 @@ export interface ProviderProfile {
 
 export interface HotkeyConfig {
   key: string;
-  /** 快速模式快捷键（可选）：跳过 AI 优化直接输出原文 */
+  /** 快速模式快捷键（可选）：跳过 AI 优化直接输出 ASR 原文 */
   keyQuick: string;
   /** 翻译模式快捷键（可选）：本次听写强制翻译，输出目标语言译文 */
   keyTranslate: string;
+  /** 划词翻译快捷键（可选）：翻译任意应用中选中的文字（弹悬浮窗，可复制/替换） */
+  keyTranslateSel: string;
+  /** 截图取词快捷键（可选）：框选屏幕区域 OCR 识别（弹悬浮窗，可复制/翻译/输入） */
+  keyOcr: string;
   mode: HotkeyMode;
   enabled: boolean;
 }
@@ -83,11 +87,11 @@ export interface LocalModelStatus {
   desc: string;
   sizeMb: number;
   downloaded: boolean;
-  /** whisper（内置 candle）| qwen（llama.cpp 子进程） */
-  kind?: 'whisper' | 'qwen';
-  /** qwen：llama.cpp 运行时是否就绪 */
+  /** whisper（内置 candle）| qwen（llama.cpp 子进程）| llm（本地翻译引擎，llama.cpp 子进程）| ppocr（截图取词质量档，ort 进程内推理） */
+  kind?: 'whisper' | 'qwen' | 'llm' | 'ppocr';
+  /** qwen / llm：llama.cpp 运行时是否就绪 */
   runtimeReady?: boolean;
-  /** qwen：运行时后端（vulkan / cpu） */
+  /** qwen / llm：运行时后端（vulkan / cpu） */
   backend?: string;
 }
 
@@ -108,6 +112,41 @@ export interface LlmConfig {
   translateSecondTarget: string;
   /** translation（仅译文）| bilingual（原文 + 译文两行） */
   translateOutput: 'translation' | 'bilingual';
+}
+
+/** 划词翻译行为配置。目标语言与听写翻译共用 llm.translateTarget */
+export interface TranslateConfig {
+  /** 译文出来后自动复制到剪贴板 */
+  autoCopy: boolean;
+  /** 强制模拟复制取词（跳过 UIA；兼容 UIA 取不到文字的应用） */
+  forcedCopy: boolean;
+  /** 「替换原文」时在译文前加「翻 」标记，防误替换（可关） */
+  replaceMarker: boolean;
+  /** 黑名单（每行一个关键字）：前台窗口标题或进程名命中时不触发划词翻译 */
+  blacklist: string;
+  /** 复制即翻译：监听剪贴板变化，复制文字后自动弹出翻译卡片（默认关，敏感内容慎用） */
+  clipboardWatch: boolean;
+  /** 结构化智能翻译：JSON/YAML/键值只翻译字符串值，键名、注释、格式原样保留（默认开） */
+  structuredTranslate: boolean;
+  /** 翻译引擎：cloud（云端 LLM，默认）| local（本地 llama.cpp，离线·隐私·免费） */
+  engine: 'cloud' | 'local';
+  /** 本地引擎模型 id（local_llm::MODELS） */
+  localModel: string;
+}
+
+/** 截图取词（OCR）配置。引擎分层：system=Windows 内置离线引擎（零下载）；
+ *  ppocr / vlm 为后续质量档预留 */
+export interface OcrConfig {
+  /** 功能总开关（关闭后热键/托盘不响应） */
+  enabled: boolean;
+  /** system（Windows.Media.Ocr）| ppocr | vlm（预留位） */
+  engine: string;
+  /** auto（跟随系统用户语言）或语言前缀（zh / en / ja / ko …） */
+  language: string;
+  /** 识别完成后不弹 OCR 卡片，直接进入翻译流程（截图翻译一键链） */
+  autoTranslate: boolean;
+  /** 识别完成后自动把文本复制到剪贴板 */
+  copyOnCapture: boolean;
 }
 
 export interface OutputConfig {
@@ -152,6 +191,10 @@ export interface Config {
   audio: AudioConfig;
   asr: AsrConfig;
   llm: LlmConfig;
+  /** 划词翻译（DeepL 式客户端体验） */
+  translate: TranslateConfig;
+  /** 截图取词（OCR）：框选识别 → 复制/翻译/输入 */
+  ocr: OcrConfig;
   output: OutputConfig;
   general: GeneralConfig;
   externalDisplay: ExternalDisplayConfig;
@@ -221,6 +264,8 @@ export type TabId =
   | 'mic'
   | 'asr'
   | 'llm'
+  | 'translate'
+  | 'ocr'
   | 'output'
   | 'display'
   | 'history'

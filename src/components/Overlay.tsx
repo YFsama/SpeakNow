@@ -10,17 +10,24 @@ import {
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import type { Config, MetaPayload, Stage } from '../types';
-import { langName, resolvedLlmCreds } from '../types';
+import { TRANSLATE_LANGS, langName, resolvedLlmCreds } from '../types';
 import {
   cancelReview,
   confirmEdit,
+  copyText,
   dismissOverlay,
   getConfig,
+  ocrCapture,
+  ocrPaste,
   optimizeText,
   overlayPin,
   overlaySetManual,
   restartElevated,
   retryLast,
+  translateAnnounce,
+  translateRetarget,
+  translateText,
+  translateReplace,
 } from '../api';
 
 const BAR_COUNT = 26;
@@ -38,6 +45,25 @@ const MODE_LABELS: Record<string, string> = {
   translate: '翻译',
 };
 
+/* 划词翻译卡片状态（独立于听写 stage 机器：由 sn-translate-* 事件驱动） */
+interface TransCard {
+  text: string;
+  target: string;
+  status: 'streaming' | 'done' | 'error';
+  stream: string;
+  thinking: string;
+  final: string;
+  error: string;
+  ms: number;
+  firstMs: number;
+  autoCopied: boolean;
+  /** 结构化翻译：结果事件携带的结构类型（JSON/YAML/键值），空 = 普通翻译 */
+  structured: string;
+}
+
+/* 翻译卡片驻留时长（与后端 hide_later 的 10s 对齐；悬停钉住时暂停） */
+const TRANS_COUNTDOWN_MS = 10000;
+
 /* 阶段色微光（卡片外圈短焦光晕的颜色，与描边渐变同色系）：
    取代旧版大范围灰色阴影——低透明长尾在 8bit alpha 量化下会出现色带，
    且色相单一的暗灰晕在浅色桌面上观感浑浊 */
@@ -48,6 +74,7 @@ const GLOW_COLORS: Record<string, string> = {
   done: 'rgba(52,211,153,0.20)',
   error: 'rgba(239,68,68,0.22)',
   review: 'rgba(251,191,36,0.20)',
+  translate: 'rgba(52,211,153,0.20)',
 };
 
 /* ---- WebAudio 合成提示音（无资源文件依赖） ---- */
@@ -397,6 +424,23 @@ export default function Overlay() {
   const [llmEnabled, setLlmEnabled] = useState(false);
   const [llmMode, setLlmMode] = useState('correct');
   const [translateTarget, setTranslateTarget] = useState('en');
+  /* 划词翻译卡片 */
+  const [trans, setTrans] = useState<TransCard | null>(null);
+  const [transBusy, setTransBusy] = useState(false);
+  const [transCopied, setTransCopied] = useState(false);
+  const [transReplacing, setTransReplacing] = useState(false);
+  const [transActionErr, setTransActionErr] = useState('');
+  const [srcExpanded, setSrcExpanded] = useState(false);
+  /* 截图取词（OCR）卡片 */
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrCard, setOcrCard] = useState<{ text: string; ms: number } | null>(null);
+  const [ocrCopied, setOcrCopied] = useState(false);
+  const [ocrPasting, setOcrPasting] = useState(false);
+  /* 可编辑正文：识别错字先改再用（复制/翻译/输入都取编辑后的文本） */
+  const [ocrEdit, setOcrEdit] = useState('');
+  const ocrEditRef = useRef<HTMLTextAreaElement>(null);
+  /* 声音反馈开关（翻译完成音随配置；ref 避免监听器闭包过期） */
+  const soundRef = useRef(true);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   /* 重新优化期间把流式累计文本直接写回审阅编辑框（不进 React 状态） */
   const reoptStreamRef = useRef(false);
@@ -412,6 +456,7 @@ export default function Overlay() {
     const apply = (c: Config) => {
       zoomRef.current = c.general.fontScale || 1;
       document.body.style.zoom = String(zoomRef.current);
+      soundRef.current = c.general.soundFeedback !== false;
       // 后端凭据组迁移会清空内联 llm.baseUrl，须按解析后的生效凭据判断
       // LLM 是否可用，否则迁移后审阅编辑器的「重新优化」会莫名消失
       setLlmEnabled(c.llm.enabled && !!resolvedLlmCreds(c).baseUrl.trim());
@@ -505,6 +550,12 @@ export default function Overlay() {
         const p = e.payload;
         setStage(p.stage);
         setMessage(p.message ?? '');
+        // 听写接管 / 悬浮窗隐藏（含替换原文后的复位）：翻译与 OCR 卡片一并清场
+        setTrans(null);
+        setTransBusy(false);
+        setTransActionErr('');
+        setOcrBusy(false);
+        setOcrCard(null);
         if (p.stage === 'recording') {
           setRawText('');
           setPartial('');
@@ -569,6 +620,327 @@ export default function Overlay() {
     };
   }, []);
 
+  /* ---- 划词翻译卡片：生命周期事件 + 流式增量 ---- */
+  useEffect(() => {
+    const un1 = listen<{ gen: number; text: string; target: string; second?: string }>(
+      'sn-translate-start',
+      (e) => {
+        setTrans({
+          text: e.payload.text,
+          target: e.payload.target,
+          status: 'streaming',
+          stream: '',
+          thinking: '',
+          final: '',
+          error: '',
+          ms: 0,
+          firstMs: 0,
+          autoCopied: false,
+          structured: '',
+        });
+        setTransBusy(true);
+        setTransCopied(false);
+        setTransActionErr('');
+        setSrcExpanded(false);
+        // 翻译卡片接管悬浮窗：OCR 卡片让位（截图翻译一键链的切换点）
+        setOcrBusy(false);
+        setOcrCard(null);
+      },
+    );
+    const un2 = listen<{
+      gen: number;
+      final: string;
+      ms: number;
+      firstMs: number;
+      autoCopied?: boolean;
+      structured?: string;
+    }>('sn-translate-result', (e) => {
+      setTrans((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          status: 'done',
+          final: e.payload.final,
+          stream: e.payload.final,
+          ms: e.payload.ms,
+          firstMs: e.payload.firstMs,
+          autoCopied: !!e.payload.autoCopied,
+          structured: e.payload.structured ?? '',
+        };
+      });
+      setTransBusy(false);
+      if (soundRef.current) playTones([880, 1175, 1568], 0.07);
+    });
+    const un3 = listen<{ message: string }>('sn-translate-error', (e) => {
+      // 无卡片时的独立错误（取词失败等）：创建只含错误信息的卡片
+      setTrans((prev) =>
+        prev
+          ? { ...prev, status: 'error', error: e.payload.message }
+          : {
+              text: '',
+              target: '',
+              status: 'error',
+              stream: '',
+              thinking: '',
+              final: '',
+              error: e.payload.message,
+              ms: 0,
+              firstMs: 0,
+              autoCopied: false,
+              structured: '',
+            },
+      );
+      setTransBusy(false);
+      setOcrBusy(false); // 截图翻译链在翻译阶段失败：OCR 卡片同样让位给错误卡
+      if (soundRef.current) playTones([340, 230], 0.12);
+    });
+    /* 翻译会话的流式增量：仅卡片处于 streaming 时累计（事件与听写优化共用频道） */
+    const un4 = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
+      setTrans((prev) => {
+        if (!prev || prev.status !== 'streaming') return prev;
+        if (e.payload.kind === 'content' && e.payload.text !== undefined) {
+          return { ...prev, stream: e.payload.text };
+        }
+        if (e.payload.kind === 'reasoning' && e.payload.delta) {
+          return { ...prev, thinking: (prev.thinking + (e.payload.delta ?? '')).slice(-160) };
+        }
+        return prev;
+      });
+    });
+    return () => {
+      un1.then((f) => f());
+      un2.then((f) => f());
+      un3.then((f) => f());
+      un4.then((f) => f());
+    };
+  }, []);
+
+  /* 翻译卡片：Esc 关闭 */
+  useEffect(() => {
+    if (!trans) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setTrans(null);
+        void dismissOverlay();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [!!trans]);
+
+  /* 翻译卡片：按内容自适应窗口高度（流式与完成共用一条估算） */
+  const transBody = trans
+    ? trans.status === 'done'
+      ? trans.final
+      : trans.status === 'streaming'
+        ? trans.stream
+        : ''
+    : '';
+  const transH = useMemo(() => {
+    if (!trans) return WIN_NORMAL.h;
+    if (trans.status === 'error') return WIN_NORMAL.h;
+    const srcLines = trans.text ? estimateDisplayLines(trans.text, 430) * 0.5 : 0;
+    const bodyLines = estimateDisplayLines(transBody || '…', 430);
+    return Math.min(Math.max(232 + Math.round((srcLines + bodyLines) * 25), WIN_NORMAL.h), 620);
+  }, [!!trans, trans?.status, trans?.text, transBody]);
+  useEffect(() => {
+    if (!trans) return;
+    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, transH));
+  }, [!!trans, transH]);
+
+  /* 操作反馈自动消退 */
+  useEffect(() => {
+    if (!transCopied) return;
+    const t = setTimeout(() => setTransCopied(false), 1600);
+    return () => clearTimeout(t);
+  }, [transCopied]);
+  useEffect(() => {
+    if (!transActionErr) return;
+    const t = setTimeout(() => setTransActionErr(''), 3500);
+    return () => clearTimeout(t);
+  }, [transActionErr]);
+
+  /* ---- 截图取词（OCR）卡片：生命周期事件 + 动作 ---- */
+  const [ocrErr, setOcrErr] = useState('');
+  useEffect(() => {
+    const un1 = listen('sn-ocr-start', () => {
+      setOcrBusy(true);
+      setOcrCard(null);
+      setOcrErr('');
+      setOcrCopied(false);
+    });
+    const un2 = listen<{ text: string; ms: number }>('sn-ocr-result', (e) => {
+      setOcrBusy(false);
+      setOcrCard({ text: e.payload.text, ms: e.payload.ms });
+      setOcrEdit(e.payload.text);
+      if (soundRef.current) playTones([880, 1175, 1568], 0.07);
+    });
+    const un3 = listen<{ message: string }>('sn-ocr-error', (e) => {
+      setOcrBusy(false);
+      setOcrErr(e.payload.message);
+      if (soundRef.current) playTones([340, 230], 0.12);
+    });
+    return () => {
+      un1.then((f) => f());
+      un2.then((f) => f());
+      un3.then((f) => f());
+    };
+  }, []);
+
+  const closeOcrCard = () => {
+    setOcrBusy(false);
+    setOcrCard(null);
+    setOcrErr('');
+    setOcrEdit('');
+    void dismissOverlay();
+  };
+
+  const onOcrCopy = async () => {
+    if (!ocrEdit.trim()) return;
+    try {
+      await copyText(ocrEdit);
+      setOcrCopied(true);
+    } catch (e) {
+      setOcrErr(String(e));
+    }
+  };
+
+  /* OCR 卡片「翻译」：切换到流式翻译卡片（语言条/复制/替换全沿用） */
+  const onOcrTranslate = async () => {
+    if (!ocrEdit.trim()) return;
+    try {
+      await translateAnnounce(ocrEdit);
+    } catch (e) {
+      setOcrErr(String(e));
+    }
+  };
+
+  const onOcrPaste = async () => {
+    if (!ocrEdit.trim() || ocrPasting) return;
+    setOcrPasting(true);
+    try {
+      await ocrPaste(ocrEdit);
+      // 后端粘贴成功后发 idle 状态，卡片由 sn-status 监听统一清场
+    } catch (e) {
+      setOcrErr(String(e));
+    } finally {
+      setOcrPasting(false);
+    }
+  };
+
+  /* OCR 卡片：Esc 关闭（与翻译卡片同语义） */
+  useEffect(() => {
+    if (!ocrCard && !ocrBusy && !ocrErr) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeOcrCard();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [!!ocrCard, !!ocrBusy, !!ocrErr]);
+
+  /* OCR 卡片：按内容自适应窗口高度（跟随编辑中的文本；编辑框另有滚动上限） */
+  const ocrH = useMemo(() => {
+    if (ocrErr) return WIN_NORMAL.h;
+    if (!ocrCard) return WIN_NORMAL.h;
+    const lines = estimateDisplayLines(ocrEdit || ocrCard.text, 430);
+    return Math.min(Math.max(232 + Math.round(lines * 25), WIN_NORMAL.h), 560);
+  }, [!!ocrCard, ocrEdit, !!ocrErr]);
+  useEffect(() => {
+    if (!ocrCard && !ocrBusy && !ocrErr) return;
+    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, ocrH));
+  }, [!!ocrCard, ocrH, !!ocrBusy, !!ocrErr]);
+  /* 编辑框随内容长高（基线 4 行，封顶 300px 后滚动），编辑不丢光标 */
+  useEffect(() => {
+    const el = ocrEditRef.current;
+    if (!el || !ocrCard) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 300)}px`;
+  }, [!!ocrCard, ocrEdit]);
+  useEffect(() => {
+    if (!ocrCard && !ocrErr) {
+      // 卡片清场（听写/翻译接管）后交还尺寸控制权；翻译卡片在场时由它接管高度
+      if (!trans && stage !== 'review') {
+        void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
+      }
+    }
+  }, [!!ocrCard, !!ocrErr, !!trans, stage]);
+
+  useEffect(() => {
+    if (!ocrCopied) return;
+    const t = setTimeout(() => setOcrCopied(false), 1600);
+    return () => clearTimeout(t);
+  }, [ocrCopied]);
+  useEffect(() => {
+    if (!ocrErr) return;
+    const t = setTimeout(() => setOcrErr(''), 6000);
+    return () => clearTimeout(t);
+  }, [ocrErr]);
+
+  /* 语言条切换目标语言并重译（持久化，托盘/设置页同步） */
+  const onTransTarget = (code: string) => {
+    if (!trans || transBusy || code === trans.target) return;
+    setTrans((prev) =>
+      prev
+        ? { ...prev, target: code, status: 'streaming', stream: '', thinking: '', final: '', error: '' }
+        : prev,
+    );
+    setTransBusy(true);
+    setTransCopied(false);
+    setTransActionErr('');
+    translateRetarget(trans.text, code).catch((e) => {
+      setTransBusy(false);
+      setTrans((prev) => (prev ? { ...prev, status: 'error', error: String(e) } : prev));
+    });
+  };
+
+  /* 重译（同一目标语言；静默会话，不落盘配置） */
+  const onTransRetry = () => {
+    if (!trans || transBusy || !trans.text.trim()) return;
+    setTrans((prev) =>
+      prev ? { ...prev, status: 'streaming', stream: '', thinking: '', final: '', error: '' } : prev,
+    );
+    setTransBusy(true);
+    setTransActionErr('');
+    translateText(trans.text, trans.target)
+      .then((t) => {
+        setTrans((prev) =>
+          prev ? { ...prev, status: 'done', final: t, stream: t } : prev,
+        );
+        setTransBusy(false);
+      })
+      .catch((e) => {
+        setTrans((prev) => (prev ? { ...prev, status: 'error', error: String(e) } : prev));
+        setTransBusy(false);
+      });
+  };
+
+  const onTransCopy = () => {
+    const t = trans?.status === 'done' ? trans.final : trans?.stream ?? '';
+    if (!t.trim()) return;
+    void copyText(t)
+      .then(() => setTransCopied(true))
+      .catch((e) => setTransActionErr(String(e)));
+  };
+
+  const onTransReplace = () => {
+    if (!trans || transReplacing || !trans.final.trim()) return;
+    setTransReplacing(true);
+    translateReplace(trans.final)
+      .catch((e) => {
+        setTransReplacing(false);
+        setTransActionErr(String(e));
+      });
+  };
+
+  const closeTrans = () => {
+    setTrans(null);
+    void dismissOverlay();
+  };
+
   const onEnter = () => {
     setHovered(true);
     void overlayPin(true);
@@ -615,11 +987,12 @@ export default function Overlay() {
     return () => clearTimeout(t);
   }, [notice]);
 
-  if (stage === 'idle') return <div className="h-screen w-screen" />;
+  if (stage === 'idle' && !trans) return <div className="h-screen w-screen" />;
 
-  // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红
-  const glow =
-    stage === 'recording'
+  // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红；翻译卡=青绿
+  const glow = trans
+    ? 'from-emerald-400/50 via-teal-400/25 to-emerald-400/50'
+    : stage === 'recording'
       ? 'from-rose-500/55 via-red-500/25 to-rose-500/55'
       : stage === 'optimizing'
         ? 'from-indigo-400/45 via-violet-500/25 to-indigo-400/45'
@@ -643,7 +1016,9 @@ export default function Overlay() {
         style={
           {
             ...(stage === 'review' ? { width: CARD_W_REVIEW } : null),
-            '--stage-glow': GLOW_COLORS[stage] ?? GLOW_COLORS.transcribing,
+            '--stage-glow': trans
+              ? GLOW_COLORS.translate
+              : (GLOW_COLORS[stage] ?? GLOW_COLORS.transcribing),
           } as CSSProperties
         }
       >
@@ -702,7 +1077,7 @@ export default function Overlay() {
               </span>
             )}
           </div>
-          {(stage === 'done' || stage === 'error') && (
+          {(stage === 'done' || stage === 'error') && !trans && (
             <span
               key={`${stage}-${resultId}`}
               className={`countdown-bar absolute bottom-0 left-0 h-[2px] ${
@@ -716,6 +1091,314 @@ export default function Overlay() {
               }}
               aria-hidden
             />
+          )}
+          {trans?.status === 'done' && (
+            <span
+              className="countdown-bar absolute bottom-0 left-0 h-[2px] bg-gradient-to-r from-emerald-400 to-teal-300"
+              style={{
+                animationDuration: `${TRANS_COUNTDOWN_MS}ms`,
+                animationPlayState: hovered ? 'paused' : 'running',
+              }}
+              aria-hidden
+            />
+          )}
+
+          {ocrCard?.text && !trans && (
+            <span
+              className="countdown-bar absolute bottom-0 left-0 h-[2px] bg-gradient-to-r from-sky-400 to-cyan-300"
+              style={{
+                animationDuration: '15s',
+                animationPlayState: hovered ? 'paused' : 'running',
+              }}
+              aria-hidden
+            />
+          )}
+
+          {(ocrBusy || ocrCard || ocrErr) && !trans && (
+            <div className="anim-rise" onClick={(e) => e.stopPropagation()}>
+              {/* 标题行 */}
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-sky-500/15 text-[13px]">
+                  📷
+                </span>
+                <span className="text-[13px] font-medium text-sky-300">截图取词</span>
+                {ocrBusy && (
+                  <span className="flex items-center gap-0.5 text-[11px] text-slate-500">
+                    识别中
+                    <span className="dot ml-1 inline-block h-1 w-1 rounded-full bg-sky-400" />
+                    <span
+                      className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-sky-400"
+                      style={{ animationDelay: '0.15s' }}
+                    />
+                    <span
+                      className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-sky-400"
+                      style={{ animationDelay: '0.3s' }}
+                    />
+                  </span>
+                )}
+                {ocrCard && (
+                  <span className="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 text-[10px] text-sky-300">
+                    本地识别{ocrCard.ms ? ` · ${fmtMs(ocrCard.ms)}` : ''}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={closeOcrCard}
+                  title="关闭（Esc）"
+                  className="ml-auto flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-black/25 text-[11px] text-slate-500 transition hover:border-white/25 hover:text-slate-200"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* 错误信息（语言包缺失 / 引擎失败等，附引导） */}
+              {ocrErr && (
+                <div className="mt-2.5 rounded-lg border border-red-400/20 bg-red-500/[0.07] px-3 py-2.5 text-[12.5px] leading-relaxed text-red-200">
+                  {ocrErr}
+                </div>
+              )}
+
+              {/* 识别文本：可直接编辑（错字先改再用，复制/翻译/输入都取编辑后文本） */}
+              {ocrCard?.text && (
+                <div className="mt-2.5">
+                  <textarea
+                    ref={ocrEditRef}
+                    value={ocrEdit}
+                    rows={4}
+                    spellCheck={false}
+                    onChange={(e) => setOcrEdit(e.target.value)}
+                    className="sn-scroll max-h-[300px] w-full resize-none whitespace-pre-wrap break-words rounded-lg border border-sky-400/15 bg-sky-500/[0.05] px-3 py-2.5 text-[13.5px] leading-[1.85] text-slate-100 outline-none transition select-text hover:border-sky-400/30 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-500/15"
+                  />
+                  <div className="mt-1 flex items-center gap-2 text-[10px] text-slate-600">
+                    <span>{ocrEdit.trim() ? `${ocrEdit.trim().length} 字` : ''}</span>
+                    <span className="ml-auto">可直接修改 · Esc 关闭</span>
+                  </div>
+                </div>
+              )}
+
+              {/* 操作行 */}
+              <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2.5">
+                <button
+                  type="button"
+                  disabled={!ocrEdit.trim()}
+                  onClick={onOcrCopy}
+                  className="rounded-full border border-white/10 bg-black/25 px-3 py-1.5 text-[12px] text-slate-300 transition hover:border-white/25 disabled:opacity-40"
+                >
+                  {ocrCopied ? '已复制 ✓' : '⧉ 复制'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!ocrEdit.trim()}
+                  onClick={onOcrTranslate}
+                  title="识别文本送入翻译（目标语言与划词翻译一致）"
+                  className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[12px] text-emerald-300 transition hover:bg-emerald-400/20 disabled:opacity-40"
+                >
+                  🌐 翻译
+                </button>
+                <button
+                  type="button"
+                  disabled={!ocrEdit.trim() || ocrPasting}
+                  onClick={onOcrPaste}
+                  title="把识别文本粘贴到光标处（Ctrl+Z 可撤销）"
+                  className="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1.5 text-[12px] text-sky-300 transition hover:bg-sky-400/20 disabled:opacity-40"
+                >
+                  {ocrPasting ? '输入中…' : '⌨ 输入到光标'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOcrCard(null);
+                    setOcrErr('');
+                    setOcrBusy(false);
+                    void ocrCapture();
+                  }}
+                  title="重新框选一块区域"
+                  className="rounded-full border border-white/10 bg-black/25 px-3 py-1.5 text-[12px] text-slate-400 transition hover:border-white/25 disabled:opacity-40"
+                >
+                  ↻ 再截一次
+                </button>
+                <span className="ml-auto text-[10px] text-slate-600">
+                  悬停可暂停 · Esc 关闭
+                </span>
+              </div>
+            </div>
+          )}
+
+          {trans && (
+            <div className="anim-rise" onClick={(e) => e.stopPropagation()}>
+              {/* 标题行 */}
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-[13px]">
+                  🌐
+                </span>
+                <span className="text-[13px] font-medium text-emerald-300">划词翻译</span>
+                {trans.structured && (
+                  <span
+                    className="rounded-full border border-teal-400/30 bg-teal-400/10 px-2 py-0.5 text-[10px] text-teal-300"
+                    title="检测到结构化文本：只翻译了字符串值，键名、注释与格式原样保留"
+                  >
+                    📄 {trans.structured} · 只译值
+                  </span>
+                )}
+                {trans.status === 'streaming' && (
+                  <span className="flex items-center gap-0.5 text-[11px] text-slate-500">
+                    译成{langName(trans.target)}
+                    <span className="dot ml-1 inline-block h-1 w-1 rounded-full bg-emerald-400" />
+                    <span
+                      className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-emerald-400"
+                      style={{ animationDelay: '0.15s' }}
+                    />
+                    <span
+                      className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-emerald-400"
+                      style={{ animationDelay: '0.3s' }}
+                    />
+                  </span>
+                )}
+                {trans.status === 'done' && (
+                  <span className="rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">
+                    {langName(trans.target)}
+                    {trans.ms ? ` · ${fmtMs(trans.ms)}` : ''}
+                  </span>
+                )}
+                {trans.autoCopied && (
+                  <span className="rounded-full border border-sky-400/25 bg-sky-400/[0.07] px-2 py-0.5 text-[10px] text-sky-300/90">
+                    已自动复制
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={closeTrans}
+                  title="关闭（Esc）"
+                  className="ml-auto flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-black/25 text-[11px] text-slate-500 transition hover:border-white/25 hover:text-slate-200"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* 源文（默认两行折叠，点击展开核对） */}
+              {trans.text && (
+                <button
+                  type="button"
+                  onClick={() => setSrcExpanded((v) => !v)}
+                  title={srcExpanded ? '收起源文' : '展开完整源文'}
+                  className="mt-2.5 block w-full rounded-lg border border-white/[0.05] bg-white/[0.02] px-3 py-2 text-left transition hover:bg-white/[0.04]"
+                >
+                  <span
+                    className={`block whitespace-pre-wrap break-words text-[12px] leading-5 text-slate-400 ${
+                      srcExpanded ? '' : 'line-clamp-2'
+                    }`}
+                  >
+                    {trans.text}
+                  </span>
+                  <span className="mt-1 block text-[10px] text-slate-600">
+                    {srcExpanded ? '收起源文' : `源文 ${trans.text.length} 字 · 点击展开`}
+                  </span>
+                </button>
+              )}
+
+              {/* 译文 / 错误 */}
+              {trans.status === 'error' ? (
+                <div className="mt-2.5 flex items-start gap-2.5 rounded-lg border border-red-400/15 bg-red-500/[0.06] px-3 py-2.5">
+                  <span className="mt-0.5 text-[13px] font-bold text-red-400">!</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[12.5px] leading-5 text-red-300">{trans.error}</div>
+                    {trans.error.includes('管理员') && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void restartElevated().catch(() => {});
+                        }}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-amber-500/90 to-orange-500/90 px-3 py-1 text-[11.5px] font-medium text-white shadow-lg shadow-amber-500/20 transition hover:brightness-110 active:scale-[0.97]"
+                      >
+                        🛡 以管理员身份重启 SpeakNow
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : transBody || trans.status === 'streaming' ? (
+                <div
+                  onDoubleClick={onTransCopy}
+                  title="双击复制译文"
+                  className="sn-scroll mt-2.5 max-h-[300px] cursor-copy select-text overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-400/15 bg-emerald-500/[0.05] px-3 py-2.5 text-[13.5px] leading-[1.85] text-slate-100"
+                >
+                  {transBody}
+                  {trans.status === 'streaming' && (
+                    <span className="llm-cursor text-emerald-300">▍</span>
+                  )}
+                </div>
+              ) : null}
+
+              {/* 思考型模型：正文未出时先暗色展示思考片段 */}
+              {trans.status === 'streaming' && !trans.stream && trans.thinking && (
+                <div className="mt-2 rounded-lg border border-white/[0.05] bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-slate-600">深度思考中…</div>
+                  <div className="mt-0.5 line-clamp-2 break-all text-[11px] leading-5 text-slate-500">
+                    {trans.thinking}
+                  </div>
+                </div>
+              )}
+
+              {/* 目标语言条：点击即换语言重译（持久化，托盘/设置页同步） */}
+              {trans.text && (
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {TRANSLATE_LANGS.map(([code, name]) => {
+                    const active = code === trans.target;
+                    return (
+                      <button
+                        key={code}
+                        type="button"
+                        disabled={transBusy}
+                        onClick={() => onTransTarget(code)}
+                        className={`rounded-full border px-2.5 py-[5px] text-[11px] transition active:scale-[0.97] ${
+                          active
+                            ? 'border-emerald-400/60 bg-emerald-400/15 font-medium text-emerald-200'
+                            : 'border-white/10 bg-black/25 text-slate-400 hover:border-white/25 hover:text-slate-200'
+                        } disabled:opacity-50`}
+                      >
+                        {name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* 操作行 */}
+              <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2.5">
+                <button
+                  type="button"
+                  disabled={!transBody.trim()}
+                  onClick={onTransCopy}
+                  className="rounded-full border border-white/10 bg-black/25 px-3 py-1.5 text-[12px] text-slate-300 transition hover:border-white/25 disabled:opacity-40"
+                >
+                  {transCopied ? '已复制 ✓' : '⧉ 复制'}
+                </button>
+                <button
+                  type="button"
+                  disabled={trans.status !== 'done' || transReplacing || !trans.final.trim()}
+                  onClick={onTransReplace}
+                  title="把译文粘贴覆盖原应用中选中的文字（Ctrl+Z 可撤销）"
+                  className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[12px] text-emerald-300 transition hover:bg-emerald-400/20 disabled:opacity-40"
+                >
+                  {transReplacing ? '替换中…' : '⇄ 替换原文'}
+                </button>
+                <button
+                  type="button"
+                  disabled={transBusy || !trans.text.trim()}
+                  onClick={onTransRetry}
+                  className="rounded-full border border-white/10 bg-black/25 px-3 py-1.5 text-[12px] text-slate-400 transition hover:border-white/25 disabled:opacity-40"
+                >
+                  ↻ 重译
+                </button>
+                <span className="ml-auto text-[10px] text-slate-600">
+                  悬停暂停 · 双击复制 · 点空白关闭
+                </span>
+              </div>
+              {transActionErr && (
+                <div className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-red-300">
+                  {transActionErr}
+                </div>
+              )}
+            </div>
           )}
 
           {stage === 'recording' && (

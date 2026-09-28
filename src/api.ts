@@ -131,6 +131,40 @@ export const cancelReview = () => invoke('cancel_review');
 export const optimizeText = (text: string, mode?: string) =>
   invoke<string>('optimize_text', { text, mode: mode ?? null });
 
+/* ============ 划词翻译 ============ */
+
+/** 手动触发一次划词翻译（取当前前台应用的选中文字，悬浮窗展示结果） */
+export const translateSelection = () =>
+  invoke<string>('translate_selection_cmd');
+/** 翻译指定文本（静默会话：不弹悬浮窗，流式增量走 sn-llm-delta，返回完整译文） */
+export const translateText = (text: string, target?: string) =>
+  invoke<string>('translate_text', { text, target: target ?? null });
+/** 悬浮窗语言条切换目标语言并重译（持久化新目标，卡片收到 start/result 事件） */
+export const translateRetarget = (text: string, target: string) =>
+  invoke('translate_retarget', { text, target });
+/** 把译文替换回原应用中选中的文字（选中状态下粘贴即覆盖，Ctrl+Z 可撤销） */
+export const translateReplace = (text: string) =>
+  invoke('translate_replace', { text });
+/** 广播式翻译会话（OCR 卡片「翻译」按钮）：悬浮窗切到流式翻译卡片，目标语言不落盘 */
+export const translateAnnounce = (text: string, target?: string) =>
+  invoke('translate_announce', { text, target: target ?? null });
+
+/* ============ 截图取词（OCR） ============ */
+
+/** 触发一次截图取词（框选屏幕区域识别；设置页「试一下」同款入口） */
+export const ocrCapture = () => invoke<string>('ocr_capture_cmd');
+/** 框选完成回调（选区窗前端专用，逻辑像素矩形） */
+export const ocrRegionSelected = (x: number, y: number, w: number, h: number) =>
+  invoke('ocr_region_selected', { x, y, w, h });
+/** 取消本轮框选 */
+export const ocrCancel = () => invoke('ocr_cancel');
+/** 把 OCR 文本粘贴输入到光标处（悬浮窗收回后执行） */
+export const ocrPaste = (text: string) => invoke('ocr_paste', { text });
+/** 系统 OCR 引擎已安装的语言包标签（判断中文语言包、引导安装） */
+export const ocrLangs = () => invoke<string[]>('ocr_langs');
+/** 打开系统语言设置页（安装 OCR 语言包） */
+export const openLanguageSettings = () => invoke('open_language_settings');
+
 /** 外接显示（硬件字幕屏）服务状态 */
 export interface DisplayStatus {
   running: boolean;

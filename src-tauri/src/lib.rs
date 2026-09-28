@@ -9,9 +9,14 @@ mod http;
 mod inject;
 mod llm;
 pub mod local_whisper;
+mod local_llm;
+mod ocr;
 mod overlay;
 mod pipeline;
 mod qwen_asr;
+mod selection;
+mod trans_struct;
+mod translate;
 mod tray;
 mod text_clean;
 mod wav;
@@ -679,11 +684,14 @@ async fn test_asr(
     }
 }
 
-/// 内置本地模型列表与下载状态（Whisper 系列 + Qwen3-ASR）
+/// 内置本地模型列表与下载状态（Whisper 系列 + Qwen3-ASR + 本地翻译模型 + PP-OCR 质量档）
 #[tauri::command]
 fn builtin_models(app: AppHandle) -> Vec<local_whisper::LocalModelStatus> {
     let mut v = local_whisper::status(&app);
     v.push(qwen_asr::status(&app));
+    v.extend(local_llm::status(&app));
+    #[cfg(target_os = "windows")]
+    v.push(ocr::ppocr_status(&app));
     v
 }
 
@@ -692,7 +700,16 @@ fn builtin_models(app: AppHandle) -> Vec<local_whisper::LocalModelStatus> {
 async fn download_builtin(app: AppHandle, id: String, mirror: String) -> Result<(), String> {
     if id == qwen_asr::MODEL_ID {
         qwen_asr::download(&app).await.map_err(|e| format!("{e:#}"))
+    } else if local_llm::find(&id).is_some() {
+        local_llm::download(&app, &id)
+            .await
+            .map_err(|e| format!("{e:#}"))
     } else {
+        #[cfg(target_os = "windows")]
+        if id == ocr::PPOCR_ID {
+            return ocr::ppocr_download(&app).await.map_err(|e| format!("{e:#}"));
+        }
+        let _ = &mirror;
         local_whisper::download(&app, &id, &mirror)
             .await
             .map_err(|e| format!("{e:#}"))
@@ -703,13 +720,23 @@ async fn download_builtin(app: AppHandle, id: String, mirror: String) -> Result<
 #[tauri::command]
 fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
     let known = local_whisper::LOCAL_MODELS.iter().any(|d| d.id == id)
-        || id == qwen_asr::MODEL_ID;
+        || id == qwen_asr::MODEL_ID
+        || local_llm::find(&id).is_some();
+    #[cfg(target_os = "windows")]
+    let known = known || id == ocr::PPOCR_ID;
     if !known {
         return Err("未知模型".into());
     }
     if id == qwen_asr::MODEL_ID {
         // 服务进程占着 gguf 文件，必须先停
         qwen_asr::shutdown(&app);
+    }
+    if local_llm::find(&id).is_some() {
+        local_llm::shutdown(&app);
+    }
+    #[cfg(target_os = "windows")]
+    if id == ocr::PPOCR_ID {
+        ocr::ppocr_unload();
     }
     let root = local_whisper::models_root(&app).map_err(|e| e.to_string())?;
     let dir = root.join(&id);
@@ -1089,6 +1116,8 @@ pub fn run() {
             if let Err(e) = hotkey::apply(app.handle(), &cfg.hotkey) {
                 eprintln!("[speaknow] {e:#}");
             }
+            // 剪贴板监听（复制即翻译）：常驻轮询线程，开关由配置每 tick 判定
+            translate::ensure_clipboard_watcher(app.handle());
             if cfg.general.autostart {
                 let _ = apply_autostart(app.handle(), true);
             }
@@ -1102,6 +1131,18 @@ pub fn run() {
                 std::thread::spawn(move || {
                     if let Err(e) = qwen_asr::ensure_server(&h) {
                         eprintln!("[speaknow] Qwen3-ASR 预启动失败: {e:#}");
+                    }
+                });
+            }
+            // 选中本地翻译引擎时同样预启动，首次划词即秒级响应
+            if cfg.translate.engine == "local"
+                && local_llm::model_files_ok(app.handle(), &cfg.translate.local_model)
+                && qwen_asr::runtime_ok(app.handle())
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = local_llm::ensure_server(&h) {
+                        eprintln!("[speaknow] 本地翻译引擎预启动失败: {e:#}");
                     }
                 });
             }
@@ -1128,6 +1169,10 @@ pub fn run() {
                         api.prevent_close();
                         let _ = window.hide();
                     }
+                } else if window.label().starts_with("ocr-sel-") {
+                    // 选区窗被 Alt+F4 等关闭：转为取消本轮截图取词（窗实例保留复用）
+                    api.prevent_close();
+                    crate::ocr::ocr_cancel(window.app_handle().clone());
                 }
             }
             // 主窗口真正销毁（退出应用）前：把内存中的配置落盘，防止配置文件意外丢失
@@ -1183,6 +1228,17 @@ pub fn run() {
             confirm_edit,
             cancel_review,
             optimize_text,
+            translate::translate_selection_cmd,
+            translate::translate_text,
+            translate::translate_retarget,
+            translate::translate_replace,
+            translate::translate_announce,
+            ocr::ocr_capture_cmd,
+            ocr::ocr_region_selected,
+            ocr::ocr_cancel,
+            ocr::ocr_paste,
+            ocr::ocr_langs,
+            ocr::open_language_settings,
             display_status,
             open_display_page,
             is_elevated,
@@ -1191,10 +1247,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("SpeakNow 启动失败")
         .run(|app, event| {
-            // 应用退出时收掉 llama-server 子进程，避免孤儿进程占着 3GB 内存；
-            // 强杀/崩溃路径由 Job Object（KILL_ON_JOB_CLOSE）兜底
+            // 应用退出时收掉 llama-server 子进程（识别 + 翻译两个引擎），避免孤儿进程
+            // 占着数 GB 内存；强杀/崩溃路径由 Job Object（KILL_ON_JOB_CLOSE）兜底
             if let tauri::RunEvent::Exit = event {
                 qwen_asr::shutdown(app);
+                local_llm::shutdown(app);
             }
         });
 }

@@ -41,7 +41,7 @@ fn model_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(config_dir(app)?.join("models").join(MODEL_ID))
 }
 
-fn runtime_dir(app: &AppHandle) -> Result<PathBuf> {
+pub(crate) fn runtime_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(config_dir(app)?.join("llama-runtime"))
 }
 
@@ -51,7 +51,7 @@ pub fn model_files_ok(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn runtime_exe(app: &AppHandle) -> Result<PathBuf> {
+pub(crate) fn runtime_exe(app: &AppHandle) -> Result<PathBuf> {
     Ok(runtime_dir(app)?.join("llama-server.exe"))
 }
 
@@ -60,7 +60,7 @@ pub fn runtime_ok(app: &AppHandle) -> bool {
 }
 
 /// 运行时后端标记（backend.txt 首行：vulkan / cpu）
-fn runtime_backend(app: &AppHandle) -> Option<String> {
+pub fn runtime_backend(app: &AppHandle) -> Option<String> {
     let txt = runtime_dir(app).ok()?.join("backend.txt");
     std::fs::read_to_string(txt)
         .ok()?
@@ -142,7 +142,8 @@ async fn download_inner(
     }
 }
 
-/// 下载并解压 llama.cpp 运行时。backend=None 时自动检测（有显卡 → vulkan，否则 cpu）
+/// 下载并解压 llama.cpp 运行时。backend=None 时自动检测（有显卡 → vulkan，否则 cpu）。
+/// 本地翻译引擎（local_llm）共用同一份 runtime 与本函数
 pub async fn download_runtime(
     app: &AppHandle,
     force_backend: Option<&str>,
@@ -267,7 +268,7 @@ fn unzip_all(zip_path: &Path, dest: &Path) -> Result<()> {
 }
 
 /// 流式下载单个文件到 .part 再改名；已存在则跳过（断点只需删除损坏文件重下）
-async fn fetch_file(
+pub(crate) async fn fetch_file(
     url: &str,
     dest: &Path,
     label: &str,
@@ -343,9 +344,10 @@ unsafe impl Send for JobHandle {}
 #[cfg(target_os = "windows")]
 static JOB: LazyLock<Mutex<Option<JobHandle>>> = LazyLock::new(|| Mutex::new(None));
 
-/// 把子进程挂进 Job（挂进后立即生效，即使应用在引擎启动等待期崩溃也会被收掉）
+/// 把子进程挂进 Job（挂进后立即生效，即使应用在引擎启动等待期崩溃也会被收掉）。
+/// 本地翻译引擎的 llama-server 也挂进同一个 Job：应用无论怎么退出，两个引擎一起被内核收掉
 #[cfg(target_os = "windows")]
-fn assign_to_job(child: &Child) {
+pub(crate) fn assign_to_job(child: &Child) {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
@@ -384,7 +386,16 @@ fn assign_to_job(child: &Child) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn assign_to_job(_child: &Child) {}
+pub(crate) fn assign_to_job(_child: &Child) {}
+
+/// 当前 ASR 引擎子进程 PID（本地翻译引擎的孤儿清理据此避让活跃实例）
+pub fn tracked_pid() -> Option<u32> {
+    SERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|st| st.child.as_ref().map(|c| c.id()))
+}
 
 /// 终止遗留的 llama-server 进程（可执行文件位于本应用 llama-runtime 目录内），
 /// 返回清理数量。覆盖两类残留：旧版本强杀/崩溃留下的孤儿，以及被本会话
@@ -421,7 +432,11 @@ fn kill_leftover_runtimes(app: &AppHandle) -> usize {
             let name = String::from_utf16_lossy(&e.szExeFile)
                 .trim_end_matches('\0')
                 .to_lowercase();
-            if name == "llama-server.exe" {
+            // 本地翻译引擎的活跃 llama-server 不在此清理（异常退出遗留的会在
+            // local_llm 自己的清理路径收掉；启动期统一清理也会覆盖到）
+            if name == "llama-server.exe"
+                && crate::local_llm::tracked_pid() != Some(e.th32ProcessID)
+            {
                 let rights = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
                 if let Ok(h) = OpenProcess(rights, false, e.th32ProcessID) {
                     let mut buf = [0u16; 1024];
