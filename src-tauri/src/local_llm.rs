@@ -1,5 +1,7 @@
-// 本地翻译引擎：4B 级对话模型 GGUF + llama.cpp llama-server（本机 OpenAI 兼容
+// 本地翻译引擎：GGUF 模型 + llama.cpp llama-server（本机 OpenAI 兼容
 // /v1/chat/completions），划词 / 复制即翻译 / 输入翻译均可完全离线完成，文本不出本机。
+// 首选 Index-Translate（B 站开源翻译专项模型）或通用对话模型，提示词与解码
+// 参数按模型家族自动切换（Index 家族走官方原生配方，见 llm.rs）。
 // 与 Qwen3-ASR 共享 llama-runtime 二进制与下载设施（qwen_asr::download_runtime 等），
 // 但各自独立子进程：端口段（18320+）、日志（server-llm.log）、生命周期互不干扰，
 // 双方的孤儿清理互相避让对方的活跃实例（tracked_pid）。
@@ -15,9 +17,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::asr::truncate;
 use crate::local_whisper::LocalModelStatus;
 
-/// 本地翻译模型目录（4B 级 Q4 量化，约 2.4~2.6GB）。
-/// 默认 Qwen3-4B-Instruct-2507：非思考版（无推理 token 开销）、中文基本功扎实、
-/// llama.cpp 官方 GGUF 直连；Gemma-3 作欧语系备选。
+/// 本地翻译模型目录。首选 Index-Translate（B 站开源翻译专项模型，Qwen3.5 底座，
+/// 150 语种、原生支持只译值的结构化任务，提示词走 llm.rs 的官方原生配方）；
+/// Qwen3-4B / Gemma-3 为通用对话模型备选。
 pub struct LocalLlmModel {
     pub id: &'static str,
     pub name: &'static str,
@@ -30,9 +32,25 @@ pub struct LocalLlmModel {
 
 pub const MODELS: &[LocalLlmModel] = &[
     LocalLlmModel {
+        id: "index-translate-2b",
+        name: "Index-Translate-2B · B站开源翻译专项",
+        desc: "150 语种翻译专项训练（Qwen3.5 底座），JSON/YAML 只译值原生支持。仅 1.3GB，CPU 也流畅，推荐首选",
+        hf_repo: "mradermacher/Index-Translate-2B-GGUF",
+        gguf: "Index-Translate-2B.Q4_K_M.gguf",
+        size_mb: 1252,
+    },
+    LocalLlmModel {
+        id: "index-translate-9b",
+        name: "Index-Translate-9B · 质量档",
+        desc: "同家族 9B（WMT24++ COMET 0.8789），质量上限更高；5.5GB 建议显卡或大内存机器",
+        hf_repo: "datouge/Index-Translate-9B-Q4_K_M-GGUF",
+        gguf: "index-translate-9b-q4_k_m.gguf",
+        size_mb: 5513,
+    },
+    LocalLlmModel {
         id: "qwen3-4b-instruct",
         name: "Qwen3-4B-Instruct-2507",
-        desc: "非思考版 4B（无推理开销，首字快），中文基本功扎实。CPU 约 7~15 字/s，显卡更快",
+        desc: "通用对话 4B（非思考版），中文基本功扎实，也能兼顾润色等其他任务",
         hf_repo: "Qwen/Qwen3-4B-Instruct-2507-GGUF",
         gguf: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         size_mb: 2390,
@@ -58,7 +76,7 @@ pub fn resolve(id: &str) -> &'static LocalLlmModel {
 
 /// 端口段与 Qwen3-ASR（18279+）错开：两个引擎可同时常驻
 const BASE_PORT: u16 = 18320;
-/// 引擎冷启动（加载 ~2.5GB 模型）最长等待
+/// 引擎冷启动（加载模型，1.3~5.5GB 视所选档位）最长等待
 const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
 /// 与 ASR 引擎分开的日志文件（共用 runtime 目录）
 const LOG_FILE: &str = "server-llm.log";
@@ -415,7 +433,7 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
                     "sn-llm-delta",
                     serde_json::json!({
                         "kind": "reasoning",
-                        "delta": "本地翻译引擎启动中…（首次加载约 2.5GB 模型，需十几秒）\n"
+                        "delta": "本地翻译引擎启动中…（首次加载模型需十几秒）\n"
                     }),
                 );
                 last_note = Instant::now();

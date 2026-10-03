@@ -10,9 +10,8 @@ fn main() {
         }
         for ep in &list {
             println!(
-                "{}{} 音量 {:.0}%{}  {}",
+                "{} 音量 {:.0}%{}  {}",
                 if ep.muted { "[静音]" } else { "[激活]" },
-                "",
                 ep.volume * 100.0,
                 if ep.volume < 0.2 { "  ← 过低!" } else { "" },
                 ep.name

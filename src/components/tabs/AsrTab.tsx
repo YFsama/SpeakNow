@@ -91,7 +91,22 @@ function fmtBytes(n: number): string {
   return `${(n / 1024).toFixed(0)}KB`;
 }
 
-export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: TabProps) {
+/** 热词条数（与后端同规则：换行 / 中英文逗号分割，去空白后计非空项，上限 100） */
+function hotwordCount(s: string): number {
+  return s
+    .split(/[\n,，]/)
+    .map((t) => t.trim())
+    .filter(Boolean).length;
+}
+
+export function AsrTab({
+  cfg,
+  set,
+  toast,
+  navigate,
+  localModels,
+  refreshLocalModels,
+}: TabProps) {
   const [test, setTest] = useState<{ loading: boolean; ok?: boolean; msg?: string }>({
     loading: false,
   });
@@ -312,10 +327,21 @@ export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: Tab
             <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] px-3.5 py-2.5 text-[11.5px] leading-5 text-emerald-200/80">
               🔑 正在使用凭据组「
               {cfg.providers.find((x) => x.id === cfg.asr.providerId)?.name || '未命名'}」
-              · 地址 {asrCreds.baseUrl || '（未填写）'} · Key
-              {cfg.providers.find((x) => x.id === cfg.asr.providerId)?.apiKey.trim()
-                ? '已配置'
-                : '未填写（请到「AI 优化」页凭据组填写）'}
+              · 地址 {asrCreds.baseUrl || '（未填写）'} · Key{' '}
+              {cfg.providers.find((x) => x.id === cfg.asr.providerId)?.apiKey.trim() ? (
+                '已配置'
+              ) : (
+                <>
+                  未填写 ·{' '}
+                  <button
+                    type="button"
+                    onClick={() => navigate('llm')}
+                    className="text-sky-400 underline decoration-sky-400/40 underline-offset-2 transition hover:text-sky-300"
+                  >
+                    去 AI 优化页填写 ›
+                  </button>
+                </>
+              )}
             </div>
           ) : (
             <Field label="API Key">
@@ -346,6 +372,17 @@ export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: Tab
           </div>
           <Field
             label="ASR 热词（专业行业字库）"
+            badge={
+              <span
+                className={`rounded-full border px-1.5 py-0.5 font-mono text-[10px] tabular-nums ${
+                  hotwordCount(cfg.asr.hotwords) >= 100
+                    ? 'border-red-400/30 bg-red-400/10 text-red-300'
+                    : 'border-white/10 bg-white/[0.04] text-slate-400'
+                }`}
+              >
+                {Math.min(hotwordCount(cfg.asr.hotwords), 100)}/100
+              </span>
+            }
             hint="每行一个或用逗号分隔。GLM-ASR 等支持热词的模型会显著提升专有名词、行业术语的识别准确率（最多 100 个）。「AI 优化」页术语表中的术语会自动并入，无需重复填写"
           >
             <TextArea
@@ -523,24 +560,23 @@ export function AsrTab({ cfg, set, toast, localModels, refreshLocalModels }: Tab
         </>
       )}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <Field
-          label="识别语言"
-          hint="中文语音建议固定「中文」：本地模型会自动引导输出简体中文，避免繁体与语言误判"
-        >
-          <Select
-            value={cfg.asr.language}
-            onChange={(language) => set('asr', { language })}
-            options={[
-              { value: 'auto', label: '自动检测' },
-              { value: 'zh', label: '中文' },
-              { value: 'en', label: '英语' },
-              { value: 'ja', label: '日语' },
-              { value: 'ko', label: '韩语' },
-            ]}
-          />
-        </Field>
-      </div>
+      {/* 识别语言与两端 Toggle 同为全宽字段，独占一行（原两列 grid 只有一格，右半留白） */}
+      <Field
+        label="识别语言"
+        hint="中文语音建议固定「中文」：本地模型会自动引导输出简体中文，避免繁体与语言误判"
+      >
+        <Select
+          value={cfg.asr.language}
+          onChange={(language) => set('asr', { language })}
+          options={[
+            { value: 'auto', label: '自动检测' },
+            { value: 'zh', label: '中文' },
+            { value: 'en', label: '英语' },
+            { value: 'ja', label: '日语' },
+            { value: 'ko', label: '韩语' },
+          ]}
+        />
+      </Field>
 
       <Toggle
         checked={cfg.asr.stripFillers}

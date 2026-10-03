@@ -113,8 +113,13 @@ export const testLlm = (config: LlmConfig, providers: ProviderProfile[]) =>
 export const getHistory = () => invoke<HistoryItem[]>('get_history');
 export const clearHistory = () => invoke('clear_history');
 export const deleteHistory = (ts: number) => invoke('delete_history', { ts });
-export const regenerate = (ts: number) =>
-  invoke<HistoryItem>('regenerate', { ts });
+/** mode 可选：本次重优化覆盖使用的模式（correct / polish / prompt / translate），不改全局配置 */
+export const regenerate = (ts: number, mode?: string | null) =>
+  invoke<HistoryItem>('regenerate', { ts, mode: mode ?? null });
+/** 行内编辑：保存某条历史的终稿（后端广播 sn-history-changed 刷新列表）。
+ *  Rust 形参 final_text，invoke 键须用 camelCase finalText */
+export const updateHistoryFinal = (ts: number, final: string) =>
+  invoke('update_history_final', { ts, finalText: final });
 export const copyText = (text: string) => invoke('copy_text', { text });
 export const dismissOverlay = () => invoke('dismiss_overlay');
 export const overlayPin = (pinned: boolean) => invoke('overlay_pin', { pinned });
@@ -183,9 +188,35 @@ export const isElevated = () => invoke<boolean>('is_elevated');
 /** 以管理员身份重启（UAC 确认后旧实例自动退出） */
 export const restartElevated = () => invoke('restart_elevated');
 
-/** 应用主题与缩放到当前窗口 */
+/* ============ 主题外观 ============ */
+
+/** 当前生效的主题设置（dark / light / auto）；matchMedia 监听据此决定是否响应系统变化 */
+let curTheme = '';
+/** 系统配色变化监听只安装一次（多次调用 applyAppearance 不重复挂监听） */
+let mediaListenerInstalled = false;
+
+/** 按当前主题设置解析出实际外观并应用到 <html> */
+function applyThemeClass() {
+  const light =
+    curTheme === 'light' ||
+    (curTheme === 'auto' &&
+      window.matchMedia('(prefers-color-scheme: light)').matches);
+  document.documentElement.classList.toggle('light', light);
+}
+
+/** 应用主题与缩放到当前窗口。theme === 'auto' 时跟随系统配色，
+ *  系统切换实时响应；手动 dark / light 时忽略系统变化。 */
 export function applyAppearance(theme: string, fontScale: number) {
-  document.documentElement.classList.toggle('light', theme === 'light');
+  curTheme = theme;
+  if (!mediaListenerInstalled) {
+    mediaListenerInstalled = true;
+    window
+      .matchMedia('(prefers-color-scheme: light)')
+      .addEventListener('change', () => {
+        if (curTheme === 'auto') applyThemeClass();
+      });
+  }
+  applyThemeClass();
   document.body.style.zoom = String(fontScale || 1);
 }
 

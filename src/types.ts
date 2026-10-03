@@ -95,6 +95,13 @@ export interface LocalModelStatus {
   backend?: string;
 }
 
+/** 命名指令模板（llm.promptTemplates）：一键套用到 customPrompt */
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  prompt: string;
+}
+
 export interface LlmConfig {
   enabled: boolean;
   /** 引用凭据组 id：命中时以凭据组的 baseUrl/apiKey 为准，空则用下方内联字段 */
@@ -112,6 +119,8 @@ export interface LlmConfig {
   translateSecondTarget: string;
   /** translation（仅译文）| bilingual（原文 + 译文两行） */
   translateOutput: 'translation' | 'bilingual';
+  /** 指令模板库（可选，旧配置缺省为空） */
+  promptTemplates?: PromptTemplate[];
 }
 
 /** 划词翻译行为配置。目标语言与听写翻译共用 llm.translateTarget */
@@ -126,6 +135,8 @@ export interface TranslateConfig {
   blacklist: string;
   /** 复制即翻译：监听剪贴板变化，复制文字后自动弹出翻译卡片（默认关，敏感内容慎用） */
   clipboardWatch: boolean;
+  /** Ctrl+C+C 双击复制即翻译（DeepL 式低级键盘钩子，仅 Windows，默认关） */
+  ccc: boolean;
   /** 结构化智能翻译：JSON/YAML/键值只翻译字符串值，键名、注释、格式原样保留（默认开） */
   structuredTranslate: boolean;
   /** 翻译引擎：cloud（云端 LLM，默认）| local（本地 llama.cpp，离线·隐私·免费） */
@@ -166,10 +177,12 @@ export interface GeneralConfig {
   soundFeedback: boolean;
   /** 开机自启动 */
   autostart: boolean;
-  /** dark / light */
-  theme: 'dark' | 'light';
+  /** dark / light / auto（auto=跟随系统） */
+  theme: 'dark' | 'light' | 'auto';
   /** 界面缩放 0.85 ~ 1.30 */
   fontScale: number;
+  /** 历史记录保留条数（后端默认 50） */
+  historyLimit?: number;
 }
 
 /** 外接显示（硬件字幕屏）API */
@@ -221,6 +234,8 @@ export interface HistoryItem {
   final: string;
   asrMs?: number | null;
   llmMs?: number | null;
+  /** dictation（听写）/ translate（划词·输入翻译）/ ocr（截图取词）；旧数据缺省时按 asrMs==null 推断为 translate */
+  kind?: 'dictation' | 'translate' | 'ocr';
 }
 
 export type Stage =
@@ -275,7 +290,8 @@ export type TabId =
 export interface TabProps {
   cfg: Config;
   set: <K extends keyof Config>(key: K, patch: Partial<Config[K]> | Config[K]) => void;
-  toast: (s: string) => void;
+  /** kind 缺省时按文案正则推断（向后兼容） */
+  toast: (s: string, kind?: 'ok' | 'error' | 'info') => void;
   navigate: (tab: TabId) => void;
   stage: Stage;
   statusMsg: string;

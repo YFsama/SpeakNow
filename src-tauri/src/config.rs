@@ -45,6 +45,25 @@ pub fn lang_name(code: &str) -> String {
         .unwrap_or_else(|| code.to_string())
 }
 
+/// 语言代码 → 中文语言名。Index-Translate（B 站开源翻译模型）等国产模型的
+/// 训练侧提示词用中文语言名（英语/日语…），按官方配方需要换用此映射
+pub fn lang_name_zh(code: &str) -> String {
+    const ZH: &[(&str, &str)] = &[
+        ("zh", "中文"),
+        ("en", "英语"),
+        ("ja", "日语"),
+        ("ko", "韩语"),
+        ("fr", "法语"),
+        ("de", "德语"),
+        ("es", "西班牙语"),
+        ("ru", "俄语"),
+    ];
+    ZH.iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| lang_name(code))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ProviderProfile {
@@ -218,6 +237,28 @@ pub struct LlmConfig {
     pub translate_second_target: String,
     /// translation（仅译文）/ bilingual（原文 + 译文两行）
     pub translate_output: String,
+    /// 指令模板库：命名的自定义指令模板，一键套用到 customPrompt
+    #[serde(default)]
+    pub prompt_templates: Vec<PromptTemplate>,
+}
+
+/// 命名指令模板（llm.promptTemplates）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PromptTemplate {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+}
+
+impl Default for PromptTemplate {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            prompt: String::new(),
+        }
+    }
 }
 
 impl Default for LlmConfig {
@@ -235,6 +276,7 @@ impl Default for LlmConfig {
             translate_target: "en".into(),
             translate_second_target: "zh".into(),
             translate_output: "translation".into(),
+            prompt_templates: Vec::new(),
         }
     }
 }
@@ -269,6 +311,10 @@ pub struct TranslateConfig {
     /// 复制即翻译：监听剪贴板变化，复制文字后自动弹出翻译卡片。
     /// 默认关闭——开启后复制的内容都会发给 AI 接口，敏感场景慎用
     pub clipboard_watch: bool,
+    /// Ctrl+C+C 双击复制即翻译（DeepL 式，Windows 低级键盘钩子）。
+    /// 默认关闭；与剪贴板监听互不冲突，守卫（黑名单/自写/听写中）一致
+    #[serde(default)]
+    pub ccc: bool,
     /// 结构化文本智能翻译：检测到 JSON / YAML / properties 等结构时只翻译字符串值，
     /// 键名、注释与格式原样保留（默认开启）
     pub structured_translate: bool,
@@ -286,9 +332,12 @@ impl Default for TranslateConfig {
             replace_marker: false,
             blacklist: String::new(),
             clipboard_watch: false,
+            ccc: false,
             structured_translate: true,
             engine: "cloud".into(),
-            local_model: "qwen3-4b-instruct".into(),
+            // 默认 Index-Translate-2B：B 站开源翻译专项模型，1.3GB 比 4B 对话模型
+            // 更小、翻译质量更优（原生配方见 llm.rs）。已存配置的旧选择不受影响
+            local_model: "index-translate-2b".into(),
         }
     }
 }
@@ -372,10 +421,17 @@ pub struct GeneralConfig {
     pub sound_feedback: bool,
     /// 开机自启动
     pub autostart: bool,
-    /// dark / light
+    /// dark / light / auto（auto=跟随系统）
     pub theme: String,
     /// 界面缩放 0.85 ~ 1.30
     pub font_scale: f32,
+    /// 历史记录保留条数
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    50
 }
 
 impl Default for GeneralConfig {
@@ -387,6 +443,7 @@ impl Default for GeneralConfig {
             autostart: false,
             theme: "dark".into(),
             font_scale: 1.0,
+            history_limit: default_history_limit(),
         }
     }
 }
@@ -671,5 +728,14 @@ mod tests {
         assert_eq!(lang_name("en"), "English");
         assert_eq!(lang_name("zh"), "中文");
         assert_eq!(lang_name("xx"), "xx");
+    }
+
+    #[test]
+    fn lang_name_zh_matches_index_training_names() {
+        // Index-Translate 训练侧语言名（中文语言名），未知代码回退展示名
+        assert_eq!(lang_name_zh("en"), "英语");
+        assert_eq!(lang_name_zh("es"), "西班牙语");
+        assert_eq!(lang_name_zh("zh"), "中文");
+        assert_eq!(lang_name_zh("xx"), "xx");
     }
 }

@@ -106,6 +106,10 @@ pub fn to_16k_i16(samples: &[f32], from_rate: u32) -> Vec<i16> {
 /// 录音句柄（可跨线程传递；cpal Stream 本身 !Send，始终留在创建线程上）
 pub struct Recording {
     pub shared: Arc<Shared>,
+    /// 本次开流是否发生「指定设备不可见 → 回退系统默认」（find_device 判定）。
+    /// 以字段而非改 start 签名的方式暴露：test_all_devices / mic_test 等
+    /// 调用方零改动，pipeline 据此向用户追加提示
+    pub used_fallback: bool,
     stop_flag: Arc<AtomicBool>,
     stop_signal: Arc<(Mutex<()>, Condvar)>,
     owner: Option<JoinHandle<()>>,
@@ -165,7 +169,10 @@ fn normalized(s: &str) -> String {
     s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn find_device(name: Option<&str>) -> anyhow::Result<cpal::Device> {
+/// 按名字查找输入设备。返回 (设备, 是否发生回退)：回退 = 用户指定了设备名
+/// 但枚举中找不到（false = 命中指定设备或本就未指定）。调用方据布尔值向
+/// 用户提示「已用系统默认麦克风」，避免声音进了另一支麦却毫无感知
+fn find_device(name: Option<&str>) -> anyhow::Result<(cpal::Device, bool)> {
     let host = cpal::default_host();
     if let Some(n) = name {
         if !n.is_empty() {
@@ -184,17 +191,18 @@ fn find_device(name: Option<&str>) -> anyhow::Result<cpal::Device> {
                 }
             }
             if let Some(d) = exact.or(fuzzy) {
-                return Ok(d);
+                return Ok((d, false));
             }
             // 设备暂时不可见（无线接收器休眠/重新枚举/重启未就绪）：
             // 回退系统默认设备继续录音，而不是让整次听写失败。
             // 该设备常同时就是系统默认输入，多数情况下等效。
             if let Some(d) = host.default_input_device() {
-                return Ok(d);
+                return Ok((d, true));
             }
         }
     }
     host.default_input_device()
+        .map(|d| (d, false))
         .ok_or_else(|| anyhow!("未找到可用的音频输入设备"))
 }
 
@@ -219,7 +227,9 @@ pub fn start(
     // 停止信号唤醒：原实现 20ms 轮询 stop_flag，停止平均晚一拍（≤20ms）才
     // 被发现——改用 Condvar 即时唤醒（信号量语义：Mutex 只作 Condvar 载体）
     let stop_signal = Arc::new((Mutex::new(()), Condvar::new()));
-    let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
+    // 通道回传 used_fallback（find_device 在 owner 线程内判定，recv 返回即
+    // happens-before 于 Recording 构造，无需额外同步原语）
+    let (tx, rx) = mpsc::channel::<anyhow::Result<bool>>();
     let dev_name = device.map(str::to_string);
     shared.set_gain_db(gain_db);
 
@@ -228,8 +238,8 @@ pub fn start(
     let thread_signal = stop_signal.clone();
 
     let owner = thread::spawn(move || {
-        let init = || -> anyhow::Result<cpal::Stream> {
-            let device = find_device(dev_name.as_deref())?;
+        let init = || -> anyhow::Result<(cpal::Stream, bool)> {
+            let (device, used_fallback) = find_device(dev_name.as_deref())?;
             let supported = device.default_input_config()?;
             let sample_format = supported.sample_format();
             let config: cpal::StreamConfig = supported.into();
@@ -294,12 +304,12 @@ pub fn start(
             .map_err(|e| anyhow!("无法打开音频流: {e}"))?;
 
             stream.play().map_err(|e| anyhow!("无法启动音频流: {e}"))?;
-            Ok(stream)
+            Ok((stream, used_fallback))
         };
 
         match init() {
-            Ok(stream) => {
-                let _ = tx.send(Ok(()));
+            Ok((stream, used_fallback)) => {
+                let _ = tx.send(Ok(used_fallback));
                 let (lock, cv) = &*thread_signal;
                 let mut g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 while !thread_flag.load(Ordering::SeqCst) {
@@ -319,8 +329,9 @@ pub fn start(
     });
 
     match rx.recv() {
-        Ok(Ok(())) => Ok(Recording {
+        Ok(Ok(used_fallback)) => Ok(Recording {
             shared,
+            used_fallback,
             stop_flag,
             stop_signal,
             owner: Some(owner),

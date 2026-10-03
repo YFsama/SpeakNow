@@ -203,9 +203,20 @@ fn split_yaml_like(text: &str) -> Option<Split> {
     let mut structural = 0usize;
     let mut content_lines = 0usize;
     let mut eq_lines = 0usize;
+    // 块标量区域（| 与 > 折叠）：块内容是任意的纯文本，行内出现「键: 值」
+    // 会被上面的映射识别误抓（回填还可能加引号污染内容）——整段跳过不译，
+    // 也不计入结构/内容行，直到缩进回到父键层级
+    let mut block_indent: Option<usize> = None;
 
     for (n, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if let Some(parent) = block_indent {
+            if trimmed.is_empty() || indent > parent {
+                continue; // 块内容行：原样保留
+            }
+            block_indent = None; // 缩进回到父层级：块结束，本行正常处理
+        }
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -215,14 +226,20 @@ fn split_yaml_like(text: &str) -> Option<Split> {
         }
         content_lines += 1;
         // 内容部分：剥掉列表前缀「- 」再找映射分隔符
-        let indent = line.len() - trimmed.len();
         let after_dash = trimmed.strip_prefix("- ").unwrap_or(trimmed);
         let dash_len = trimmed.len() - after_dash.len();
 
         if let Some(sep_at) = find_yaml_mapping_sep(after_dash) {
             structural += 1;
             let after_sep = indent + dash_len + sep_at + 1;
-            if let Some(slot) = yaml_value_slot(n, line, value_start(line, after_sep)) {
+            let vstart = value_start(line, after_sep);
+            let vfirst = line[vstart.min(line.len())..].chars().next();
+            if vfirst == Some('|') || vfirst == Some('>') {
+                // 块标量头：后续更深缩进的行属于块内容
+                block_indent = Some(indent);
+                continue;
+            }
+            if let Some(slot) = yaml_value_slot(n, line, vstart) {
                 slots.push(slot);
             }
         } else if dash_len > 0 {
@@ -723,6 +740,29 @@ mod tests {
         let sp = split(src).expect("yaml");
         let out = merge(&sp, &["你好".into(), "文件".into(), "退出".into()]);
         assert!(out.contains("你好 # 界面标题"));
+    }
+
+    #[test]
+    fn yaml_block_scalar_skipped_intact() {
+        // 块内容里的「键: 值」形态不得被当作映射行提取翻译（回填会污染内容）
+        let src = "name: Intro\ndesc: |\n  First: line\n  Second line\n  # 不是注释\nmore: Text\ntail: End\n";
+        let sp = split(src).expect("yaml");
+        assert_eq!(sp.values, vec!["Intro", "Text", "End"]);
+        let out = merge(&sp, &["介绍".into(), "文本".into(), "结尾".into()]);
+        // 块内容逐字节原样
+        assert!(out.contains("  First: line\n  Second line\n  # 不是注释\n"));
+        assert!(out.contains("more: 文本"));
+    }
+
+    #[test]
+    fn yaml_folded_block_and_sibling_after() {
+        // 折叠块（>）与块结束后回到父层级的兄弟键
+        let src = "a: One\nb: >\n  folded prose: with colon\nc: Two\nd: Three\n";
+        let sp = split(src).expect("yaml");
+        assert_eq!(sp.values, vec!["One", "Two", "Three"]);
+        let out = merge(&sp, &["一".into(), "二".into(), "三".into()]);
+        assert!(out.contains("  folded prose: with colon"));
+        assert!(out.contains("c: 二"));
     }
 
     #[test]

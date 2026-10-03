@@ -1,4 +1,14 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import type { ReactNode } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   applyAppearance,
@@ -20,7 +30,6 @@ import type {
   TabId,
 } from './types';
 import { DEFAULT_DEVICE_KEY } from './types';
-import { Spinner } from './components/Controls';
 import Dashboard from './components/Dashboard';
 import './styles.css';
 
@@ -57,19 +66,101 @@ const AboutTab = lazy(() =>
   import('./components/tabs/AboutTab').then((m) => ({ default: m.AboutTab })),
 );
 
-const NAV: { id: TabId; icon: string; label: string }[] = [
-  { id: 'dash', icon: '🏠', label: '总览' },
-  { id: 'hotkey', icon: '⌨️', label: '快捷键' },
-  { id: 'mic', icon: '🎙️', label: '麦克风' },
-  { id: 'asr', icon: '📝', label: '语音识别' },
-  { id: 'llm', icon: '✨', label: 'AI 优化' },
-  { id: 'translate', icon: '🌐', label: '翻译' },
-  { id: 'ocr', icon: '📷', label: '截图取词' },
-  { id: 'output', icon: '⌨', label: '输入方式' },
-  { id: 'display', icon: '📡', label: '外接显示' },
-  { id: 'history', icon: '🕘', label: '历史' },
-  { id: 'about', icon: 'ℹ️', label: '关于' },
+const NAV: { id: TabId; label: string; group: string }[] = [
+  { id: 'dash', label: '总览', group: '使用' },
+  { id: 'hotkey', label: '快捷键', group: '使用' },
+  { id: 'mic', label: '麦克风', group: '输入与识别' },
+  { id: 'asr', label: '语音识别', group: '输入与识别' },
+  { id: 'ocr', label: '截图取词', group: '输入与识别' },
+  { id: 'llm', label: 'AI 优化', group: '增强' },
+  { id: 'translate', label: '翻译', group: '增强' },
+  { id: 'output', label: '输入方式', group: '输出与数据' },
+  { id: 'display', label: '外接显示', group: '输出与数据' },
+  { id: 'history', label: '历史', group: '数据与其他' },
+  { id: 'about', label: '关于', group: '数据与其他' },
 ];
+
+/* 侧栏 16px 线性 stroke 图标：stroke=currentColor，激活态自动跟随 sky-300 */
+const iconSvgProps = {
+  width: 16,
+  height: 16,
+  viewBox: '0 0 24 24',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.5,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+} as const;
+
+const ICONS: Record<TabId, ReactNode> = {
+  dash: (
+    <svg {...iconSvgProps} aria-hidden>
+      <path d="M3 10.5 12 3l9 7.5" />
+      <path d="M5.5 9.5V21h13V9.5" />
+      <path d="M9.5 21v-6h5v6" />
+    </svg>
+  ),
+  hotkey: (
+    <svg {...iconSvgProps} aria-hidden>
+      <rect x="2.5" y="6" width="19" height="12" rx="2.5" />
+      <path d="M6.5 10h.01M10.5 10h.01M14.5 10h.01M18 10h.01M6.5 14h.01M18.2 14h.01M9.5 14h5" />
+    </svg>
+  ),
+  mic: (
+    <svg {...iconSvgProps} aria-hidden>
+      <rect x="9" y="2.5" width="6" height="11.5" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" />
+      <path d="M12 18v3" />
+    </svg>
+  ),
+  asr: (
+    <svg {...iconSvgProps} aria-hidden>
+      <path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4" />
+    </svg>
+  ),
+  llm: (
+    <svg {...iconSvgProps} aria-hidden>
+      <path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9L12 16.5l-1.9-4.6L5.5 10l4.6-1.9L12 3.5z" />
+      <path d="M18.5 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1z" />
+    </svg>
+  ),
+  translate: (
+    <svg {...iconSvgProps} aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3c2.5 2.6 3.8 5.7 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" />
+    </svg>
+  ),
+  ocr: (
+    <svg {...iconSvgProps} aria-hidden>
+      <path d="M6.5 2.5V16a2 2 0 0 0 2 2h13" />
+      <path d="M17.5 21.5V8a2 2 0 0 0-2-2h-13" />
+    </svg>
+  ),
+  output: (
+    <svg {...iconSvgProps} aria-hidden>
+      <path d="M4.5 3.5l7.2 17 2.4-6.4 6.4-2.4-16-8.2z" />
+    </svg>
+  ),
+  display: (
+    <svg {...iconSvgProps} aria-hidden>
+      <rect x="2.5" y="4" width="19" height="13" rx="2" />
+      <path d="M9 21h6M12 17v4" />
+    </svg>
+  ),
+  history: (
+    <svg {...iconSvgProps} aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7.5V12l3 2" />
+    </svg>
+  ),
+  about: (
+    <svg {...iconSvgProps} aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5M12 7.8h.01" />
+    </svg>
+  ),
+};
 
 const STAGE_HINT: Record<string, string> = {
   idle: '等待触发',
@@ -107,6 +198,47 @@ function MicLogo({ size = 17 }: { size?: number }) {
   );
 }
 
+/* ============ Toast（类型化 + 队列） ============ */
+
+type ToastKind = 'ok' | 'error' | 'info';
+interface ToastItem {
+  id: number;
+  msg: string;
+  kind: ToastKind;
+}
+
+const TOAST_META: Record<ToastKind, { glyph: string; cls: string }> = {
+  ok: { glyph: '✓', cls: 'text-emerald-400' },
+  error: { glyph: '⚠', cls: 'text-red-400' },
+  info: { glyph: '✦', cls: 'text-sky-400' },
+};
+
+/* kind 缺省时按文案正则推断（向后兼容旧 toast('...') 调用） */
+function inferToastKind(msg: string): ToastKind {
+  if (/失败|错误|无法|未找到|不支持|未检测/.test(msg)) return 'error';
+  if (/成功|完成|就绪|已保存|已设置|已导出|已恢复|已下载/.test(msg)) return 'ok';
+  return 'info';
+}
+
+function Toast({ item, onClose }: { item: ToastItem; onClose: (id: number) => void }) {
+  useEffect(() => {
+    // error 停留更久；挂载时起表，后续兄弟 toast 增减不会重置计时
+    const t = setTimeout(() => onClose(item.id), item.kind === 'error' ? 6000 : 2800);
+    return () => clearTimeout(t);
+  }, [item.id, onClose]);
+  const meta = TOAST_META[item.kind];
+  return (
+    <div
+      role="status"
+      onClick={() => onClose(item.id)}
+      className="anim-rise flex cursor-pointer items-center gap-2 rounded-full border border-white/10 bg-[#17171f]/95 px-4 py-2 text-xs leading-5 text-slate-200 shadow-xl"
+    >
+      <span className={meta.cls}>{meta.glyph}</span>
+      <span className="min-w-0">{item.msg}</span>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<TabId>('dash');
   const [cfg, setCfg] = useState<Config | null>(null);
@@ -118,7 +250,18 @@ export default function App() {
   const [stage, setStage] = useState<Stage>('idle');
   const [statusMsg, setStatusMsg] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [toast, setToast] = useState('');
+  // Toast 队列：同屏最多渲染 2 条，其余在数组中排队，前面的过期后依次补位
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastSeq = useRef(0);
+  const setToast = useCallback((s: string, kind?: ToastKind) => {
+    setToasts((ts) => [
+      ...ts,
+      { id: ++toastSeq.current, msg: s, kind: kind ?? inferToastKind(s) },
+    ]);
+  }, []);
+  const dismissToast = useCallback((id: number) => {
+    setToasts((ts) => ts.filter((t) => t.id !== id));
+  }, []);
   const [recording, setRecording] = useState(false);
 
   useEffect(() => {
@@ -199,12 +342,6 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(''), 2800);
-    return () => clearTimeout(t);
-  }, [toast]);
-
   // 主题与缩放实时应用
   useEffect(() => {
     if (cfg) applyAppearance(cfg.general.theme, cfg.general.fontScale);
@@ -231,7 +368,9 @@ export default function App() {
 
   const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
+  // ref 供保存流程内同步读取；state 驱动侧栏/保存条的失败 UI
   const saveFailsRef = useRef(0);
+  const [saveFails, setSaveFails] = useState(0);
 
   const onSave = useCallback(async (silent = false) => {
     const c = cfgRef.current;
@@ -248,10 +387,12 @@ export default function App() {
       ]);
       savedRef.current = JSON.stringify(c);
       saveFailsRef.current = 0;
-      if (!silent) setToast('已保存 ✓');
+      setSaveFails(0);
+      if (!silent) setToast('已保存 ✓', 'ok');
     } catch (e) {
       saveFailsRef.current += 1;
-      if (saveFailsRef.current === 1 || !silent) setToast(`保存失败：${e}`);
+      setSaveFails(saveFailsRef.current);
+      if (saveFailsRef.current === 1 || !silent) setToast(`保存失败：${e}`, 'error');
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -313,14 +454,62 @@ export default function App() {
       if (recording) await stopRecording();
       else await startRecording();
     } catch (e) {
-      setToast(String(e));
+      setToast(String(e), 'error');
     }
   }, [recording]);
 
+  /* 首屏骨架：配置未就绪时渲染完整侧栏 + 主区 skeleton 卡，降低白屏/孤零 Spinner 感 */
   if (!cfg) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <Spinner size={24} />
+      <div className="flex min-h-screen">
+        <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-white/[0.06] bg-[#0d0d14]/80 backdrop-blur-xl">
+          <div className="flex items-center gap-2.5 px-5 pb-7 pt-7">
+            <div className="skeleton h-9 w-9 rounded-xl" />
+            <div className="space-y-1.5">
+              <div className="skeleton h-3 w-[72px]" />
+              <div className="skeleton h-2 w-[52px]" />
+            </div>
+          </div>
+          <div className="flex-1 space-y-1.5 overflow-hidden px-3 pb-4">
+            {Array.from({ length: 11 }, (_, i) => (
+              <div key={i} className="flex items-center gap-2.5 px-3 py-2">
+                <div className="skeleton h-4 w-4 rounded-md" />
+                <div
+                  className="skeleton h-3 rounded-full"
+                  style={{ width: 52 + ((i * 13) % 30) }}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="p-3.5">
+            <div className="rounded-xl border border-white/[0.06] bg-black/30 p-3">
+              <div className="skeleton h-2.5 w-2/3 rounded-full" />
+              <div className="skeleton mt-2.5 h-3 w-1/2 rounded-full" />
+            </div>
+          </div>
+        </aside>
+        <main className="min-w-0 flex-1 px-8 pb-32 pt-8">
+          <div className="mx-auto max-w-2xl space-y-5">
+            <div className="rounded-[20px] border border-white/[0.07] bg-white/[0.025] p-5">
+              <div className="flex items-center gap-3">
+                <div className="skeleton h-9 w-9 rounded-xl" />
+                <div className="flex-1 space-y-1.5">
+                  <div className="skeleton h-3.5 w-1/3 rounded-full" />
+                  <div className="skeleton h-2.5 w-1/2 rounded-full" />
+                </div>
+              </div>
+              <div className="skeleton mt-5 h-[104px] rounded-xl" />
+            </div>
+            <div className="rounded-[20px] border border-white/[0.07] bg-white/[0.025] p-5">
+              <div className="skeleton h-3.5 w-1/4 rounded-full" />
+              <div className="mt-4 space-y-2.5">
+                <div className="skeleton h-10 rounded-2xl" />
+                <div className="skeleton h-10 rounded-2xl" />
+              </div>
+            </div>
+            <div className="skeleton h-24 rounded-[20px]" />
+          </div>
+        </main>
       </div>
     );
   }
@@ -367,38 +556,51 @@ export default function App() {
         </div>
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-4">
-          {NAV.map((n) => {
+          {NAV.map((n, i) => {
             const active = tab === n.id;
+            const showGroup = n.group !== NAV[i - 1]?.group;
             return (
-              <button
-                key={n.id}
-                type="button"
-                onClick={() => setTab(n.id)}
-                className={`relative flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] transition active:scale-[0.98] ${
-                  active
-                    ? 'nav-glow font-medium text-sky-300'
-                    : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
-                }`}
-              >
-                {active && (
-                  <span
-                    className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-full bg-gradient-to-b from-sky-400 to-indigo-500 shadow-[0_0_8px_rgba(56,189,248,0.6)]"
-                    aria-hidden
-                  />
+              <Fragment key={n.id}>
+                {showGroup && (
+                  <div
+                    className={`px-3 text-[10px] font-medium tracking-widest text-slate-600 ${
+                      i > 0 ? 'mb-1 mt-4' : 'mb-1 mt-1'
+                    }`}
+                  >
+                    {n.group}
+                  </div>
                 )}
-                <span className="w-5 text-center text-[13px]">{n.icon}</span>
-                <span>{n.label}</span>
-                {n.id === 'history' && history.length > 0 && (
-                  <span className="ml-auto rounded-full bg-white/[0.07] px-1.5 py-0.5 text-[10px] text-slate-500">
-                    {history.length}
-                  </span>
-                )}
-                {n.id === 'asr' &&
-                  cfg.asr.provider === 'local' &&
-                  !localModels.find((m) => m.id === cfg.asr.localModel)?.downloaded && (
-                    <span className="ml-auto h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden />
+                <button
+                  type="button"
+                  onClick={() => setTab(n.id)}
+                  className={`relative flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] transition active:scale-[0.98] ${
+                    active
+                      ? 'nav-glow font-medium text-sky-300'
+                      : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
+                  }`}
+                >
+                  {active && (
+                    <span
+                      className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-full bg-gradient-to-b from-sky-400 to-indigo-500 shadow-[0_0_8px_rgba(56,189,248,0.6)]"
+                      aria-hidden
+                    />
                   )}
-              </button>
+                  <span className="flex w-5 shrink-0 items-center justify-center">
+                    {ICONS[n.id]}
+                  </span>
+                  <span>{n.label}</span>
+                  {n.id === 'history' && history.length > 0 && (
+                    <span className="ml-auto rounded-full bg-white/[0.07] px-1.5 py-0.5 text-[10px] text-slate-500">
+                      {history.length}
+                    </span>
+                  )}
+                  {n.id === 'asr' &&
+                    cfg.asr.provider === 'local' &&
+                    !localModels.find((m) => m.id === cfg.asr.localModel)?.downloaded && (
+                      <span className="ml-auto h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden />
+                    )}
+                </button>
+              </Fragment>
             );
           })}
         </nav>
@@ -414,8 +616,14 @@ export default function App() {
               <span className="text-[10px] text-slate-600">
                 {STAGE_HINT[stage] ?? ''}
               </span>
-              {dirty && (
-                <span className="ml-auto text-[10.5px] text-sky-400/90">自动保存中…</span>
+              {saveFails > 0 && (
+                <span className="ml-auto flex items-center gap-1.5 text-[10.5px] text-red-400">
+                  <span
+                    className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500"
+                    aria-hidden
+                  />
+                  保存失败
+                </span>
               )}
             </div>
             {hotkeyChips.length > 0 && (
@@ -472,36 +680,42 @@ export default function App() {
         </div>
       </main>
 
-      {/* 保存栏：自动保存状态提示 */}
-      {dirty && (
-        <div className="anim-rise fixed inset-x-0 bottom-5 z-30 flex justify-center">
-          <div className="flex items-center gap-3 rounded-full border border-sky-500/20 bg-[#17171f]/95 py-2 pl-5 pr-5 shadow-2xl shadow-sky-950/50 backdrop-blur">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-60" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-400" />
-            </span>
-            <span className="text-[13px] text-slate-300">
-              正在自动保存…
-            </span>
+      {/* 保存栏：自动保存状态提示；失败时变红、点击立即重试 */}
+      {dirty &&
+        (saveFails > 0 ? (
+          <div className="anim-rise fixed inset-x-0 bottom-5 z-30 flex justify-center">
+            <button
+              type="button"
+              onClick={() => void onSave()}
+              className="flex cursor-pointer items-center gap-3 rounded-full border border-red-500/25 bg-[#17171f]/95 py-2 pl-5 pr-5 shadow-2xl shadow-red-950/40 backdrop-blur transition hover:border-red-500/45"
+            >
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-500 opacity-60" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
+              </span>
+              <span className="text-[13px] text-red-300">保存失败 · 点击重试</span>
+            </button>
           </div>
-        </div>
-      )}
+        ) : (
+          <div className="anim-rise fixed inset-x-0 bottom-5 z-30 flex justify-center">
+            <div className="flex items-center gap-3 rounded-full border border-sky-500/20 bg-[#17171f]/95 py-2 pl-5 pr-5 shadow-2xl shadow-sky-950/50 backdrop-blur">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-60" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-400" />
+              </span>
+              <span className="text-[13px] text-slate-300">
+                正在自动保存…
+              </span>
+            </div>
+          </div>
+        ))}
 
-      {/* Toast */}
-      {toast && (
-        <div className="anim-rise fixed left-1/2 top-5 z-40 max-w-[520px] -translate-x-1/2">
-          <div className="flex items-center gap-2 rounded-full border border-white/10 bg-[#17171f]/95 px-4 py-2 text-xs leading-5 text-slate-200 shadow-xl">
-            {(() => {
-              const isError = /失败|错误|无法|未找到|不支持|未检测/.test(toast);
-              const isOk = /成功|完成|就绪|已保存|已设置|已导出|已恢复|已下载/.test(toast);
-              return (
-                <span className={isError ? 'text-red-400' : isOk ? 'text-emerald-400' : 'text-sky-400'}>
-                  {isError ? '⚠' : isOk ? '✓' : '✦'}
-                </span>
-              );
-            })()}
-            <span className="min-w-0">{toast}</span>
-          </div>
+      {/* Toast 队列：同屏最多 2 条，多余排队，逐条过期/点击关闭 */}
+      {toasts.length > 0 && (
+        <div className="fixed left-1/2 top-5 z-40 flex w-max max-w-[520px] -translate-x-1/2 flex-col items-center gap-2">
+          {toasts.slice(0, 2).map((t) => (
+            <Toast key={t.id} item={t} onClose={dismissToast} />
+          ))}
         </div>
       )}
     </div>

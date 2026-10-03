@@ -50,13 +50,66 @@ fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
-/// 常规用户消息：自定义指令模板（{text} 占位）或原始转写
+/// 常规用户消息：自定义指令模板（{text} 占位）或原始转写。
+/// Index-Translate 家族（翻译专项训练）改走官方原生指令配方
 fn user_content(cfg: &LlmConfig, raw: &str) -> String {
+    if cfg.mode == "translate"
+        && cfg.custom_prompt.trim().is_empty()
+        && is_index_translate(&cfg.model)
+    {
+        return native_translate_user_prompt(cfg, raw);
+    }
     if cfg.custom_prompt.trim().is_empty() {
         raw.to_string()
     } else {
         cfg.custom_prompt.replace("{text}", raw)
     }
+}
+
+/* ---------- Index-Translate 家族（B 站开源专业翻译模型） ---------- */
+
+/// 本地引擎模型 id（index-translate-2b/9b）与云端 vLLM 部署名
+/// （IndexTeam/Index-Translate-9B）都命中此判断。该家族经翻译专项训练，
+/// 请求参数与官方推理脚本对齐：原生提示词、temperature 0、模板层关思考
+pub fn is_index_translate(model: &str) -> bool {
+    model.to_lowercase().contains("index-translate")
+}
+
+/// 官方训练同款指令（仓库 inference/llm/translate.py 的 trans_prompt）：
+/// 单条用户消息、目标语言用中文语言名；在此之上追加本产品特有的
+/// 第二目标 / 术语表 / ASR 口误提示条款（该家族有指令跟随训练，吃得下）。
+/// 第二目标条款必须以分号并入首句（真机实测 2B：后置独立句会被忽略，
+/// 分号式「译为A；若原文已是A则改译B」三方向全对——英→中/中→英/日→英）
+fn native_translate_user_prompt(cfg: &LlmConfig, raw: &str) -> String {
+    let target = crate::config::lang_name_zh(&cfg.translate_target);
+    let has_second = !cfg.translate_second_target.trim().is_empty()
+        && cfg.translate_second_target.trim() != cfg.translate_target.trim();
+    let mut instr = if has_second {
+        let second = crate::config::lang_name_zh(&cfg.translate_second_target);
+        format!(
+            "请将以下文本翻译为{target}；若原文本身已经是{target}，则改为翻译成{second}。\
+             直接输出翻译结果，不要进行任何解释。"
+        )
+    } else {
+        format!("请将以下文本翻译为{target}，直接输出翻译结果，不要进行任何解释。")
+    };
+    let entries = parse_glossary(cfg);
+    if !entries.is_empty() {
+        let list = entries
+            .iter()
+            .map(|e| {
+                if e.aliases.is_empty() {
+                    e.canonical.clone()
+                } else {
+                    format!("{}（原文出现「{}」时）", e.canonical, e.aliases.join("」「"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        instr.push_str(&format!("术语表：以下术语在译文中使用规范写法——{list}。"));
+    }
+    instr.push_str("原文可能含少量语音识别错误，请先按语境修正理解再翻译。");
+    format!("{instr}\n\n{raw}")
 }
 
 /// 定点修补重试的用户消息：带上原始转写与上一次输出，只要求修正指明的问题。
@@ -101,20 +154,44 @@ fn request_body(
     token_floor: usize,
     extra: Option<&Value>,
 ) -> Value {
+    // Index-Translate 原生配方：训练即以单条用户指令驱动，官方脚本不带系统消息，
+    // 外加系统提示反而稀释指令；解码对齐官方（贪婪 temperature 0）
+    let native = cfg.mode == "translate"
+        && cfg.custom_prompt.trim().is_empty()
+        && is_index_translate(&cfg.model);
     let system = build_system_prompt(cfg);
     // 中文约 1 字 1 token；编程指令模式会整理成条目，膨胀更多，留出更大余量
     let factor = if cfg.mode == "prompt" { 3 } else { 2 };
     let max_tokens = (token_floor + user.chars().count() * factor).min(8192);
-    let mut body = serde_json::json!({
-        "model": cfg.model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ],
-        "temperature": if cfg.custom_prompt.trim().is_empty() && cfg.mode == "correct" { 0.1 } else { 0.2 },
-        "max_tokens": max_tokens,
-        "stream": stream
-    });
+    let temp = if is_index_translate(&cfg.model) {
+        0.0
+    } else if cfg.custom_prompt.trim().is_empty() && cfg.mode == "correct" {
+        0.1
+    } else {
+        0.2
+    };
+    let mut body = if native {
+        serde_json::json!({
+            "model": cfg.model,
+            "messages": [
+                { "role": "user", "content": user }
+            ],
+            "temperature": temp,
+            "max_tokens": max_tokens,
+            "stream": stream
+        })
+    } else {
+        serde_json::json!({
+            "model": cfg.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ],
+            "temperature": temp,
+            "max_tokens": max_tokens,
+            "stream": stream
+        })
+    };
     if let (Some(Value::Object(src)), Some(dst)) = (extra, body.as_object_mut()) {
         for (k, v) in src {
             dst.insert(k.clone(), v.clone());
@@ -174,6 +251,13 @@ fn fast_path_no_thinking(cfg: &LlmConfig) -> Option<Value> {
         return None;
     }
     let m = cfg.model.to_lowercase();
+    // Index-Translate 家族：官方推理脚本经 chat_template_kwargs 在模板层关思考
+    // （llama-server / vLLM 均支持；严格网关 4xx 时已有去参数重发兜底）
+    if is_index_translate(&m) {
+        return Some(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": false }
+        }));
+    }
     if m.starts_with("glm") || m.starts_with("qwen3") || m.starts_with("qwq") {
         Some(no_thinking_extra_for(&m))
     } else {
@@ -1037,6 +1121,7 @@ mod tests {
             translate_target: "en".into(),
             translate_second_target: String::new(),
             translate_output: "translation".into(),
+            prompt_templates: Vec::new(),
         }
     }
 
@@ -1297,6 +1382,79 @@ mod tests {
         let mut c = cfg("translate", "");
         c.model = "glm-4.6".into();
         assert!(fast_path_no_thinking(&c).is_some());
+    }
+
+    /* ---- Index-Translate 家族原生配方 ---- */
+
+    #[test]
+    fn index_translate_detection() {
+        // 本地引擎模型 id 与云端 vLLM 部署名（含组织前缀、大小写）都命中
+        assert!(is_index_translate("index-translate-2b"));
+        assert!(is_index_translate("IndexTeam/Index-Translate-9B"));
+        assert!(!is_index_translate("qwen3-4b-instruct"));
+        assert!(!is_index_translate("glm-4.6"));
+    }
+
+    #[test]
+    fn index_native_request_shape() {
+        let mut c = cfg("translate", "");
+        c.model = "index-translate-2b".into();
+        c.translate_second_target = "zh".into();
+        let user = user_content(&c, "你好世界");
+        // 官方训练同款指令：中文语言名 + 直接输出 + 条款追加；
+        // 第二目标以分号并入首句（真机实测后置独立句被 2B 忽略）
+        assert!(user.starts_with("请将以下文本翻译为英语；若原文本身已经是英语，则改为翻译成中文。"));
+        assert!(user.contains("直接输出翻译结果，不要进行任何解释"));
+        assert!(user.contains("语音识别错误"));
+        assert!(user.ends_with("你好世界"));
+        // 请求体：单条 user 消息（无系统提示）、贪婪解码、模板层关思考
+        let body = request_body(&c, &user, false, TOKEN_FLOOR, fast_path_no_thinking(&c).as_ref());
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(body["temperature"].as_f64().unwrap(), 0.0);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn index_native_prompt_carries_glossary() {
+        let mut c = cfg("translate", "Rust=拉斯特|拉斯\nK8S");
+        c.model = "IndexTeam/Index-Translate-9B".into();
+        let user = user_content(&c, "text");
+        assert!(user.contains("Rust（原文出现「拉斯特」「拉斯」时）"));
+        assert!(user.contains("K8S"));
+        // 术语表条款只出现一次，规范写法在列
+        assert_eq!(user.matches("术语表").count(), 1);
+    }
+
+    #[test]
+    fn index_batch_protocol_keeps_system_message() {
+        // 结构化翻译的批量协议借 custom_prompt 通道：不走原生配方，
+        // 系统提示保留，但解码仍对齐官方贪婪（temperature 0）
+        let mut c = cfg("translate", "");
+        c.model = "index-translate-2b".into();
+        c.custom_prompt = "批量指令 {text}".into();
+        let user = user_content(&c, "[0] a");
+        assert_eq!(user, "批量指令 [0] a");
+        let body = request_body(&c, &user, false, TOKEN_FLOOR, None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(body["temperature"].as_f64().unwrap(), 0.0);
+        // 未走快路径时（如守卫修补重试 extra=None）不带 chat_template_kwargs，
+        // 输出侧由 clean() 的 <think> 剥离兜底
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn index_fast_path_uses_template_kwargs() {
+        let mut c = cfg("translate", "");
+        c.model = "index-translate-2b".into();
+        let e = fast_path_no_thinking(&c).unwrap();
+        assert_eq!(e["chat_template_kwargs"]["enable_thinking"], false);
+        // prompt 模式（需结构整理）与其他模型不受影响
+        c.mode = "prompt".into();
+        assert!(fast_path_no_thinking(&c).is_none());
     }
 
     /* ---- 思考预算与烧尽重试 ---- */

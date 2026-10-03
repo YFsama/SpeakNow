@@ -52,6 +52,19 @@ export function HotkeyTab({ cfg, set }: TabProps) {
       </div>
     ) : null;
 
+  // 已设置槽位的「清除」入口：写入空串即「未设置」（后端 hotkey.rs 对空串一律跳过注册）。
+  // 空串不会与其他槽位撞车，可安全绕过查重分支；此前误录后只能换绑、无法解绑
+  const clearBtn = (field: HotkeyField) =>
+    cfg.hotkey[field].trim() === '' ? null : (
+      <button
+        type="button"
+        onClick={() => applyKey(field, '')}
+        className="mt-1.5 text-[11px] text-slate-500 transition hover:text-red-400"
+      >
+        清除
+      </button>
+    );
+
   return (
     <Section
       icon="⌨️"
@@ -70,6 +83,7 @@ export function HotkeyTab({ cfg, set }: TabProps) {
             onChange={(key) => applyKey('key', key)}
           />
           {dupWarning('key')}
+          {clearBtn('key')}
         </Field>
         <Field
           label="快速模式（可选）"
@@ -80,6 +94,7 @@ export function HotkeyTab({ cfg, set }: TabProps) {
             onChange={(keyQuick) => applyKey('keyQuick', keyQuick)}
           />
           {dupWarning('keyQuick')}
+          {clearBtn('keyQuick')}
         </Field>
       </div>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -94,6 +109,7 @@ export function HotkeyTab({ cfg, set }: TabProps) {
             onChange={(keyTranslate) => applyKey('keyTranslate', keyTranslate)}
           />
           {dupWarning('keyTranslate')}
+          {clearBtn('keyTranslate')}
         </Field>
         <Field
           label="划词翻译（可选）"
@@ -104,6 +120,7 @@ export function HotkeyTab({ cfg, set }: TabProps) {
             onChange={(keyTranslateSel) => applyKey('keyTranslateSel', keyTranslateSel)}
           />
           {dupWarning('keyTranslateSel')}
+          {clearBtn('keyTranslateSel')}
         </Field>
       </div>
       <Field
@@ -115,6 +132,7 @@ export function HotkeyTab({ cfg, set }: TabProps) {
           onChange={(keyOcr) => applyKey('keyOcr', keyOcr)}
         />
         {dupWarning('keyOcr')}
+        {clearBtn('keyOcr')}
       </Field>
       <Field label="触发方式">
         <Segmented

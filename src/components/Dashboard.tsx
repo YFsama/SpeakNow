@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import type { Stage, TabProps } from '../types';
 import { resolvedAsrCreds, resolvedLlmCreds } from '../types';
-import { ocrCapture, shortcutChips, translateSelection } from '../api';
+import { isMac, copyText, ocrCapture, shortcutChips, translateSelection } from '../api';
 import { Button, Toggle } from './Controls';
 
 const STAGE_INFO: Record<
@@ -52,7 +52,34 @@ const STAGE_INFO: Record<
   },
 };
 
-const STAT_ICONS = ['🔤', '✍️', '📅', '⚡'];
+const STAT_ICONS = ['🔤', '✍️', '📅', '⚡', '⏱'];
+
+/** 历史时间戳旧记录为秒、新记录为毫秒，统一折算为毫秒 */
+const tsMs = (ts: number) => (ts < 1e12 ? ts * 1000 : ts);
+
+const dayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/** 相对时间：刚刚 / X分钟前 / X小时前 / 昨天 / X天前 */
+function relTime(ts: number): string {
+  const diff = Date.now() - tsMs(ts);
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`;
+  const yd = new Date();
+  yd.setDate(yd.getDate() - 1);
+  return dayKey(new Date(tsMs(ts))) === dayKey(yd)
+    ? '昨天'
+    : `${Math.floor(diff / 86_400_000)}天前`;
+}
+
+/** 星期缩写（getDay 下标） */
+const WEEKDAY_ABBR = ['日', '一', '二', '三', '四', '五', '六'];
+
+/** 最近位次分位值（nearest-rank，ceil(q·N) 取秩）：空数组返回 null */
+function percentile(sorted: number[], q: number): number | null {
+  if (!sorted.length) return null;
+  return sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)];
+}
 
 export default function Dashboard({
   cfg,
@@ -61,26 +88,49 @@ export default function Dashboard({
   stage,
   statusMsg,
   recording,
+  devices,
   history,
   localModels,
   onRecordToggle,
+  toast,
 }: TabProps) {
   const stats = useMemo(() => {
     const total = history.length;
     const chars = history.reduce((n, h) => n + h.final.length, 0);
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    // 历史时间戳旧记录为秒、新记录为毫秒，统一折算后比较
-    const today = history.filter(
-      (h) => (h.ts < 1e12 ? h.ts * 1000 : h.ts) >= todayStart.getTime(),
-    ).length;
+    // 按本地日期分组（今日 / 昨日 / 近 7 天柱图共用一张表）
+    const byDay = new Map<string, number>();
+    for (const h of history) {
+      const k = dayKey(new Date(tsMs(h.ts)));
+      byDay.set(k, (byDay.get(k) ?? 0) + 1);
+    }
+    const now = new Date();
+    const today = byDay.get(dayKey(now)) ?? 0;
+    // 昨日无记录（undefined）时不显示对比
+    const yesterday = byDay.get(dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)));
     const proc = history
       .map((h) => (h.asrMs ?? 0) + (h.llmMs ?? 0))
       .filter((v) => v > 0);
     const avg = proc.length
       ? (proc.reduce((a, b) => a + b, 0) / proc.length / 1000).toFixed(1) + 's'
       : '—';
-    return { total, chars, today, avg };
+    // 识别延迟分位（仅统计 asrMs 非空且 > 0 的记录）
+    const asrLat = history
+      .map((h) => h.asrMs)
+      .filter((v): v is number => typeof v === 'number' && v > 0)
+      .sort((a, b) => a - b);
+    const p50 = percentile(asrLat, 0.5);
+    const p95 = percentile(asrLat, 0.95);
+    // 近 7 天（含今日，末位为今日）
+    const week = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (6 - i));
+      return {
+        wd: d.getDay(),
+        md: `${d.getMonth() + 1}/${d.getDate()}`,
+        isToday: i === 6,
+        count: byDay.get(dayKey(d)) ?? 0,
+      };
+    });
+    return { total, chars, today, yesterday, avg, p50, p95, week };
   }, [history]);
 
   const info = STAGE_INFO[stage];
@@ -131,11 +181,19 @@ export default function Dashboard({
       label: cfg.hotkey.enabled ? '全局快捷键已启用' : '全局快捷键未启用',
       tab: 'hotkey' as const,
     },
-    {
-      ok: true,
-      label: cfg.audio.device ? `麦克风：${cfg.audio.device}` : '麦克风：系统默认',
-      tab: 'mic' as const,
-    },
+    // 已保存指定设备但当前系统枚举不到（接收器休眠/未插/重启后）：置为待完善，
+    // 提示与 MicTab 里置顶的「已保存未检测到」卡片同口径
+    (() => {
+      const saved = cfg.audio.device;
+      if (!saved) return { ok: true, label: '麦克风：系统默认', tab: 'mic' as const };
+      return devices.some((d) => d.name === saved)
+        ? { ok: true, label: `麦克风：${saved}`, tab: 'mic' as const }
+        : {
+            ok: false,
+            label: `已保存设备当前未检测到：${saved}`,
+            tab: 'mic' as const,
+          };
+    })(),
   ];
 
   return (
@@ -162,7 +220,14 @@ export default function Dashboard({
           </span>
           <div className="min-w-0">
             <div className={`text-lg font-semibold ${info.text}`}>{info.label}</div>
-            <div className="truncate text-xs text-slate-400">
+            {/* 出错时完整展示错误信息（最多三行）；正常状态保持单行截断的提示 */}
+            <div
+              className={`text-xs text-slate-400 ${
+                statusMsg && stage === 'error'
+                  ? 'line-clamp-3 break-all'
+                  : 'truncate'
+              }`}
+            >
               {statusMsg && stage === 'error' ? statusMsg : info.hint}
             </div>
           </div>
@@ -175,14 +240,17 @@ export default function Dashboard({
             >
               🌐 翻译选中文字
             </Button>
-            <Button
-              onClick={() => {
-                void ocrCapture().catch(() => {});
-              }}
-              title="框选屏幕任意区域，本地离线识别出文字（可复制/翻译/输入）"
-            >
-              📷 截图取词
-            </Button>
+            {/* 截图取词后端仅 Windows：mac 上隐藏入口，点了也会立即报错（门控与 OcrTab 一致） */}
+            {!isMac && (
+              <Button
+                onClick={() => {
+                  void ocrCapture().catch(() => {});
+                }}
+                title="框选屏幕任意区域，本地离线识别出文字（可复制/翻译/输入）"
+              >
+                📷 截图取词
+              </Button>
+            )}
             <Button kind="primary" onClick={onRecordToggle}>
               {recording ? '■ 结束并识别' : '🎤 试录一段'}
             </Button>
@@ -251,12 +319,33 @@ export default function Dashboard({
       </section>
 
       {/* 统计 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
         {[
           { label: '累计使用', value: String(stats.total), unit: '次' },
-          { label: '累计输入', value: String(stats.chars), unit: '字' },
-          { label: '今日', value: String(stats.today), unit: '次' },
+          { label: '累计输入', value: stats.chars.toLocaleString(), unit: '字' },
+          {
+            label: '今日',
+            value: String(stats.today),
+            unit: '次',
+            // 昨日无数据（undefined）时不显示对比
+            sub:
+              stats.yesterday === undefined
+                ? undefined
+                : stats.today > stats.yesterday
+                  ? `较昨日 +${stats.today - stats.yesterday}`
+                  : stats.today < stats.yesterday
+                    ? `较昨日 -${stats.yesterday - stats.today}`
+                    : '与昨日持平',
+          },
           { label: '平均处理', value: stats.avg, unit: '' },
+          {
+            label: '识别 p50 / p95',
+            value:
+              stats.p50 !== null && stats.p95 !== null
+                ? `${(stats.p50 / 1000).toFixed(1)}s / ${(stats.p95 / 1000).toFixed(1)}s`
+                : '—',
+            unit: '',
+          },
         ].map((s, i) => (
           <div
             key={s.label}
@@ -274,9 +363,72 @@ export default function Dashboard({
                 </span>
               )}
             </div>
+            {s.sub && (
+              <div
+                className={`mt-1 text-[10.5px] ${
+                  s.sub.startsWith('较昨日 +')
+                    ? 'text-emerald-400/80'
+                    : s.sub.startsWith('较昨日 -')
+                      ? 'text-amber-400/80'
+                      : 'text-slate-500'
+                }`}
+              >
+                {s.sub}
+              </div>
+            )}
           </div>
         ))}
       </div>
+
+      {/* 最近 7 天迷你柱图（纯 div，高度按当日条数归一） */}
+      <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] px-4 py-3">
+        {(() => {
+          const max = Math.max(...stats.week.map((d) => d.count));
+          return (
+            <div className="flex items-center gap-4">
+              <span className="shrink-0 text-[11px] text-slate-500">近 7 天</span>
+              <div className="flex flex-1 items-end gap-1.5 sm:gap-2.5">
+                {stats.week.map((d, i) => (
+                  <div
+                    key={i}
+                    className="flex min-w-0 flex-1 flex-col items-center gap-1.5"
+                        title={`${d.md}：${d.count} 条`}
+                  >
+                    <div className="flex h-11 w-full items-end justify-center">
+                      <div
+                        className={`w-full max-w-6 rounded-t-[3px] transition-all ${
+                          d.count === 0
+                            ? 'h-[2px] bg-slate-700/60' // 无数据日 2px 底座灰柱
+                            : d.isToday
+                              ? 'bg-gradient-to-t from-sky-500 to-indigo-400'
+                              : 'bg-sky-400/35'
+                        }`}
+                        style={
+                          d.count > 0
+                            ? {
+                                height: `${Math.max(
+                                  6,
+                                  Math.round((d.count / (max || 1)) * 44),
+                                )}px`,
+                              }
+                            : undefined
+                        }
+                      />
+                    </div>
+                    <span
+                      className={`text-[10px] ${
+                        d.isToday ? 'font-medium text-sky-300' : 'text-slate-600'
+                      }`}
+                    >
+                      {WEEKDAY_ABBR[d.wd]}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+      </section>
 
       {/* 配置自检 */}
       <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
@@ -365,11 +517,12 @@ export default function Dashboard({
         <div className="space-y-4">
           <div>
             <div className="mb-1.5 text-[13px] font-medium text-slate-300/90">主题</div>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
               {(
                 [
                   { v: 'dark', label: '🌙 夜间', desc: '深色 · 护眼默认' },
                   { v: 'light', label: '☀️ 日间', desc: '浅色 · 明亮清爽' },
+                  { v: 'auto', label: '🖥 跟随系统', desc: '自动匹配系统外观' },
                 ] as const
               ).map((o) => {
                 const active = cfg.general.theme === o.v;
@@ -402,9 +555,15 @@ export default function Dashboard({
           <div>
             <div className="mb-1.5 flex items-center justify-between">
               <span className="text-[13px] font-medium text-slate-300/90">界面缩放</span>
-              <span className="font-mono text-xs text-sky-300">
+              {/* 读数 chip 化：点击重置 100% */}
+              <button
+                type="button"
+                onClick={() => set('general', { fontScale: 1 })}
+                title="点击重置为 100%"
+                className="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 font-mono text-[11px] tabular-nums text-sky-300 transition hover:border-sky-400/40 hover:bg-sky-400/20 active:scale-95"
+              >
                 {Math.round((cfg.general.fontScale || 1) * 100)}%
-              </span>
+              </button>
             </div>
             <input
               type="range"
@@ -441,9 +600,26 @@ export default function Dashboard({
             {history.slice(0, 3).map((h, idx) => (
               <div
                 key={`${h.ts}-${idx}`}
-                className="card-lift truncate rounded-lg border border-white/[0.05] bg-black/20 px-3.5 py-2.5 text-[13px] text-slate-300"
+                className="card-lift group flex items-center gap-2.5 rounded-lg border border-white/[0.05] bg-black/20 px-3.5 py-2.5"
               >
-                {h.final}
+                <span className="min-w-0 flex-1 truncate text-[13px] text-slate-300">
+                  {h.final || h.raw}
+                </span>
+                <span className="shrink-0 text-[10.5px] text-slate-600">
+                  {relTime(h.ts)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void copyText(h.final || h.raw)
+                      .then(() => toast('已复制 ✓'))
+                      .catch((e) => toast(`复制失败：${e}`));
+                  }}
+                  title="复制该条文本"
+                  className="shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] text-sky-400 opacity-0 transition hover:bg-sky-500/10 hover:text-sky-300 focus:opacity-100 group-hover:opacity-100"
+                >
+                  复制
+                </button>
               </div>
             ))}
           </div>

@@ -37,6 +37,14 @@ fn current_config(app: &AppHandle) -> Config {
 
 /// 开始一次截图取词：弹出各屏选区窗等待框选。线程安全，可从任意线程调用。
 pub fn start_capture(app: &AppHandle) {
+    // 非 Windows：截屏（GDI）与识别（Windows.Media.Ocr）链路尚未移植，必须在
+    // 入口直接报错走 sn-ocr-error 事件——否则用户完整框选松手后才在
+    // recognize_region 里失败，白白经历一轮选区交互
+    #[cfg(not(target_os = "windows"))]
+    {
+        emit_error(app, "截图取词当前仅支持 Windows");
+        return;
+    }
     let cfg = current_config(app);
     if !cfg.ocr.enabled {
         return;
@@ -182,9 +190,10 @@ pub async fn ocr_region_selected(
             emit_error(&h, "该区域没有识别到文字（可尝试框选更大的范围）");
             return;
         }
-        if cfg2.ocr.copy_on_capture {
-            let _ = crate::inject::copy_only(&text);
-        }
+        // 识别后自动复制也可能失败（剪贴板被占用）：结果事件带回 copyFailed，
+        // 卡片据此提示手动复制——否则用户粘贴出旧内容还以为识别错了
+        let copy_failed =
+            cfg2.ocr.copy_on_capture && crate::inject::copy_only(&text).is_err();
         // 截图翻译一键链：AI 未配置时降级为普通 OCR 卡片（复制/翻译按钮仍可用）
         let llm = cfg2.resolved_llm();
         let can_translate =
@@ -193,9 +202,11 @@ pub async fn ocr_region_selected(
             let target = cfg2.llm.translate_target.clone();
             crate::translate::start_session(&h, &cfg2, text, target);
         } else {
+            // 识别成功入历史（kind=ocr，识别耗时记到 asr 位；前端据 asrMs/llmMs 隐藏耗时行）
+            crate::history::push(&h, &text, &text, ms, 0, "ocr");
             let _ = h.emit(
                 "sn-ocr-result",
-                serde_json::json!({ "text": text, "ms": ms }),
+                serde_json::json!({ "text": text, "ms": ms, "copyFailed": copy_failed }),
             );
             // OCR 卡片要读要选：给足驻留时间，悬停钉住时计时自动暂停
             crate::pipeline::hide_later(&h, 15_000);

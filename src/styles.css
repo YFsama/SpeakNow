@@ -279,7 +279,7 @@ input[type='range']::-webkit-slider-thumb {
   animation: wordInFade 0.3s ease-out both;
 }
 
-/* AI 修改处的强调高亮，随后褪去 */
+/* AI 修改处的强调高亮，动画结束后保留极淡常驻底色（审计可回溯哪些词被改过） */
 @keyframes wordChanged {
   0% {
     background: rgba(56, 189, 248, 0.35);
@@ -289,7 +289,7 @@ input[type='range']::-webkit-slider-thumb {
     background: rgba(56, 189, 248, 0.22);
   }
   100% {
-    background: transparent;
+    background: rgba(56, 189, 248, 0.1);
   }
 }
 .word-changed {
@@ -373,6 +373,9 @@ html.light .placeholder\:text-slate-600::placeholder {
 }
 
 /* 半透明黑底 → 浅灰 */
+html.light .bg-black\/\[0\.14\] {
+  background: rgba(15, 23, 42, 0.035);
+}
 html.light .bg-black\/20,
 html.light .bg-black\/25 {
   background: rgba(15, 23, 42, 0.045);
@@ -387,15 +390,24 @@ html.light .bg-black\/45 {
 }
 
 /* 白色透明表面 → 深色透明表面 */
+html.light .bg-white\/\[0\.02\],
 html.light .bg-white\/\[0\.025\],
 html.light .bg-white\/\[0\.03\] {
   background: rgba(255, 255, 255, 0.75);
 }
-html.light .bg-white\/\[0\.04\] {
+html.light .bg-white\/\[0\.04\],
+html.light .bg-white\/\[0\.05\] {
   background: rgba(15, 23, 42, 0.05);
 }
+html.light .bg-white\/\[0\.06\],
 html.light .bg-white\/\[0\.07\] {
   background: rgba(15, 23, 42, 0.08);
+}
+html.light .bg-white\/\[0\.09\] {
+  background: rgba(15, 23, 42, 0.1);
+}
+html.light .bg-white\/10 {
+  background: rgba(15, 23, 42, 0.09);
 }
 html.light .bg-white\/\[0\.025\],
 html.light section[class*='bg-white'] {
@@ -403,6 +415,7 @@ html.light section[class*='bg-white'] {
 }
 
 /* 边框 */
+html.light .border-white\/\[0\.05\],
 html.light .border-white\/\[0\.06\],
 html.light .border-white\/\[0\.07\],
 html.light .border-white\/\[0\.08\] {
@@ -420,6 +433,63 @@ html.light .hover\:border-white\/25:hover {
 }
 html.light .hover\:border-white\/20:hover {
   border-color: rgba(15, 23, 42, 0.22);
+}
+html.light .hover\:border-white\/15:hover {
+  border-color: rgba(15, 23, 42, 0.2);
+}
+html.light .hover\:border-white\/\[0\.12\]:hover {
+  border-color: rgba(15, 23, 42, 0.18);
+}
+html.light .hover\:border-white\/\[0\.14\]:hover {
+  border-color: rgba(15, 23, 42, 0.2);
+}
+/* 输入框悬停边框（inputBase 用）：基础态映射特异性压过 Tailwind hover 变体，须显式补 */
+html.light .hover\:border-white\/\[0\.18\]:hover {
+  border-color: rgba(15, 23, 42, 0.28);
+}
+
+/* 交互态表面：深色透明 hover/focus → 暗色低透明；白透明 hover → 深色低透明 */
+html.light .hover\:bg-black\/35:hover,
+html.light .hover\:bg-black\/\[0\.3\]:hover {
+  background: rgba(15, 23, 42, 0.09);
+}
+html.light .hover\:bg-black\/\[0\.38\]:hover {
+  background: rgba(15, 23, 42, 0.1);
+}
+html.light .focus\:bg-black\/\[0\.42\]:focus {
+  background: rgba(15, 23, 42, 0.11);
+}
+html.light .hover\:bg-white\/10:hover {
+  background: rgba(15, 23, 42, 0.07);
+}
+html.light .hover\:bg-white\/\[0\.04\]:hover {
+  background: rgba(15, 23, 42, 0.05);
+}
+html.light .hover\:bg-white\/\[0\.05\]:hover {
+  background: rgba(15, 23, 42, 0.06);
+}
+html.light .hover\:bg-white\/\[0\.09\]:hover {
+  background: rgba(15, 23, 42, 0.1);
+}
+
+/* 交互态文字 */
+html.light .hover\:text-slate-100:hover {
+  color: #0f172a;
+}
+html.light .hover\:text-slate-200:hover {
+  color: #1e293b;
+}
+html.light .hover\:text-slate-300:hover {
+  color: #334155;
+}
+html.light .hover\:text-sky-300:hover {
+  color: #0369a1;
+}
+html.light .hover\:text-red-300:hover {
+  color: #b91c1c;
+}
+html.light .hover\:text-teal-300:hover {
+  color: #0f766e;
 }
 
 /* 灰色控件底 */
@@ -464,6 +534,42 @@ html.light .text-amber-400 {
 html.light .text-sky-200\/70 {
   color: #075985;
 }
+html.light .text-sky-200 {
+  color: #075985;
+}
+html.light .text-teal-300,
+html.light .text-teal-300\/80 {
+  color: #0f766e;
+}
+html.light .text-teal-400 {
+  color: #0d9488;
+}
+html.light .text-violet-300 {
+  color: #6d28d9;
+}
+html.light .text-amber-200,
+html.light .text-amber-200\/80,
+html.light .text-amber-200\/90 {
+  color: #92400e;
+}
+html.light .text-amber-300\/80 {
+  color: #b45309;
+}
+html.light .text-emerald-200,
+html.light .text-emerald-200\/80 {
+  color: #065f46;
+}
+html.light .text-emerald-300\/80 {
+  color: #047857;
+}
+/* Dashboard 快捷键徽章用 !important 变体（kbd !text-teal-300 !border-teal-400/25），
+   需同权重才能在浅色下生效 */
+html.light .\!text-teal-300 {
+  color: #0f766e !important;
+}
+html.light .\!border-teal-400\/25 {
+  border-color: rgba(13, 148, 136, 0.45) !important;
+}
 
 /* 徽章与滚动条 */
 html.light .kbd {
@@ -471,6 +577,10 @@ html.light .kbd {
   border-bottom-width: 2px;
   background: rgba(15, 23, 42, 0.05);
   color: #0369a1;
+}
+/* 滑杆轨道：深色 #26263a → 浅灰 */
+html.light input[type='range'] {
+  background: #dbe1ea;
 }
 html.light ::-webkit-scrollbar-thumb {
   background: #c3cbd8;

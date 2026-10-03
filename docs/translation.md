@@ -5,8 +5,8 @@
 ## 0. TL;DR
 
 - **已有资产**：SpeakNow 已具备"听写翻译"（`llm.mode == "translate"`、专用热键 `key_translate`、托盘语言子菜单、翻译 prompt / 术语表 / 双语输出 / 思考-token 快路径全部就绪）。缺的是 DeepL 客户端的核心体验：**划词取词 → 独立翻译结果窗 → 复制/替换写回**，以及长文档批量翻译。
-- **质量结论（2026）**：云端 LLM 翻译已全面超过 DeepL/Google（WMT25 上 Gemini 2.5 Pro 拿下 15 个语言对中的 14 个；中文系模型在 zh↔en 上有语料优势）。本地侧翻译专用小模型 **TranslateGemma-4B**（Q4 约 2.5–3GB）质量已超过传统 MT 引擎。"本地实现"完全成立，但建议做成**可选下载包**而非内置。
-- **推荐架构**：云为主（复用现有 OpenAI 兼容 LLM 通道，零新增依赖）+ 本地增强包（llama.cpp sidecar 跑 TranslateGemma-4B，完全复用 `qwen_asr.rs` 的子进程管理模式）+ 统一的取词/展示/写回管线。
+- **质量结论（2026）**：云端 LLM 翻译已全面超过 DeepL/Google（WMT25 上 Gemini 2.5 Pro 拿下 15 个语言对中的 14 个；中文系模型在 zh↔en 上有语料优势）。本地侧 **Index-Translate（B 站开源翻译专项，2B 仅 1.3GB）** 已接入并设为本地引擎默认，质量超过通用对话小模型；TranslateGemma-4B 为欧语备选。"本地实现"完全成立，做成**可选下载包**而非内置。
+- **推荐架构**：云为主（复用现有 OpenAI 兼容 LLM 通道，零新增依赖）+ 本地增强包（llama.cpp sidecar 跑 Index-Translate-2B，完全复用 `qwen_asr.rs` 的子进程管理模式）+ 统一的取词/展示/写回管线。
 - **唯一需要从零建的模块**：跨应用取词（selection）。Windows 上 `caret.rs` 已经在用 UIA `GetSelection` 拿选区矩形——只差对同一个 range 调 `GetText()`，零新依赖。
 
 ---
@@ -22,6 +22,8 @@
 | qwen-mt-turbo（阿里翻译专用 API） | ★★★★ | ≈$1–2 | <1s | ✗ | OpenAI 兼容 + `translation_options`（术语/领域/翻译记忆原生参数） | 0 |
 | DeepL API | ★★★☆（欧语强、zh 一般） | ≈$25（贵 10–20 倍） | <1s | ✗ | 需单独 REST 模块 | 0 |
 | 火山（200 万字/月免费）/ 腾讯（500 万/月免费） | ★★★ | 0 | <1s | ✗ | REST + 签名 | 0 |
+| **本地 Index-Translate-2B Q4（B 站开源，翻译专项）** | ★★★★☆（WMT24++ 家族水准，150 语种，指令跟随 + 梗翻译） | 0 | CPU 快于 4B 通用模型；GPU 更快 | ✓ | **已内置**（local_llm 模型目录 + llm.rs 官方原生配方） | 1.3GB |
+| 本地 Index-Translate-9B Q4 | ★★★★★（WMT24++ COMET 0.8789，追平云端旗舰档） | 0 | 需 GPU / 大内存 | ✓ | 同上 | 5.5GB |
 | **本地 TranslateGemma-4B Q4** | ★★★★（超 DeepL 档，COMET 81.6） | 0 | CPU 7–15 tok/s；GPU 快 | ✓ | sidecar + OpenAI 兼容端口（复用现有客户端） | ~2.5–3GB + 10MB |
 | 本地 Qwen3-4B/8B | ★★★☆ / ★★★★（8B 需 GPU） | 0 | 8B CPU 仅 3–6 tok/s | ✓ | 同上 | 2.5/5GB |
 | 本地 NLLB-600M int8（ct2rs） | ★★☆（看大意） | 0 | 百 ms 级/句 | ✓ | ct2rs 进程内（需 C++ 工具链） | ~0.6GB |
@@ -139,22 +141,64 @@ async fn run(cfg, text, app, superseded)  // llm::optimize_streaming(translate �
 1. ✅ `selection.rs`（Win：UIA GetText + 模拟复制降级 + 软换行合并；mac：强制取词路径）
 2. ✅ `key_translate_sel` 热键 → `translate.rs` 编排 → overlay 翻译卡片（流式、双语、复制/替换、语言条切换、Esc 关闭、悬停钉住）
 3. ✅ TranslateTab 设置页（目标语/第二目标语、术语表入口、黑名单、自动复制/替换标记/强制模拟复制）+ 输入翻译工作台
-4. 未尽事项：macOS AX 取词（现为 Cmd+C 模拟复制单路径）、Ctrl+C+C 双击检测（v3）、截图 OCR 兜底（与 OCR 模块汇合后做）
+4. 未尽事项：macOS AX 取词（现为 Cmd+C 模拟复制单路径）、截图 OCR 兜底（✅ 已由并行开发的 OCR 模块覆盖）；~~Ctrl+C+C 双击检测~~ ✅ v2.6 实现
 
 **v2 —— 输入翻译 + 本地化（大部分已实现）**
 > ✅ 主窗口输入翻译工作台（TranslateTab 内，流式双语）
 > ✅ 剪贴板监听模式（复制即翻译，`translate.clipboardWatch`，默认关；自身写入不触发、黑名单生效、超长交给工作台）
-> ✅ **本地翻译引擎**（`src-tauri/src/local_llm.rs`）：`translate.engine = local` 切换；默认 Qwen3-4B-Instruct-2507（非思考版，中文扎实）、Gemma-3-4B-it 可选，Q4 约 2.4~2.6GB 按需下载（镜像沿用语音识别页设置）；llama.cpp sidecar 与 Qwen3-ASR 共享 runtime 二进制但独立进程（端口 18320+ / server-llm.log / 孤儿清理互相避让 tracked_pid）；随应用预载、Vulkan 自动加速失败回退 CPU、超时放宽 300s
+> ✅ **本地翻译引擎**（`src-tauri/src/local_llm.rs`）：`translate.engine = local` 切换；**默认 Index-Translate-2B（B 站开源翻译专项，1.3GB）**、Index-Translate-9B（5.5GB 质量档）、Qwen3-4B、Gemma-3-4B 可选，Q4 按需下载（镜像沿用语音识别页设置）；llama.cpp sidecar 与 Qwen3-ASR 共享 runtime 二进制但独立进程（端口 18320+ / server-llm.log / 孤儿清理互相避让 tracked_pid）；随应用预载、Vulkan 自动加速失败回退 CPU、超时放宽 300s
 > ✅ qwen-mt-turbo 预设（已加入「AI 优化」预设列表）
 > ✅ **结构化智能翻译**（`src-tauri/src/trans_struct.rs`）：JSON / YAML / properties·env 只译字符串值——位置扫描 + 原位回填（格式零漂移），占位符掩码保护（{name}/%s/{{var}}/$var/HTML 标签），非文本值（URL/路径/数字/布尔/locale）自动跳过，重复值去重，30 条一批编号协议 + 失配逐条兜底；`translate.structuredTranslate` 可关
-1. TranslateGemma-4B 专属模型卡（等 llama.cpp 生态稳定后加入模型目录）
+
+**v2.5 —— Index-Translate 家族接入（B 站开源，2026-10）✅ 已实现**
+> 官网 https://index-translate.bilibili.com · 仓库 https://github.com/bilibili/Index-Translate（Apache-2.0）。
+> Qwen3.5 底座、150 语种、翻译专项三阶段训练（Mid-train / Post-train / Model-merge），带指令跟随
+> 与梗理解（"结芬"→"let's get married"）；9B 在 WMT24++ COMET 0.8789、FLORES-200 0.879（35B-A3B preview）。
+> 家族还有 Index-Echo（语音翻译）、Index-Homura（音节控制配音）、Index-NaiLong（64K 长文档一次成篇），
+> 后两者暂未接入（见 v3）。
+1. ✅ 本地引擎模型目录新增 `index-translate-2b`（mradermacher Q4_K_M GGUF，1252MB，社区量化——
+   官方只发 safetensors/vLLM 权重）与 `index-translate-9b`（datouge Q4_K_M，5513MB），并设为默认
+2. ✅ **官方原生提示词配方**（`llm.rs`）：检测 `is_index_translate`（本地 id 与云端模型名 `IndexTeam/Index-Translate-9B` 均命中）→
+   单条用户消息（无系统提示）+ 中文目标语言名（`lang_name_zh`，训练侧同款）+ temperature 0（贪婪）+
+   `chat_template_kwargs.enable_thinking=false`（模板层关思考，llama-server/vLLM 均支持，不识别的网关有去参数重发与 `<think>` 剥离双兜底）；
+   本产品特有的第二目标语言 / 术语表 / ASR 口误修正条款以追加句并入指令（该家族有指令跟随训练）。
+   **第二目标条款必须以分号并入首句**（`译为A；若原文已是A则改译B。直接输出…`）——真机实测 2B：后置独立句会被忽略（英→中原样回显）、
+   「若A译B否则译A」双向式会翻车主方向（中→中）；分号式三方向全对（英→中 / 中→英 / 日→英）
+3. ✅ 运行时零改动：llama.cpp 已合并 Qwen3.5 架构（PR #19468，2026-02），应用下载策略"最新 release 优先、
+   固定回退 b10584（2026-08）"两路都已包含
+4. ✅ 云端自部署同理：vLLM serve 任一 Index 模型后在「AI 优化」页把模型名填为 `IndexTeam/Index-Translate-9B`
+   即自动命中原生配方（`vllm serve IndexTeam/Index-Translate-2B --max-model-len 32768`）
+5. 未尽：Index-NaiLong 长文档模型卡（等结构化长文管线）；Index-Echo 语音→译文端到端（架构不同，需 AuT 编码器，
+   llama.cpp 不支持，暂缓）
+
+**真机验证（2026-10-02，llama.cpp b11335 CPU 构建 + Index-Translate-2B Q4_K_M）**：
+模型 2 秒加载；`chat_template_kwargs` 正常接受、无 `<think>` 输出（去掉该参数同样干净——降级路径安全）；
+口语中文→英文译文地道（"百分之三十"→30%、token 保留），纯 CPU 生成 27 tok/s、整句 1.5s；
+结构化批量协议（system + 编号列表 + kwargs）编号对齐、`⟪0⟫` 占位符原样保留、术语一致；SSE 流式 delta
+格式与 `stream_once` 解析器完全匹配。
 
 **v3 —— 大量翻译与进阶交互**
-1. 长文档工作台：分块 + 滑动窗口上下文 + 术语检索注入 + 并发池 + TM（SQLite）+ 可选二遍审校
-2. Ctrl+C+C 双击检测（rdev 钩子 + 状态机）
-3. 截图 OCR 翻译（xcap + Windows.Media.OCR / Vision）
+1. 长文档工作台：分块 + 滑动窗口上下文 + 术语检索注入 + 并发池 + TM（SQLite）+ 可选二遍审校；接入 Index-NaiLong（64K 单次成篇，原生全文 3 次调用 vs 分块 157+ 次）
+2. ~~Ctrl+C+C 双击检测~~ ✅ v2.6 实现（Win32 低级键盘钩子而非 rdev：回调纳秒级透传、注入事件忽略、纯逻辑状态机可单测）
+3. ~~截图 OCR 翻译~~（✅ 已由并行开发的 OCR 模块覆盖：截图取词 → 翻译卡片）
 4. DeepL API / 火山 / 腾讯等专用引擎插件化（pot 模式，多引擎并排对比）
 5. 文档导出（docx 段落级替换、EPUB 双语）
+
+**v2.6 —— Ctrl+C+C 双击复制即翻译 + 健壮性修复（2026-10）✅ 已实现**
+> DeepL 式：350ms 内连按两次 Ctrl+C，把刚复制的内容直接送进翻译卡片。
+> 代码：`src-tauri/src/ccc.rs`（钩子 + 纯逻辑状态机，5 个单测）。
+1. ✅ Windows 低级键盘钩子（WH_KEYBOARD_LL）跑独立消息循环线程；回调只做
+   原子开关判断 + 时间戳比对（纳秒级返回、永不吞键），命中经 channel 交工作线程
+   （稳等 270ms 让第二次复制落盘 + 合并抖动），读剪贴板走与「复制即翻译」完全一致的
+   守卫链（引擎就绪 / 黑名单 / 自写剪贴板 / 听写进行中，`translate::guard_copied_text` 共用）
+2. ✅ 注入事件（LLKHF_INJECTED / LOWER_IL_INJECTED）一律忽略——本应用模拟复制的
+   Ctrl+C 不会自激励；「Ctrl+C → 别的键 → Ctrl+C」不触发（其他键重置记忆）；
+   30ms 内的重复投递视为抖动
+3. ✅ 默认关闭，「翻译」页开关（`translate.ccc`）；与剪贴板监听互不冲突可同开
+4. ✅ 修复：YAML 块标量（`|` / `>`）内容里的「键: 值」形态曾被误当映射行提取翻译、
+   回填加引号会污染块内容——现在块内容整段原样保留（不译不计数），缩进回到父层级后恢复
+5. ✅ 修复：翻译卡片 result/error 事件补 `gen` 会话代数过滤，旧会话迟到的
+   结果/错误不再覆盖新卡片（会话竞态根治的翻译侧收尾）
 
 ### 3.3 已知雷区（调研实证）
 
@@ -173,6 +217,8 @@ async fn run(cfg, text, app, superseded)  // llm::optimize_streaming(translate �
 **评测与模型**
 - WMT24 Findings: https://aclanthology.org/2024.wmt-1.75/ · WMT25 初步排名: https://arxiv.org/abs/2508.20550
 - Qwen-MT: https://qwenlm.github.io/blog/qwen-mt/ · TranslateGemma: https://huggingface.co/google/translategemma-4b-it
+- Index-Translate（B 站开源）: https://index-translate.bilibili.com · https://github.com/bilibili/Index-Translate · 技术报告 https://arxiv.org/abs/2609.40181 · GGUF 量化 https://huggingface.co/mradermacher/Index-Translate-2B-GGUF
+- llama.cpp Qwen3.5 架构支持（PR #19468）: https://github.com/ggml-org/llama.cpp/pull/19468
 - Alconost 引擎横评: https://alconost.com/blog/best-llm-for-translation
 - 术语注入（ACL 2025）: https://aclanthology.org/2025.wmt-1.5/ · 滑动窗口上下文: https://aclanthology.org/2024.amta-1.16/
 

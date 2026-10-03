@@ -188,11 +188,14 @@ fn detect_backend() -> String {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        // 先把子进程控制台输出编码切到 UTF-8：zh-CN 系统的 PowerShell 5.1 重定向
+        // 输出跟随控制台代码页（GBK），非 ASCII 显卡名会被 from_utf8_lossy 洗成
+        // U+FFFD——纯中文名不含 ASCII 关键词时会误判无独显，回落 CPU 运行时
         let out = Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
-                "(Get-CimInstance Win32_VideoController).Name -join ';'",
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; (Get-CimInstance Win32_VideoController).Name -join ';'",
             ])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output();

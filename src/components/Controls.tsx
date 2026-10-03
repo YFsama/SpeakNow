@@ -1,4 +1,5 @@
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 /* ============ 通用卡片区块 ============ */
 
@@ -71,6 +72,37 @@ export function Field({
 const inputBase =
   'w-full rounded-xl border border-white/10 bg-black/30 px-3.5 py-2.5 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] hover:bg-black/[0.38] focus:border-sky-500/60 focus:bg-black/[0.42] focus:ring-[3px] focus:ring-sky-500/10';
 
+/* 密码显隐眼睛图标（线性 stroke 风格，与整体一致） */
+function EyeIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="12" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+    </svg>
+  );
+}
+function EyeOffIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M2 12s3.6-6.5 10-6.5c2.2 0 4 .8 5.4 1.9M22 12s-3.6 6.5-10 6.5c-2.2 0-4-.8-5.4-1.9"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="12" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M4.5 19.5 19.5 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function TextInput({
   value,
   onChange,
@@ -90,17 +122,32 @@ export function TextInput({
   /** 按键回调：如数字输入按 Enter 视同失焦立即提交 */
   onKeyDown?: (e: ReactKeyboardEvent<HTMLInputElement>) => void;
 }) {
+  // type=password 时右侧提供显隐切换；spellCheck=false 语义保持不变
+  const isPwd = type === 'password';
+  const [reveal, setReveal] = useState(false);
   return (
-    <input
-      type={type}
-      value={value ?? ''}
-      placeholder={placeholder}
-      spellCheck={false}
-      onChange={(e) => onChange(e.target.value)}
-      onBlur={onBlur}
-      onKeyDown={onKeyDown}
-      className={`${inputBase} ${mono ? 'font-mono text-xs leading-6' : ''}`}
-    />
+    <div className="relative">
+      <input
+        type={isPwd && reveal ? 'text' : type}
+        value={value ?? ''}
+        placeholder={placeholder}
+        spellCheck={false}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        onKeyDown={onKeyDown}
+        className={`${inputBase} ${mono ? 'font-mono text-xs leading-6' : ''} ${isPwd ? 'pr-11' : ''}`}
+      />
+      {isPwd && (
+        <button
+          type="button"
+          onClick={() => setReveal((v) => !v)}
+          aria-label={reveal ? '隐藏密码' : '显示密码'}
+          className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-slate-500 transition hover:text-slate-300"
+        >
+          {reveal ? <EyeOffIcon /> : <EyeIcon />}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -189,6 +236,8 @@ export function Toggle({
   return (
     <button
       type="button"
+      role="switch"
+      aria-checked={checked}
       onClick={() => onChange(!checked)}
       className={`flex w-full items-center justify-between gap-4 rounded-2xl border px-3.5 py-3 text-left transition ${
         checked
@@ -223,6 +272,14 @@ export function Toggle({
   );
 }
 
+/* 列数映射表：类名必须是完整字面量，动态拼接 Tailwind 扫不到（JIT 不生成） */
+const SEGMENTED_COLS: Record<number, string> = {
+  1: '',
+  2: 'sm:grid-cols-2',
+  3: 'sm:grid-cols-3',
+  4: 'sm:grid-cols-4',
+};
+
 export function Segmented<T extends string>({
   value,
   onChange,
@@ -232,7 +289,7 @@ export function Segmented<T extends string>({
   onChange: (v: T) => void;
   options: { value: T; label: string; desc?: string }[];
 }) {
-  const cols = options.length <= 2 ? 'sm:grid-cols-2' : 'sm:grid-cols-3';
+  const cols = SEGMENTED_COLS[options.length] ?? 'sm:grid-cols-3';
   return (
     <div className={`grid grid-cols-1 gap-2 ${cols}`}>
       {options.map((o) => {
@@ -314,6 +371,67 @@ export function Button({
       className={`${base} ${kinds[kind]} ${full ? 'w-full' : ''}`}
     >
       {children}
+    </button>
+  );
+}
+
+/* ============ 两段式确认按钮 ============ */
+
+/** 危险操作的行内二次确认：首击进入待确认态（红色、文案切换、timeoutMs 后自动复位），
+    再击才触发 onConfirm。替代各处手写的 state+timer 模式（如 HistoryTab 的删除确认）。 */
+export function ConfirmButton({
+  label,
+  confirmLabel = '确认执行？',
+  onConfirm,
+  className = '',
+  timeoutMs = 3500,
+}: {
+  label: ReactNode;
+  confirmLabel?: ReactNode;
+  onConfirm: () => void;
+  className?: string;
+  /** 待确认态无操作多久自动复位 */
+  timeoutMs?: number;
+}) {
+  const [arming, setArming] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
+  const reset = () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    setArming(false);
+  };
+
+  const onClick = () => {
+    if (!arming) {
+      setArming(true);
+      timerRef.current = setTimeout(reset, timeoutMs);
+      return;
+    }
+    reset();
+    onConfirm();
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] ${
+        arming
+          ? 'border-red-400/30 bg-red-500/15 text-red-300'
+          : 'border-white/10 bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35'
+      } ${className}`}
+    >
+      {arming ? confirmLabel : label}
     </button>
   );
 }

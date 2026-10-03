@@ -5,6 +5,7 @@ import {
   copyText,
   deleteBuiltin,
   downloadBuiltin,
+  isMac,
   shortcutChips,
   translateSelection,
   translateText,
@@ -132,6 +133,15 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
 
   const llmModels = localModels.filter((m) => m.kind === 'llm');
 
+  // macOS 无 llama.cpp sidecar，本地翻译引擎仅 Windows：旧配置/多端同步可能带着
+  // engine=local 进来，检测到即自动回落云端并提示一次（回落写入后条件不再成立）
+  useEffect(() => {
+    if (isMac && cfg.translate.engine === 'local') {
+      set('translate', { engine: 'cloud' });
+      toast('本地翻译引擎仅支持 Windows，已切换回云端模型');
+    }
+  }, [cfg.translate.engine, set, toast]);
+
   useEffect(() => {
     const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
       if (!busyRef.current || e.payload.kind !== 'content' || e.payload.text === undefined)
@@ -240,6 +250,15 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
           label="复制即翻译（剪贴板监听）"
           desc="在任意应用里复制文字后自动弹出翻译卡片，无需再按热键（CopyTranslator 式）。本应用自己写入的内容（听写输出、译文复制、OCR 结果）不会触发；超长文本（4000 字以上）请用下方工作台。注意：开启后复制的所有文字都会发送给 AI 接口，密码管理器等敏感应用请加入黑名单"
         />
+        {/* Ctrl+C+C 依赖 Windows 低级键盘钩子：mac 上后端不注册，隐藏开关避免无效配置 */}
+        {!isMac && (
+          <Toggle
+            checked={cfg.translate.ccc === true}
+            onChange={(ccc) => set('translate', { ccc })}
+            label="Ctrl+C+C 双击复制即翻译"
+            desc="DeepL 式：350ms 内连按两次 Ctrl+C，把刚复制的内容直接送进翻译卡片——只译你想译的那一段，不用像剪贴板监听那样逢复制必弹。守卫与黑名单同上；仅 Windows"
+          />
+        )}
         <Toggle
           checked={cfg.translate.structuredTranslate !== false}
           onChange={(structuredTranslate) => set('translate', { structuredTranslate })}
@@ -262,16 +281,31 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
       <Section
         icon="🔒"
         title="本地翻译引擎（离线 · 隐私）"
-        desc="下载一个 4B 级模型到本机，划词 / 复制即翻译 / 输入翻译全部离线完成——文本不出本机、零调用费。质量略逊云端旗舰，日常阅读翻译完全够用；llama.cpp 运行时与语音识别引擎共用。"
+        desc="下载一个模型到本机，划词 / 复制即翻译 / 输入翻译全部离线完成——文本不出本机、零调用费。默认 Index-Translate（B 站开源翻译专项模型），llama.cpp 运行时与语音识别引擎共用。"
       >
+        {/* 本地引擎档依赖 llama.cpp sidecar（仅 Windows）：mac 上不提供该档位
+            （Segmented 无禁用态，直接不下发该选项，旁注说明），防止选了即坏 */}
         <Segmented
           value={cfg.translate.engine || 'cloud'}
           onChange={(engine) => set('translate', { engine })}
           options={[
             { value: 'cloud', label: '云端模型', desc: '质量最优 · 走「AI 优化」页配置' },
-            { value: 'local', label: '本地引擎', desc: '离线 · 隐私 · 免费 · CPU 可跑' },
+            ...(isMac
+              ? []
+              : [
+                  {
+                    value: 'local' as const,
+                    label: '本地引擎',
+                    desc: '离线 · 隐私 · 免费 · CPU 可跑',
+                  },
+                ]),
           ]}
         />
+        {isMac && (
+          <div className="mt-2 text-[11px] leading-4 text-slate-500">
+            本地引擎仅 Windows
+          </div>
+        )}
         {cfg.translate.engine === 'local' && (
           <>
             <Field
@@ -280,7 +314,7 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
             >
               <div className="space-y-2">
                 {llmModels.map((m) => {
-                  const selected = (cfg.translate.localModel || 'qwen3-4b-instruct') === m.id;
+                  const selected = (cfg.translate.localModel || 'index-translate-2b') === m.id;
                   const prog = progress[m.id];
                   const busy = downloading === m.id;
                   return (
@@ -396,9 +430,10 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
               </div>
             </Field>
             <div className="rounded-lg border border-teal-400/15 bg-teal-500/[0.04] px-3.5 py-2.5 text-[11px] leading-5 text-slate-400">
-              选中本地引擎后，应用启动会自动预载（常驻约 2.5GB 内存，与语音识别引擎各占一份）；
+              选中本地引擎后，应用启动会自动预载（内存占用随所选模型 1.3~5.5GB，与语音识别引擎各占一份）；
               首次翻译前模型加载需十几秒，期间卡片显示「引擎启动中」。显卡自动加速（Vulkan），
               初始化失败自动回退 CPU；超时放宽到 300 秒，长文翻译不会被中途掐断。听写纠错仍走云端配置，不受影响。
+              Index-Translate 家族会自动切换官方原生提示词（贪婪解码、模板层关思考），离线也拿到专项训练的翻译质量。
             </div>
           </>
         )}
@@ -491,20 +526,27 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
               <>🌐 翻译</>
             )}
           </Button>
-          <div className="w-32">
-            <Select
-              value={target}
-              onChange={(translateTarget) =>
-                set('llm', {
-                  translateTarget,
-                  // 新目标语言与第二目标语言撞车时提示词会退化：同笔提交里清空
-                  ...(cfg.llm.translateSecondTarget === translateTarget
-                    ? { translateSecondTarget: '' }
-                    : {}),
-                })
-              }
-              options={TRANSLATE_LANGS.map(([v, l]) => ({ value: v, label: l }))}
-            />
+          {/* 工作台 Select 与上方「翻译语言」共用同一持久化字段：明示切换会改全局默认，
+              避免用户以为是工作台私有的临时选项（行为不变，只加说明） */}
+          <div className="flex flex-col gap-1">
+            <div className="w-32">
+              <Select
+                value={target}
+                onChange={(translateTarget) =>
+                  set('llm', {
+                    translateTarget,
+                    // 新目标语言与第二目标语言撞车时提示词会退化：同笔提交里清空
+                    ...(cfg.llm.translateSecondTarget === translateTarget
+                      ? { translateSecondTarget: '' }
+                      : {}),
+                  })
+                }
+                options={TRANSLATE_LANGS.map(([v, l]) => ({ value: v, label: l }))}
+              />
+            </div>
+            <span className="text-[10.5px] leading-4 text-slate-600">
+              切换会同步修改全局默认目标语言（听写翻译/划词翻译共用）
+            </span>
           </div>
           {input && (
             <span className="font-mono text-[11px] text-slate-600">
@@ -537,10 +579,19 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
             </Button>
           )}
           {!llmReady && (
-            <span className="text-[11px] leading-4 text-amber-300">
+            <span className="flex flex-wrap items-center gap-1 text-[11px] leading-4 text-amber-300">
               {cfg.translate.engine === 'local'
                 ? '本地模型未下载：请在上方「本地翻译引擎」下载'
-                : 'AI 接口未配置：请先到「AI 优化」页启用并填写'}
+                : 'AI 接口未配置：'}
+              {cfg.translate.engine !== 'local' && (
+                <button
+                  type="button"
+                  onClick={() => navigate('llm')}
+                  className="text-sky-400 underline decoration-sky-400/40 underline-offset-2 transition hover:text-sky-300"
+                >
+                  去 AI 优化页启用并填写 ›
+                </button>
+              )}
             </span>
           )}
         </div>

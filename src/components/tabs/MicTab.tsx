@@ -437,543 +437,565 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
   const hasDji = devices.some((d) => /dji/i.test(d.name));
   const testingNow = fullTesting || quickTesting !== undefined;
 
+  /* 单一巨型 Section 拆为「输入设备 / 测试与诊断 / 增益与 VAD」三张卡：
+     仅 JSX 分组重排，全部 hooks 与逻辑保持原调用顺序不动 */
   return (
-    <Section
-      icon="🎙️"
-      title="麦克风"
-      desc="支持一切系统输入设备：USB / 2.4G 接收器 / 蓝牙 / 内置麦克风，均可单独测试。"
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <Button onClick={refreshDevices}>⟳ 刷新设备</Button>
-        <Button
-          kind="primary"
-          onClick={full}
-          disabled={testingNow}
-        >
-          {fullTesting ? (
-            <>
-              <Spinner size={13} /> 采集中，请说话…
-            </>
-          ) : (
-            '🎤 完整测试（3 秒 · 可试听）'
-          )}
-        </Button>
-        <Button onClick={diagnose} disabled={testingNow || diagnosing}>
-          {diagnosing ? (
-            <>
-              <Spinner size={13} /> 诊断中…
-            </>
-          ) : (
-            '🔧 深度诊断'
-          )}
-        </Button>
-        <Button onClick={scan} disabled={testingNow || scanning}>
-          {scanning ? (
-            <>
-              <Spinner size={13} /> 并发采集中，请说话…
-            </>
-          ) : (
-            '📡 同测全部设备'
-          )}
-        </Button>
-        <span className="text-[11px] text-slate-500">
-          测试对象：{cfg.audio.device ?? '系统默认'}
-        </span>
-      </div>
+    <>
+      <Section
+        icon="🎙️"
+        title="输入设备"
+        desc="支持一切系统输入设备：USB / 2.4G 接收器 / 蓝牙 / 内置麦克风，均可单独测试。"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={refreshDevices}>⟳ 刷新设备</Button>
+          <span className="text-[11px] text-slate-500">
+            插入 USB 麦克风 / 接收器后刷新列表
+          </span>
+        </div>
 
-      {sysVol && (
-        <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
-          <div className="mb-2 flex flex-wrap items-center gap-2 text-[12px] font-medium text-slate-300">
-            🎚 系统输入音量
-            <span className="min-w-0 truncate font-mono text-[10.5px] font-normal text-slate-500">
-              {sysVol.device}
-            </span>
-            {sysVol.muted && (
-              <button
-                type="button"
-                onClick={() => void applySysVol(sysVol.volume, true)}
-                className="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] text-red-300"
-              >
-                ⛔ 静音中 · 点击解除
-              </button>
+        <Field
+          label={`输入设备（${devices.length + 1} 个可选）`}
+          hint="点击卡片选择用于语音输入的设备；每张卡片可单独快测 1.4 秒"
+        >
+          <div className="space-y-2">
+            <DeviceCard
+              name="系统默认"
+              value={null}
+              spec="跟随操作系统当前选择的输入设备"
+              selected={!cfg.audio.device}
+              onSelect={selectDevice}
+              onQuick={quick}
+              testing={quickTesting === null}
+              result={quickResult['']}
+              gainDb={cfg.audio.gainDbByDevice?.[DEFAULT_DEVICE_KEY]}
+            />
+            {devices.map((d) => (
+              <DeviceCard
+                key={d.name}
+                name={d.name}
+                value={d.name}
+                spec={specText(d)}
+                isDefault={d.isDefault}
+                selected={cfg.audio.device === d.name}
+                onSelect={selectDevice}
+                onQuick={quick}
+                testing={quickTesting === d.name}
+                result={quickResult[d.name]}
+                gainDb={cfg.audio.gainDbByDevice?.[d.name]}
+              />
+            ))}
+            {/* 已保存但当前未枚举到的设备（无线接收器休眠/重枚举/刚重启）：
+                置顶展示保留选择，设备就绪后自动恢复，避免看起来像配置丢失 */}
+            {cfg.audio.device &&
+              !devices.some((d) => d.name === cfg.audio.device) && (
+                <DeviceCard
+                  name={cfg.audio.device}
+                  value={cfg.audio.device}
+                  spec="已保存 · 当前未检测到，设备就绪后自动恢复使用（录音会临时走系统默认）"
+                  selected
+                  onSelect={selectDevice}
+                  onQuick={quick}
+                  testing={quickTesting === cfg.audio.device}
+                  gainDb={cfg.audio.gainDbByDevice?.[cfg.audio.device]}
+                />
+              )}
+            {devices.length === 0 && (
+              <div className="rounded-lg border border-dashed border-white/10 py-5 text-center text-xs text-slate-600">
+                未发现其他输入设备，插入 USB 麦克风 / DJI 接收器后点「刷新设备」
+              </div>
             )}
           </div>
+        </Field>
+
+        {hasDji && (
+          <div className="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] px-3.5 py-2.5 text-[11.5px] leading-5 text-amber-200/80">
+            🎧 已检测到 DJI 设备：USB-C 接收器模式为高音质 USB 音频（约 48kHz）；蓝牙模式为通话
+            HFP（8–16kHz 单声道，音质明显下降）。追求识别准确率建议使用接收器，并用「完整测试」对比试听。
+          </div>
+        )}
+      </Section>
+
+      <Section
+        icon="🧪"
+        title="测试与诊断"
+        desc="完整测试（3 秒）可试听回放；深度诊断检查系统权限与输入音量；同测全部设备一次对比所有端点。"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            kind="primary"
+            onClick={full}
+            disabled={testingNow}
+          >
+            {fullTesting ? (
+              <>
+                <Spinner size={13} /> 采集中，请说话…
+              </>
+            ) : (
+              '🎤 完整测试（3 秒 · 可试听）'
+            )}
+          </Button>
+          <Button onClick={diagnose} disabled={testingNow || diagnosing}>
+            {diagnosing ? (
+              <>
+                <Spinner size={13} /> 诊断中…
+              </>
+            ) : (
+              '🔧 深度诊断'
+            )}
+          </Button>
+          <Button onClick={scan} disabled={testingNow || scanning}>
+            {scanning ? (
+              <>
+                <Spinner size={13} /> 并发采集中，请说话…
+              </>
+            ) : (
+              '📡 同测全部设备'
+            )}
+          </Button>
+          <span className="text-[11px] text-slate-500">
+            测试对象：{cfg.audio.device ?? '系统默认'}
+          </span>
+        </div>
+
+        {diagnosing && (
+          <div className="anim-rise rounded-xl border border-sky-500/25 bg-sky-500/[0.07] px-3.5 py-3 text-[12.5px] text-sky-200">
+            <Spinner size={12} /> 正在采集约 2 秒 ——{' '}
+            <b>请现在对着麦克风持续说话</b>，安静环境下测出的「静音」没有参考意义
+          </div>
+        )}
+
+        {diagnosis && !diagnosing && (
+          <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
+            <div className="mb-3 text-[12px] font-medium text-slate-300">
+              🔍 深度诊断结果
+              <span className="ml-2 font-mono text-[10.5px] font-normal text-slate-500">
+                采集 {diagnosis.frames} 帧 · 峰值 {diagnosis.peakPercent.toFixed(1)}%
+              </span>
+            </div>
+            <div className="space-y-1.5 text-[11.5px]">
+              <div className="flex items-center gap-2">
+                <span className="w-28 shrink-0 text-slate-500">系统麦克风权限</span>
+                {isMac && diagnosis.systemPrivacy.toLowerCase() === 'unknown' ? (
+                  <span className="text-slate-400">
+                    macOS 请在 系统设置 → 隐私与安全性 → 麦克风 中确认已允许 SpeakNow
+                  </span>
+                ) : (
+                  <span
+                    className={
+                      diagnosis.systemPrivacy.toLowerCase() === 'deny'
+                        ? 'text-red-400'
+                        : diagnosis.systemPrivacy.toLowerCase() === 'allow'
+                          ? 'text-emerald-400'
+                          : 'text-slate-500'
+                    }
+                  >
+                    {diagnosis.systemPrivacy.toLowerCase() === 'deny'
+                      ? '⛔ 已禁止（这就是无信号的原因）'
+                      : diagnosis.systemPrivacy.toLowerCase() === 'allow'
+                        ? '✅ 允许'
+                        : '❔ 未知'}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-28 shrink-0 text-slate-500">本应用授权</span>
+                {isMac ? (
+                  <span className="text-slate-400">
+                    首次使用时系统会弹窗询问；若曾拒绝，可在 隐私与安全性 → 麦克风 中重新开启
+                  </span>
+                ) : (
+                  <span
+                    className={
+                      diagnosis.appPrivacy.toLowerCase() === 'deny'
+                        ? 'text-red-400'
+                        : diagnosis.appPrivacy.toLowerCase() === 'allow'
+                          ? 'text-emerald-400'
+                          : 'text-slate-500'
+                    }
+                  >
+                    {diagnosis.appPrivacy.toLowerCase() === 'deny'
+                      ? '⛔ 已被单独拒绝'
+                      : diagnosis.appPrivacy.toLowerCase() === 'allow'
+                        ? '✅ 允许'
+                        : '❔ 尚未记录（首次使用时系统会询问）'}
+                  </span>
+                )}
+              </div>
+              {diagnosis.systemVolume != null && (
+                <div className="flex items-center gap-2">
+                  <span className="w-28 shrink-0 text-slate-500">系统输入音量</span>
+                  <span
+                    className={
+                      diagnosis.systemMuted
+                        ? 'text-red-400'
+                        : diagnosis.systemVolume < 20
+                          ? 'text-amber-400'
+                          : 'text-emerald-400'
+                    }
+                  >
+                    {diagnosis.systemMuted
+                      ? `⛔ 静音中（音量 ${diagnosis.systemVolume.toFixed(0)}%）`
+                      : `${diagnosis.systemVolume.toFixed(0)}%${
+                          diagnosis.systemVolume < 20 ? ' ← 过低' : ' ✅'
+                        }`}
+                  </span>
+                </div>
+              )}
+              {diagnosis.channelPeaks.length > 1 && (
+                <div className="flex items-center gap-2">
+                  <span className="w-28 shrink-0 text-slate-500">
+                    声道峰值（{diagnosis.channelPeaks.length} 声道）
+                  </span>
+                  <span className="font-mono text-slate-400">
+                    {diagnosis.channelPeaks
+                      .map((p, i) => `#${i + 1}: ${p.toFixed(0)}%`)
+                      .join('  ')}
+                  </span>
+                </div>
+              )}
+            </div>
+            <div className="mt-3 space-y-1 border-t border-white/[0.06] pt-3 text-[11.5px] leading-5 text-slate-300">
+              {diagnosis.findings.map((f, i) => (
+                <div key={i} className="flex gap-2">
+                  <span className="text-sky-400">·</span>
+                  <span>{f}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button kind="primary" onClick={() => void openMicSettings()}>
+                打开{isMac ? 'macOS' : 'Windows'}麦克风设置
+              </Button>
+              <Button onClick={diagnose}>重新诊断</Button>
+            </div>
+          </div>
+        )}
+
+        {scanning && (
+          <div className="anim-rise rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
+            <div className="mb-3 flex items-center gap-2 text-[12px] font-medium text-slate-300">
+              <Spinner size={13} /> 所有输入设备正在同时采集
+              <span className="animate-pulse text-sky-400">请现在持续说话…</span>
+            </div>
+            <AllLiveBars />
+          </div>
+        )}
+
+        {scanRows && !scanning && (
+          <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
+            <div className="mb-3 text-[12px] font-medium text-slate-300">
+              📡 全设备同时测试结果
+              <span className="ml-2 text-[10.5px] font-normal text-slate-500">
+                绿色 = 有信号，就是你在说话的麦克风；可一键选用
+              </span>
+            </div>
+            <div className="space-y-2">
+              {[...scanRows]
+                .sort((a, b) => b.peakPercent - a.peakPercent)
+                .map((row, idx) => {
+                  const best = row.peakPercent > 5;
+                  const isTop = best && idx === 0;
+                  return (
+                    <div
+                      key={row.name}
+                      className={`flex flex-wrap items-center gap-2.5 rounded-lg border px-3 py-2 ${
+                        isTop
+                          ? 'border-emerald-500/40 bg-emerald-500/[0.08]'
+                          : best
+                            ? 'border-emerald-500/25 bg-emerald-500/[0.05]'
+                            : 'border-white/[0.05]'
+                      }`}
+                    >
+                      <span className="min-w-0 flex-1 truncate text-[12.5px] text-slate-200">
+                        {isTop && <span className="mr-1.5">🏆</span>}
+                        {row.name}
+                        {row.isDefault && (
+                          <span className="ml-2 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 text-[9.5px] text-emerald-300">
+                            系统默认
+                          </span>
+                        )}
+                        {isTop && cfg.audio.device !== row.name && (
+                          <span className="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9.5px] text-amber-300">
+                            建议选用
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-mono text-[10.5px] text-slate-500">
+                        {fmtRate(row.sampleRate)}
+                        {row.channels ? ` · ${row.channels}ch` : ''}
+                      </span>
+                      <span
+                        title={row.error ?? undefined}
+                        className={`w-28 shrink-0 font-mono text-[11px] ${
+                          !row.ok
+                            ? 'text-red-400'
+                            : row.peakPercent > 5
+                              ? 'text-emerald-400'
+                              : row.peakPercent > 0.5
+                                ? 'text-amber-400'
+                                : 'text-slate-600'
+                        }`}
+                      >
+                        {!row.ok
+                          ? '无法打开'
+                          : row.peakPercent > 5
+                            ? `● 峰值 ${row.peakPercent.toFixed(0)}%`
+                            : `峰值 ${row.peakPercent.toFixed(1)}%`}
+                      </span>
+                      {row.ok && (
+                        <button
+                          type="button"
+                          onClick={() => selectDevice(row.name)}
+                          className={`shrink-0 rounded-md px-2 py-1 text-[11px] transition ${
+                            isTop
+                              ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                              : 'text-sky-400 hover:bg-sky-500/10'
+                          }`}
+                        >
+                          选用
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
+            {scanRows.every((r) => !r.ok || r.peakPercent < 3) && (
+              <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2.5 text-[11.5px] leading-5 text-amber-200/90">
+                所有设备都没有听到声音 → 问题在系统/硬件层，与应用无关。按顺序检查：
+                ① 耳机麦克风杆是否插紧、有没有物理静音开关；② 2.4G 接收器是否插在本机且未被其他电脑占用；
+                ③ Windows 设置 → 系统 → 声音 → 输入，对着系统自带的「测试麦克风」条说话确认系统层有没有信号；
+                ④ 重插接收器或重启 Armoury Crate / 声卡驱动面板后再试。
+              </div>
+            )}
+          </div>
+        )}
+
+        {(fullTesting || quickTesting !== undefined) && (
+          <div className="anim-rise rounded-xl border border-sky-500/20 bg-sky-500/[0.05] px-3.5 py-3">
+            <LiveBars />
+            <div className="mt-1.5 text-center text-[11px] text-slate-400">
+              正在采集实时电平，对着选定的麦克风说几句话
+            </div>
+          </div>
+        )}
+
+        {fullResult && !fullTesting && (
+          <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
+            <div className="mb-3 text-[12px] font-medium text-slate-300">
+              📊 {cfg.audio.device ?? '系统默认'} · 测试结果
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <LevelBar value={fullResult.avgLevel} label="平均电平" />
+              <LevelBar value={fullResult.peakLevel} label="峰值电平" />
+            </div>
+            {fullResult.avgLevel < 3 && (
+              <div className="mt-2 rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-200/90">
+                信号过弱，按顺序排查：
+                <br />
+                1. 点下方「🎯 自动校准增益」——多数无线耳机只需软件增益即可解决
+                <br />
+                {isMac ? (
+                  <>
+                    2. 系统设置 → 声音 → 输入：把输入音量拉到 80–100
+                    <br />
+                    3. 系统设置 → 隐私与安全性 → 麦克风：确认允许 SpeakNow
+                    <br />
+                    4. 确认耳机没有硬件静音（如麦克风孔/线控开关）
+                  </>
+                ) : (
+                  <>
+                    2. Windows 设置 → 系统 → 声音 → 输入：把输入音量拉到 80–100
+                    <br />
+                    3. Windows 设置 → 隐私和安全性 → 麦克风：允许桌面应用访问
+                    <br />
+                    4. 确认耳机没有硬件静音（如麦克风孔/线控开关）
+                  </>
+                )}
+              </div>
+            )}
+            {fullResult.wavBase64 && (
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <Button onClick={play} disabled={playing}>
+                  {playing ? '▶ 播放中…' : '▶ 试听刚才的录音'}
+                </Button>
+                <span className="text-[11px] text-slate-500">
+                  听不清 / 有底噪？优先用 USB 接收器，或调高发射器增益
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+      </Section>
+
+      <Section
+        icon="🎚️"
+        title="增益与 VAD"
+        desc="系统音量与驱动硬件增益治本，软件增益按设备记忆补偿；VAD 静音自动结束录音。"
+      >
+        {sysVol && (
+          <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-[12px] font-medium text-slate-300">
+              🎚 系统输入音量
+              <span className="min-w-0 truncate font-mono text-[10.5px] font-normal text-slate-500">
+                {sysVol.device}
+              </span>
+              {sysVol.muted && (
+                <button
+                  type="button"
+                  onClick={() => void applySysVol(sysVol.volume, true)}
+                  className="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] text-red-300"
+                >
+                  ⛔ 静音中 · 点击解除
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={sysVol.volume}
+                onChange={(e) => void applySysVol(Number(e.target.value))}
+                className="min-w-0 flex-1"
+              />
+              <span className="w-12 shrink-0 text-right font-mono text-xs tabular-nums text-sky-300">
+                {sysVol.volume.toFixed(0)}%
+              </span>
+              <Button onClick={() => void applySysVol(85, true)}>设为 85%</Button>
+            </div>
+            <div className="mt-1.5 text-[11px] text-slate-500">
+              直接写入 Windows 端点音量，拖动即时生效（无需保存）
+            </div>
+          </div>
+        )}
+
+        {hwLevels && hwLevels.length > 0 && (
+          <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
+            <div className="mb-2 text-[12px] font-medium text-slate-300">
+              🎚 驱动硬件增益（dB）
+              <span className="ml-2 text-[10.5px] font-normal text-slate-500">
+                治本方案：在驱动层拉高信号，之后软件增益可调回 0
+              </span>
+            </div>
+            <div className="space-y-3">
+              {hwLevels.map((l) => (
+                <div key={l.name} className="flex items-center gap-3">
+                  <span
+                    className="w-36 shrink-0 truncate text-[11.5px] text-slate-400"
+                    title={l.name}
+                  >
+                    {/boost|加强/i.test(l.name) && '⚡ '}
+                    {l.name}
+                  </span>
+                  <input
+                    type="range"
+                    min={l.minDb}
+                    max={l.maxDb}
+                    step={Math.max(l.stepDb, 0.5)}
+                    value={l.curDb}
+                    onChange={(e) => void applyHwLevel(l, Number(e.target.value))}
+                    className="min-w-0 flex-1"
+                  />
+                  <span className="w-16 shrink-0 text-right font-mono text-xs tabular-nums text-sky-300">
+                    {l.curDb.toFixed(1)}dB
+                  </span>
+                  <span className="w-20 shrink-0 text-right font-mono text-[10px] text-slate-500">
+                    {l.minDb.toFixed(0)}~{l.maxDb.toFixed(0)}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 text-[11px] text-slate-500">
+              立即写入驱动（无需保存）；「Mic Boost / 麦克风加强」类控件效果最明显
+            </div>
+          </div>
+        )}
+
+        {hwLevels && hwLevels.length === 0 && (
+          <div className="rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3 text-[11.5px] leading-5 text-slate-400">
+            该设备驱动未暴露硬件 dB 增益（USB / 无线耳机普遍如此）——用上方{' '}
+            <b className="text-slate-300">软件增益</b>
+            补偿即可，效果等同。游戏耳机也可在 Armoury Crate / 厂商面板里调「麦克风音量/增益」。
+          </div>
+        )}
+
+        <Field
+          label={`麦克风增益（软件）· ${cfg.audio.device ?? '系统默认'}：${cfg.audio.gainDb.toFixed(
+            1,
+          )} dB / 上限 45dB`}
+          hint="每个设备独立记忆：切换麦克风自动换入对应增益。原始信号弱（无线耳机常见）时拉高；信号峰值到 40–70% 即可，过大可能放大底噪。增益本身不损失音质（上限内自动防削波）"
+        >
           <div className="flex items-center gap-3">
             <input
               type="range"
               min={0}
-              max={100}
-              step={1}
-              value={sysVol.volume}
-              onChange={(e) => void applySysVol(Number(e.target.value))}
+              max={45}
+              step={0.5}
+              value={cfg.audio.gainDb}
+              onChange={(e) => setGainDb(Number(e.target.value))}
               className="min-w-0 flex-1"
             />
-            <span className="w-12 shrink-0 text-right font-mono text-xs tabular-nums text-sky-300">
-              {sysVol.volume.toFixed(0)}%
-            </span>
-            <Button onClick={() => void applySysVol(85, true)}>设为 85%</Button>
-          </div>
-          <div className="mt-1.5 text-[11px] text-slate-500">
-            直接写入 Windows 端点音量，拖动即时生效（无需保存）
-          </div>
-        </div>
-      )}
-
-      {hwLevels && hwLevels.length > 0 && (
-        <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
-          <div className="mb-2 text-[12px] font-medium text-slate-300">
-            🎚 驱动硬件增益（dB）
-            <span className="ml-2 text-[10.5px] font-normal text-slate-500">
-              治本方案：在驱动层拉高信号，之后软件增益可调回 0
-            </span>
-          </div>
-          <div className="space-y-3">
-            {hwLevels.map((l) => (
-              <div key={l.name} className="flex items-center gap-3">
-                <span
-                  className="w-36 shrink-0 truncate text-[11.5px] text-slate-400"
-                  title={l.name}
-                >
-                  {/boost|加强/i.test(l.name) && '⚡ '}
-                  {l.name}
-                </span>
-                <input
-                  type="range"
-                  min={l.minDb}
-                  max={l.maxDb}
-                  step={Math.max(l.stepDb, 0.5)}
-                  value={l.curDb}
-                  onChange={(e) => void applyHwLevel(l, Number(e.target.value))}
-                  className="min-w-0 flex-1"
-                />
-                <span className="w-16 shrink-0 text-right font-mono text-xs tabular-nums text-sky-300">
-                  {l.curDb.toFixed(1)}dB
-                </span>
-                <span className="w-20 shrink-0 text-right font-mono text-[10px] text-slate-500">
-                  {l.minDb.toFixed(0)}~{l.maxDb.toFixed(0)}
-                </span>
-              </div>
-            ))}
-          </div>
-          <div className="mt-1.5 text-[11px] text-slate-500">
-            立即写入驱动（无需保存）；「Mic Boost / 麦克风加强」类控件效果最明显
-          </div>
-        </div>
-      )}
-
-      {hwLevels && hwLevels.length === 0 && (
-        <div className="rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3 text-[11.5px] leading-5 text-slate-400">
-          该设备驱动未暴露硬件 dB 增益（USB / 无线耳机普遍如此）——用上方{' '}
-          <b className="text-slate-300">软件增益</b>
-          补偿即可，效果等同。游戏耳机也可在 Armoury Crate / 厂商面板里调「麦克风音量/增益」。
-        </div>
-      )}
-
-      {diagnosing && (
-        <div className="anim-rise rounded-xl border border-sky-500/25 bg-sky-500/[0.07] px-3.5 py-3 text-[12.5px] text-sky-200">
-          <Spinner size={12} /> 正在采集约 2 秒 ——{' '}
-          <b>请现在对着麦克风持续说话</b>，安静环境下测出的「静音」没有参考意义
-        </div>
-      )}
-
-      {diagnosis && !diagnosing && (
-        <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
-          <div className="mb-3 text-[12px] font-medium text-slate-300">
-            🔍 深度诊断结果
-            <span className="ml-2 font-mono text-[10.5px] font-normal text-slate-500">
-              采集 {diagnosis.frames} 帧 · 峰值 {diagnosis.peakPercent.toFixed(1)}%
-            </span>
-          </div>
-          <div className="space-y-1.5 text-[11.5px]">
-            <div className="flex items-center gap-2">
-              <span className="w-28 shrink-0 text-slate-500">系统麦克风权限</span>
-              {isMac && diagnosis.systemPrivacy.toLowerCase() === 'unknown' ? (
-                <span className="text-slate-400">
-                  macOS 请在 系统设置 → 隐私与安全性 → 麦克风 中确认已允许 SpeakNow
-                </span>
+            <Button onClick={calibrate} disabled={calibrating}>
+              {calibrating ? (
+                <>
+                  <Spinner size={13} /> 录制中…
+                </>
               ) : (
-                <span
-                  className={
-                    diagnosis.systemPrivacy.toLowerCase() === 'deny'
-                      ? 'text-red-400'
-                      : diagnosis.systemPrivacy.toLowerCase() === 'allow'
-                        ? 'text-emerald-400'
-                        : 'text-slate-500'
-                  }
-                >
-                  {diagnosis.systemPrivacy.toLowerCase() === 'deny'
-                    ? '⛔ 已禁止（这就是无信号的原因）'
-                    : diagnosis.systemPrivacy.toLowerCase() === 'allow'
-                      ? '✅ 允许'
-                      : '❔ 未知'}
-                </span>
+                '🎯 自动校准'
               )}
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-28 shrink-0 text-slate-500">本应用授权</span>
-              {isMac ? (
-                <span className="text-slate-400">
-                  首次使用时系统会弹窗询问；若曾拒绝，可在 隐私与安全性 → 麦克风 中重新开启
-                </span>
-              ) : (
-                <span
-                  className={
-                    diagnosis.appPrivacy.toLowerCase() === 'deny'
-                      ? 'text-red-400'
-                      : diagnosis.appPrivacy.toLowerCase() === 'allow'
-                        ? 'text-emerald-400'
-                        : 'text-slate-500'
-                  }
-                >
-                  {diagnosis.appPrivacy.toLowerCase() === 'deny'
-                    ? '⛔ 已被单独拒绝'
-                    : diagnosis.appPrivacy.toLowerCase() === 'allow'
-                      ? '✅ 允许'
-                      : '❔ 尚未记录（首次使用时系统会询问）'}
-                </span>
-              )}
-            </div>
-            {diagnosis.systemVolume != null && (
-              <div className="flex items-center gap-2">
-                <span className="w-28 shrink-0 text-slate-500">系统输入音量</span>
-                <span
-                  className={
-                    diagnosis.systemMuted
-                      ? 'text-red-400'
-                      : diagnosis.systemVolume < 20
-                        ? 'text-amber-400'
-                        : 'text-emerald-400'
-                  }
-                >
-                  {diagnosis.systemMuted
-                    ? `⛔ 静音中（音量 ${diagnosis.systemVolume.toFixed(0)}%）`
-                    : `${diagnosis.systemVolume.toFixed(0)}%${
-                        diagnosis.systemVolume < 20 ? ' ← 过低' : ' ✅'
-                      }`}
-                </span>
-              </div>
-            )}
-            {diagnosis.channelPeaks.length > 1 && (
-              <div className="flex items-center gap-2">
-                <span className="w-28 shrink-0 text-slate-500">
-                  声道峰值（{diagnosis.channelPeaks.length} 声道）
-                </span>
-                <span className="font-mono text-slate-400">
-                  {diagnosis.channelPeaks
-                    .map((p, i) => `#${i + 1}: ${p.toFixed(0)}%`)
-                    .join('  ')}
-                </span>
-              </div>
-            )}
-          </div>
-          <div className="mt-3 space-y-1 border-t border-white/[0.06] pt-3 text-[11.5px] leading-5 text-slate-300">
-            {diagnosis.findings.map((f, i) => (
-              <div key={i} className="flex gap-2">
-                <span className="text-sky-400">·</span>
-                <span>{f}</span>
-              </div>
-            ))}
-          </div>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Button kind="primary" onClick={() => void openMicSettings()}>
-              打开{isMac ? 'macOS' : 'Windows'}麦克风设置
             </Button>
-            <Button onClick={diagnose}>重新诊断</Button>
           </div>
-        </div>
-      )}
+          <div className="mt-1.5 text-[11px] leading-5 text-slate-500">
+            校准方式：对麦克风正常说几句话（2.6 秒），自动将峰值校准到 ~60%，结果按当前设备记忆
+          </div>
+        </Field>
 
-      {scanning && (
-        <div className="anim-rise rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
-          <div className="mb-3 flex items-center gap-2 text-[12px] font-medium text-slate-300">
-            <Spinner size={13} /> 所有输入设备正在同时采集
-            <span className="animate-pulse text-sky-400">请现在持续说话…</span>
-          </div>
-          <AllLiveBars />
-        </div>
-      )}
+        <Toggle
+          checked={cfg.audio.autoGain !== false}
+          onChange={(autoGain) => set('audio', { autoGain })}
+          label="录音时自动增益（AGC）"
+          desc="输入过小且确有语音时自动提升、接近削波时回落；学到的增益按设备记忆，下次录音直接生效，不再重复爬升"
+        />
 
-      {scanRows && !scanning && (
-        <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
-          <div className="mb-3 text-[12px] font-medium text-slate-300">
-            📡 全设备同时测试结果
-            <span className="ml-2 text-[10.5px] font-normal text-slate-500">
-              绿色 = 有信号，就是你在说话的麦克风；可一键选用
-            </span>
-          </div>
-          <div className="space-y-2">
-            {[...scanRows]
-              .sort((a, b) => b.peakPercent - a.peakPercent)
-              .map((row, idx) => {
-                const best = row.peakPercent > 5;
-                const isTop = best && idx === 0;
-                return (
-                  <div
-                    key={row.name}
-                    className={`flex flex-wrap items-center gap-2.5 rounded-lg border px-3 py-2 ${
-                      isTop
-                        ? 'border-emerald-500/40 bg-emerald-500/[0.08]'
-                        : best
-                          ? 'border-emerald-500/25 bg-emerald-500/[0.05]'
-                          : 'border-white/[0.05]'
-                    }`}
-                  >
-                    <span className="min-w-0 flex-1 truncate text-[12.5px] text-slate-200">
-                      {isTop && <span className="mr-1.5">🏆</span>}
-                      {row.name}
-                      {row.isDefault && (
-                        <span className="ml-2 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 text-[9.5px] text-emerald-300">
-                          系统默认
-                        </span>
-                      )}
-                      {isTop && cfg.audio.device !== row.name && (
-                        <span className="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9.5px] text-amber-300">
-                          建议选用
-                        </span>
-                      )}
-                    </span>
-                    <span className="font-mono text-[10.5px] text-slate-500">
-                      {fmtRate(row.sampleRate)}
-                      {row.channels ? ` · ${row.channels}ch` : ''}
-                    </span>
-                    <span
-                      title={row.error ?? undefined}
-                      className={`w-28 shrink-0 font-mono text-[11px] ${
-                        !row.ok
-                          ? 'text-red-400'
-                          : row.peakPercent > 5
-                            ? 'text-emerald-400'
-                            : row.peakPercent > 0.5
-                              ? 'text-amber-400'
-                              : 'text-slate-600'
-                      }`}
-                    >
-                      {!row.ok
-                        ? '无法打开'
-                        : row.peakPercent > 5
-                          ? `● 峰值 ${row.peakPercent.toFixed(0)}%`
-                          : `峰值 ${row.peakPercent.toFixed(1)}%`}
-                    </span>
-                    {row.ok && (
-                      <button
-                        type="button"
-                        onClick={() => selectDevice(row.name)}
-                        className={`shrink-0 rounded-md px-2 py-1 text-[11px] transition ${
-                          isTop
-                            ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
-                            : 'text-sky-400 hover:bg-sky-500/10'
-                        }`}
-                      >
-                        选用
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-          </div>
-          {scanRows.every((r) => !r.ok || r.peakPercent < 3) && (
-            <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2.5 text-[11.5px] leading-5 text-amber-200/90">
-              所有设备都没有听到声音 → 问题在系统/硬件层，与应用无关。按顺序检查：
-              ① 耳机麦克风杆是否插紧、有没有物理静音开关；② 2.4G 接收器是否插在本机且未被其他电脑占用；
-              ③ Windows 设置 → 系统 → 声音 → 输入，对着系统自带的「测试麦克风」条说话确认系统层有没有信号；
-              ④ 重插接收器或重启 Armoury Crate / 声卡驱动面板后再试。
-            </div>
-          )}
-        </div>
-      )}
-
-      {(fullTesting || quickTesting !== undefined) && (
-        <div className="anim-rise rounded-xl border border-sky-500/20 bg-sky-500/[0.05] px-3.5 py-3">
-          <LiveBars />
-          <div className="mt-1.5 text-center text-[11px] text-slate-400">
-            正在采集实时电平，对着选定的麦克风说几句话
-          </div>
-        </div>
-      )}
-
-      {fullResult && !fullTesting && (
-        <div className="anim-rise rounded-xl border border-white/[0.06] bg-black/20 p-4">
-          <div className="mb-3 text-[12px] font-medium text-slate-300">
-            📊 {cfg.audio.device ?? '系统默认'} · 测试结果
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <LevelBar value={fullResult.avgLevel} label="平均电平" />
-            <LevelBar value={fullResult.peakLevel} label="峰值电平" />
-          </div>
-          {fullResult.avgLevel < 3 && (
-            <div className="mt-2 rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-200/90">
-              信号过弱，按顺序排查：
-              <br />
-              1. 点下方「🎯 自动校准增益」——多数无线耳机只需软件增益即可解决
-              <br />
-              {isMac ? (
-                <>
-                  2. 系统设置 → 声音 → 输入：把输入音量拉到 80–100
-                  <br />
-                  3. 系统设置 → 隐私与安全性 → 麦克风：确认允许 SpeakNow
-                  <br />
-                  4. 确认耳机没有硬件静音（如麦克风孔/线控开关）
-                </>
-              ) : (
-                <>
-                  2. Windows 设置 → 系统 → 声音 → 输入：把输入音量拉到 80–100
-                  <br />
-                  3. Windows 设置 → 隐私和安全性 → 麦克风：允许桌面应用访问
-                  <br />
-                  4. 确认耳机没有硬件静音（如麦克风孔/线控开关）
-                </>
-              )}
-            </div>
-          )}
-          {fullResult.wavBase64 && (
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <Button onClick={play} disabled={playing}>
-                {playing ? '▶ 播放中…' : '▶ 试听刚才的录音'}
-              </Button>
-              <span className="text-[11px] text-slate-500">
-                听不清 / 有底噪？优先用 USB 接收器，或调高发射器增益
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-
-      <Field
-        label={`输入设备（${devices.length + 1} 个可选）`}
-        hint="点击卡片选择用于语音输入的设备；每张卡片可单独快测 1.4 秒"
-      >
-        <div className="space-y-2">
-          <DeviceCard
-            name="系统默认"
-            value={null}
-            spec="跟随操作系统当前选择的输入设备"
-            selected={!cfg.audio.device}
-            onSelect={selectDevice}
-            onQuick={quick}
-            testing={quickTesting === null}
-            result={quickResult['']}
-            gainDb={cfg.audio.gainDbByDevice?.[DEFAULT_DEVICE_KEY]}
-          />
-          {devices.map((d) => (
-            <DeviceCard
-              key={d.name}
-              name={d.name}
-              value={d.name}
-              spec={specText(d)}
-              isDefault={d.isDefault}
-              selected={cfg.audio.device === d.name}
-              onSelect={selectDevice}
-              onQuick={quick}
-              testing={quickTesting === d.name}
-              result={quickResult[d.name]}
-              gainDb={cfg.audio.gainDbByDevice?.[d.name]}
-            />
-          ))}
-          {/* 已保存但当前未枚举到的设备（无线接收器休眠/重枚举/刚重启）：
-              置顶展示保留选择，设备就绪后自动恢复，避免看起来像配置丢失 */}
-          {cfg.audio.device &&
-            !devices.some((d) => d.name === cfg.audio.device) && (
-              <DeviceCard
-                name={cfg.audio.device}
-                value={cfg.audio.device}
-                spec="已保存 · 当前未检测到，设备就绪后自动恢复使用（录音会临时走系统默认）"
-                selected
-                onSelect={selectDevice}
-                onQuick={quick}
-                testing={quickTesting === cfg.audio.device}
-                gainDb={cfg.audio.gainDbByDevice?.[cfg.audio.device]}
+        <Toggle
+          checked={cfg.audio.vadEnabled}
+          onChange={(vadEnabled) => set('audio', { vadEnabled })}
+          label="静音自动结束（VAD）"
+          desc="检测到停止说话一段时间后自动结束录音，无需再按快捷键"
+        />
+        {cfg.audio.vadEnabled && (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field label={`静音判定时长：${(cfg.audio.vadSilenceMs / 1000).toFixed(1)} 秒`}>
+              <input
+                type="range"
+                min={600}
+                max={4000}
+                step={100}
+                value={cfg.audio.vadSilenceMs}
+                onChange={(e) => set('audio', { vadSilenceMs: Number(e.target.value) })}
+                className="w-full"
               />
-            )}
-          {devices.length === 0 && (
-            <div className="rounded-lg border border-dashed border-white/10 py-5 text-center text-xs text-slate-600">
-              未发现其他输入设备，插入 USB 麦克风 / DJI 接收器后点「刷新设备」
-            </div>
-          )}
-        </div>
-      </Field>
-
-      <Field
-        label={`麦克风增益（软件）· ${cfg.audio.device ?? '系统默认'}：${cfg.audio.gainDb.toFixed(
-          1,
-        )} dB / 上限 45dB`}
-        hint="每个设备独立记忆：切换麦克风自动换入对应增益。原始信号弱（无线耳机常见）时拉高；信号峰值到 40–70% 即可，过大可能放大底噪。增益本身不损失音质（上限内自动防削波）"
-      >
-        <div className="flex items-center gap-3">
-          <input
-            type="range"
-            min={0}
-            max={45}
-            step={0.5}
-            value={cfg.audio.gainDb}
-            onChange={(e) => setGainDb(Number(e.target.value))}
-            className="min-w-0 flex-1"
-          />
-          <Button onClick={calibrate} disabled={calibrating}>
-            {calibrating ? (
-              <>
-                <Spinner size={13} /> 录制中…
-              </>
-            ) : (
-              '🎯 自动校准'
-            )}
-          </Button>
-        </div>
-        <div className="mt-1.5 text-[11px] leading-5 text-slate-500">
-          校准方式：对麦克风正常说几句话（2.6 秒），自动将峰值校准到 ~60%，结果按当前设备记忆
-        </div>
-      </Field>
-
-      <Toggle
-        checked={cfg.audio.autoGain !== false}
-        onChange={(autoGain) => set('audio', { autoGain })}
-        label="录音时自动增益（AGC）"
-        desc="输入过小且确有语音时自动提升、接近削波时回落；学到的增益按设备记忆，下次录音直接生效，不再重复爬升"
-      />
-
-      {hasDji && (
-        <div className="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] px-3.5 py-2.5 text-[11.5px] leading-5 text-amber-200/80">
-          🎧 已检测到 DJI 设备：USB-C 接收器模式为高音质 USB 音频（约 48kHz）；蓝牙模式为通话
-          HFP（8–16kHz 单声道，音质明显下降）。追求识别准确率建议使用接收器，并用「完整测试」对比试听。
-        </div>
-      )}
-
-      <Toggle
-        checked={cfg.audio.vadEnabled}
-        onChange={(vadEnabled) => set('audio', { vadEnabled })}
-        label="静音自动结束（VAD）"
-        desc="检测到停止说话一段时间后自动结束录音，无需再按快捷键"
-      />
-      {cfg.audio.vadEnabled && (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field label={`静音判定时长：${(cfg.audio.vadSilenceMs / 1000).toFixed(1)} 秒`}>
-            <input
-              type="range"
-              min={600}
-              max={4000}
-              step={100}
-              value={cfg.audio.vadSilenceMs}
-              onChange={(e) => set('audio', { vadSilenceMs: Number(e.target.value) })}
-              className="w-full"
-            />
-          </Field>
-          <Field
-            label={`触发灵敏度：${(cfg.audio.vadThreshold * 1000).toFixed(0)}`}
-            hint="数值越低越灵敏；环境嘈杂时调高"
-          >
-            <input
-              type="range"
-              min={3}
-              max={80}
-              step={1}
-              value={Math.round(cfg.audio.vadThreshold * 1000)}
-              onChange={(e) =>
-                set('audio', { vadThreshold: Number(e.target.value) / 1000 })
-              }
-              className="w-full"
-            />
-          </Field>
-        </div>
-      )}
-    </Section>
+            </Field>
+            <Field
+              label={`触发灵敏度：${(cfg.audio.vadThreshold * 1000).toFixed(0)}`}
+              hint="数值越低越灵敏；环境嘈杂时调高"
+            >
+              <input
+                type="range"
+                min={3}
+                max={80}
+                step={1}
+                value={Math.round(cfg.audio.vadThreshold * 1000)}
+                onChange={(e) =>
+                  set('audio', { vadThreshold: Number(e.target.value) / 1000 })
+                }
+                className="w-full"
+              />
+            </Field>
+          </div>
+        )}
+      </Section>
+    </>
   );
 }

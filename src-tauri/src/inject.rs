@@ -429,6 +429,15 @@ pub fn copy_only(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// 与听写粘贴互斥的剪贴板写入（翻译 auto_copy 等非粘贴路径专用）：
+/// copy_only 不进 PASTE_LOCK，会挤进听写「写剪贴板 → 发粘贴键」的间隙，
+/// 让用户粘出的是译文而不是听写结果。持锁可能等待数秒（粘贴含说话
+/// 探测），调用方在异步上下文里应放 spawn_blocking 执行
+pub fn copy_only_locked(text: &str) -> Result<()> {
+    let _lock = PASTE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    copy_only(text)
+}
+
 /// 把文字输入到当前焦点窗口（无条件执行；用户在预览编辑里点「输入」等场景使用）
 pub fn paste_text(cfg: &OutputConfig, text: &str) -> Result<()> {
     match paste_text_checked(cfg, text, Arc::new(|| false), None, None, false) {
@@ -458,7 +467,11 @@ pub fn paste_text_checked(
     // 「被新录音取代」：放弃自动输入，但结果留在剪贴板供手动粘贴（右键/Ctrl+V）
     macro_rules! skip {
         () => {{
-            let _ = copy_only(text);
+            // 退路复制失败至少留下日志：调用方会提示「已复制」，
+            // 静默吞错会让提示与事实不符
+            if let Err(e) = copy_only(text) {
+                eprintln!("[speaknow] 被取代后的退路复制失败: {e:#}");
+            }
             return Ok(false);
         }};
     }

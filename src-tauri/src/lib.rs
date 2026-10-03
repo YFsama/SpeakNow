@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod ccc;
 mod config;
 mod display_api;
 mod events;
@@ -147,6 +148,8 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
         let h = app.clone();
         tauri::async_runtime::spawn_blocking(move || qwen_asr::shutdown(&h));
     }
+    // Ctrl+C+C 双击复制即翻译：钩子首次开启后常驻，这里只同步开关
+    ccc::apply(&app, &config);
     // 托盘快切菜单展示当前模式/翻译目标：设置页改动后同步重建。
     // 经独立线程派发到主线程——不等待主线程空闲，避免保存被卡
     if config.llm.mode != old.llm.mode || config.llm.translate_target != old.llm.translate_target {
@@ -233,6 +236,13 @@ fn open_config_dir(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = std::process::Command::new("open");
+        c.arg(&dir);
+        c
+    };
+    // Linux 等平台缺此分支会导致编译失败（cmd 未定义），统一走 xdg-open
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
         c.arg(&dir);
         c
     };
@@ -814,9 +824,15 @@ fn delete_history(app: AppHandle, ts: i64) {
     history::delete(&app, ts);
 }
 
-/// 用当前 AI 设置重新优化某条历史记录的原始转写
+/// 用当前 AI 设置重新优化某条历史记录的原始转写。
+/// mode 可选：本次覆盖使用的模式（correct / polish / prompt / translate），
+/// 只影响这一次调用、不落盘改全局配置。
 #[tauri::command]
-async fn regenerate(app: AppHandle, ts: i64) -> Result<history::HistoryItem, String> {
+async fn regenerate(
+    app: AppHandle,
+    ts: i64,
+    mode: Option<String>,
+) -> Result<history::HistoryItem, String> {
     let cfg = app
         .state::<Ctx>()
         .config
@@ -824,9 +840,15 @@ async fn regenerate(app: AppHandle, ts: i64) -> Result<history::HistoryItem, Str
         .clone()
         .unwrap_or_default();
     // 展开凭据组引用后再判断可用性（内联字段可能为空、凭据在 providers 里）
-    let llm_cfg = cfg.resolved_llm();
+    let mut llm_cfg = cfg.resolved_llm();
     if !llm_cfg.enabled || llm_cfg.base_url.trim().is_empty() {
         return Err("AI 优化未启用，请先在「AI 优化」中开启并保存".into());
+    }
+    if let Some(m) = mode.as_deref() {
+        match m {
+            "correct" | "polish" | "prompt" | "translate" => llm_cfg.mode = m.to_string(),
+            _ => return Err(format!("不支持的重优化模式：{m}")),
+        }
     }
     let raw = history::find_raw(&app, ts).ok_or("未找到该条记录")?;
     let text = llm::optimize(&llm_cfg, &raw)
@@ -845,6 +867,13 @@ async fn regenerate(app: AppHandle, ts: i64) -> Result<history::HistoryItem, Str
         .ok_or_else(|| "记录已不存在".into())
 }
 
+/// 手动编辑某条历史的终稿（前端行内编辑保存）。
+/// update_final 内部的 write() 会广播 sn-history-changed，前端列表自动刷新。
+#[tauri::command]
+fn update_history_final(app: AppHandle, ts: i64, final_text: String) -> Result<(), String> {
+    history::update_final(&app, ts, &final_text).ok_or_else(|| "未找到该条记录".into())
+}
+
 #[tauri::command]
 fn copy_text(text: String) -> Result<(), String> {
     inject::copy_only(&text).map_err(|e| format!("{e:#}"))
@@ -853,6 +882,11 @@ fn copy_text(text: String) -> Result<(), String> {
 #[tauri::command]
 fn dismiss_overlay(app: AppHandle) {
     *app.state::<Ctx>().pending_review.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    // Esc 关闭卡片 = 用户放弃本次翻译：作废翻译会话（代数 +1），仍在流式
+    // 读取的翻译立即中止、迟到完成的 auto_copy 也会跳过——否则用户关闭
+    // 卡片后几秒才完成的翻译会用旧译文覆盖这段时间里新复制的内容。
+    // 听写的 run_gen 是另一套代数，不受影响
+    translate::abort_active_session();
     overlay::hide(&app);
     pipeline::emit_status(&app, "idle", "", false);
 }
@@ -884,7 +918,7 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("输入失败：{e:#}"))?;
 
-    history::push(&app, &pending.raw, &text, pending.asr_ms, pending.llm_ms);
+    history::push(&app, &pending.raw, &text, pending.asr_ms, pending.llm_ms, "dictation");
     events::emit(
         &app,
         "sn-result",
@@ -1019,7 +1053,14 @@ fn open_display_page(url: String) -> Result<(), String> {
         c.arg(&url);
         c
     };
-    cmd.spawn().map_err(|e| format!("打开失败：{e}"))?;
+    // Linux 等平台缺此分支会导致编译失败（cmd 未定义），统一走 xdg-open
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(&url);
+        c
+    };
+    cmd.spawn().map_err(|e| format!("打开失败: {e}"))?;
     Ok(())
 }
 
@@ -1118,6 +1159,8 @@ pub fn run() {
             }
             // 剪贴板监听（复制即翻译）：常驻轮询线程，开关由配置每 tick 判定
             translate::ensure_clipboard_watcher(app.handle());
+            // Ctrl+C+C 双击复制即翻译：低级键盘钩子（开关由原子量实时判定）
+            ccc::apply(app.handle(), &cfg);
             if cfg.general.autostart {
                 let _ = apply_autostart(app.handle(), true);
             }
@@ -1219,6 +1262,7 @@ pub fn run() {
             clear_history,
             delete_history,
             regenerate,
+            update_history_final,
             copy_text,
             dismiss_overlay,
             overlay_pin,

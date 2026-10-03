@@ -17,6 +17,52 @@ use crate::config::{Config, TRANSLATE_LANGS};
 /// 任何时刻只有最新一次翻译的 sn-llm-delta 是有效的
 static GEN: AtomicU64 = AtomicU64::new(0);
 
+/// 作废当前翻译会话（Esc 关闭悬浮窗卡片等场景）：代数 +1 后，仍在流式
+/// 读取的会话（superseded 检查 GEN，云端流与本地引擎流共用该谓词）立即
+/// 中止，完成前尚未写入的 auto_copy 也会跳过——否则用户关闭卡片后几秒
+/// 才完成的翻译会用旧译文覆盖窗口期内新复制的内容。
+/// 只动翻译的 GEN；听写的 run_gen 是另一套代数，互不影响
+pub fn abort_active_session() {
+    GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/* ---------- 悬浮窗隐藏倒计时的「翻译卡让位」闸门 ---------- */
+
+/// 听写收尾（finish_status）会在翻译流式进行中重新武装隐藏倒计时（cancel_hide
+/// 只能取消已装填的值，拦不住之后新武装的），把翻译卡连窗一起藏掉。翻译卡
+/// 登场时开启让位窗口，reaper 在窗口内与「悬停钉住」同等待遇暂停计时；翻译
+/// 自己武装驻留倒计时（结果/错误卡）时结束让位。窗口设时间盒上限防泄漏：
+/// 即使某条退出路径漏掉结束让位，最多让位 90s 后隐藏恢复通行。
+static HIDE_GUARD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+const HIDE_GUARD_CAP_MS: u64 = 90_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 翻译会话开始（广播型）：翻译卡登上悬浮窗，隐藏倒计时让位
+pub fn guard_overlay_hide() {
+    HIDE_GUARD_UNTIL_MS.store(
+        now_ms().saturating_add(HIDE_GUARD_CAP_MS),
+        Ordering::SeqCst,
+    );
+}
+
+/// reaper 查询：翻译卡片是否仍在让位窗口内
+pub fn overlay_hide_guarded() -> bool {
+    now_ms() < HIDE_GUARD_UNTIL_MS.load(Ordering::SeqCst)
+}
+
+/// 翻译卡片自己的驻留倒计时：武装即结束让位——结果/错误卡出现后，
+/// 到点隐藏正是期望行为，不能继续挡着
+fn arm_hide(app: &AppHandle, ms: u64) {
+    HIDE_GUARD_UNTIL_MS.store(0, Ordering::SeqCst);
+    crate::pipeline::hide_later(app, ms);
+}
+
 fn current_config(app: &AppHandle) -> Config {
     app.state::<crate::Ctx>()
         .config
@@ -80,6 +126,18 @@ fn blacklist_hit(cfg: &Config) -> Option<String> {
 /// 划词翻译入口（热键 / 托盘 / 手动触发）。阻塞操作（取词含按键模拟与
 /// 剪贴板轮询），调用方须在后台线程执行。
 pub fn translate_selection(app: &AppHandle) {
+    // 听写进行中不取词：模拟 Ctrl+C 会污染剪贴板（听写结果正是靠剪贴板
+    // 粘贴出去的），且悬浮窗此刻由聆听卡占用——与 guard_copied_text 的
+    // 静默守卫语义一致，直接返回不取词、不模拟按键
+    if app
+        .state::<crate::Ctx>()
+        .recording
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return;
+    }
     let cfg = current_config(app);
     if let Err(msg) = engine_ready(app, &cfg) {
         show_translate_error(app, &msg);
@@ -122,12 +180,16 @@ pub fn launch_card(app: &AppHandle, cfg: &Config, text: String) {
 }
 
 fn show_translate_error(app: &AppHandle, message: &str) {
+    // 入口失败（取词失败等）没有新会话可接管卡片：先作废仍在流式的旧会话。
+    // 否则这条无 gen 的错误会先劫持现有卡片，旧会话迟到 result 又把卡片
+    // 翻回完成态，状态来回跳
+    abort_active_session();
     let cfg = current_config(app);
     if cfg.general.show_overlay && !crate::pipeline::suppress_local_overlay(&cfg) {
         crate::overlay::show(app);
     }
     let _ = app.emit("sn-translate-error", serde_json::json!({ "message": message }));
-    crate::pipeline::hide_later(app, 6000);
+    arm_hide(app, 6000);
 }
 
 /// 开启一次带悬浮窗广播的翻译会话（划词入口 / 语言条重译 / 重译按钮）
@@ -160,8 +222,20 @@ async fn session(
     gen: u64,
     announce: bool,
 ) -> Result<String, String> {
+    // 上一张卡片（听写完成 / 上次翻译）遗留的隐藏倒计时若在本会话流式
+    // 进行中到期，会把悬浮窗藏掉并经 idle 状态清掉正在流式的卡片——
+    // 广播型会话开始即取消遗留倒计时，并开启「翻译卡让位」窗口（防听写
+    // 晚到收尾重新武装倒计时）；静默工作台会话不碰悬浮窗，不动它
+    if announce {
+        crate::pipeline::cancel_hide();
+        guard_overlay_hide();
+    }
     // 引擎选择：本地（llama.cpp sidecar，离线）或云端（用户配置的 OpenAI 兼容接口）
-    let mut llm = if cfg.translate.engine == "local" {
+    // macOS 无本地引擎（llama.cpp sidecar 仅 Windows）：旧配置/迁移配置里的
+    // local 档在 mac 上回落云端，避免每次翻译都报「引擎启动失败」。设置页
+    // 「翻译」Tab 打开时前端也会持久化回落并提示一次，这里是未打开页的兜底
+    let engine_local = cfg.translate.engine == "local" && !cfg!(target_os = "macos");
+    let mut llm = if engine_local {
         let h = app.clone();
         let base = tauri::async_runtime::spawn_blocking(move || crate::local_llm::ensure_server(&h))
             .await
@@ -208,8 +282,8 @@ async fn session(
             if sp.values.is_empty() {
                 let msg = format!("识别到{}结构，但没有可翻译的字符串值", sp.kind.label());
                 if announce {
-                    let _ = app.emit("sn-translate-error", serde_json::json!({ "message": msg }));
-                    crate::pipeline::hide_later(&app, 6000);
+                    let _ = app.emit("sn-translate-error", serde_json::json!({ "gen": gen, "message": msg }));
+                    arm_hide(&app, 6000);
                 }
                 return Err(msg);
             }
@@ -234,13 +308,16 @@ async fn session(
         Ok(t) => t,
         Err(e) => {
             if superseded() {
-                // 新翻译 / 新听写已接管悬浮窗：静默退出，卡片由新会话的事件刷新
+                // 会话已被取代（新翻译 / 新听写 / Esc 关闭卡片）：广播带 gen 的
+                // 中止事件让悬挂的旧卡片收尾（前端按 gen 过滤旧会话错误），
+                // 不再静默 return 留下永远转圈的卡片
+                emit_superseded(&app, gen, announce);
                 return Err(format!("翻译中止：{e:#}"));
             }
             let msg = format!("翻译失败：{e:#}");
             if announce {
-                let _ = app.emit("sn-translate-error", serde_json::json!({ "message": msg }));
-                crate::pipeline::hide_later(&app, 6000);
+                let _ = app.emit("sn-translate-error", serde_json::json!({ "gen": gen, "message": msg }));
+                arm_hide(&app, 6000);
             }
             return Err(msg);
         }
@@ -251,15 +328,18 @@ async fn session(
     if out.is_empty() {
         let msg = "AI 未返回译文（思考超限或模型异常），可点「重译」再试".to_string();
         if announce {
-            let _ = app.emit("sn-translate-error", serde_json::json!({ "message": msg }));
-            crate::pipeline::hide_later(&app, 6000);
+            let _ = app.emit("sn-translate-error", serde_json::json!({ "gen": gen, "message": msg }));
+            arm_hide(&app, 6000);
         }
         return Err(msg);
     }
-    let auto_copied = cfg.translate.auto_copy
-        && crate::inject::copy_only(&out).is_ok();
+    let (auto_copied, copy_failed) = if cfg.translate.auto_copy {
+        auto_copy_guarded(gen, &out).await
+    } else {
+        (false, false)
+    };
     // 翻译入历史（原文/译文对照，供回查与再复制；asrMs=0 时前端隐藏识别行）
-    crate::history::push(&app, &text, &out, 0, ms);
+    crate::history::push(&app, &text, &out, 0, ms, "translate");
     if announce {
         let _ = app.emit(
             "sn-translate-result",
@@ -269,16 +349,66 @@ async fn session(
                 "ms": ms,
                 "firstMs": first_ms,
                 "autoCopied": auto_copied,
+                "copyFailed": copy_failed,
             }),
         );
         // 翻译卡片要读：给足驻留时间，悬停钉住时计时自动暂停
-        crate::pipeline::hide_later(&app, 10_000);
+        arm_hide(&app, 10_000);
     }
     crate::trace_pipeline(
         &app,
         &format!("翻译完成：{ms}ms（首字 {first_ms}ms，{}字）", out.chars().count()),
     );
     Ok(out)
+}
+
+/* ---------- 会话收尾与自动复制（普通 / 结构化路径共用） ---------- */
+
+/// 会话被取代时的广播收尾：带 gen 的中止事件让悬挂的旧卡片停止转圈
+/// （前端按 gen 过滤旧会话的错误），静默工作台会话（announce=false）不打扰
+fn emit_superseded(app: &AppHandle, gen: u64, announce: bool) {
+    if announce {
+        let _ = app.emit(
+            "sn-translate-error",
+            serde_json::json!({ "gen": gen, "message": "本次翻译已被新的操作取代" }),
+        );
+    }
+}
+
+/// auto_copy 写剪贴板（云端 / 结构化两条翻译路径共用）：
+/// ① 会话已过期（Esc 关闭卡片 / 新翻译 / 新听写接管）则跳过——用户在等待
+///    期间新复制的内容优先，迟到的译文不得覆盖；
+/// ② 经 PASTE_LOCK 与听写粘贴互斥：裸写可能挤进听写「写剪贴板 → 发粘贴键」
+///    的间隙，让用户粘出译文而不是听写结果（粘贴持锁可达数秒，故放
+///    spawn_blocking，不占住异步运行时线程）。
+/// 返回 (autoCopied, copyFailed)：失败时结果事件带 copyFailed 标记，
+/// 前端可据此让「已复制」提示与事实相符
+async fn auto_copy_guarded(gen: u64, text: &str) -> (bool, bool) {
+    if GEN.load(Ordering::SeqCst) != gen {
+        return (false, false); // 会话已作废：不写剪贴板
+    }
+    let t = text.to_string();
+    // 拿到 PASTE_LOCK 后复查代数：等锁期间（听写粘贴持锁可达数秒）会话可能
+    // 已被 Esc 作废 / 新翻译取代，届时再写就会覆盖用户刚复制的新内容
+    match tauri::async_runtime::spawn_blocking(move || {
+        if GEN.load(Ordering::SeqCst) != gen {
+            return Ok(false); // 等锁期间会话作废：跳过
+        }
+        crate::inject::copy_only_locked(&t).map(|_| true)
+    })
+    .await
+    {
+        Ok(Ok(true)) => (true, false),
+        Ok(Ok(false)) => (false, false),
+        Ok(Err(e)) => {
+            eprintln!("[speaknow] 自动复制译文失败: {e:#}");
+            (false, true)
+        }
+        Err(e) => {
+            eprintln!("[speaknow] 自动复制译文任务异常: {e}");
+            (false, true)
+        }
+    }
 }
 
 /* ---------- 结构化翻译执行（JSON / YAML / 键值：只译值） ---------- */
@@ -309,7 +439,12 @@ async fn translate_structured(
 
     let n = sp.values.len();
     let kind_label = sp.kind.label();
-    let target_name = crate::config::lang_name(&llm.translate_target);
+    // Index-Translate 家族训练侧用中文语言名，命中时批量协议同样换用
+    let target_name = if crate::llm::is_index_translate(&llm.model) {
+        crate::config::lang_name_zh(&llm.translate_target)
+    } else {
+        crate::config::lang_name(&llm.translate_target)
+    };
     crate::trace_pipeline(app, &format!("结构化翻译：{kind_label} · {n} 条文本值"));
 
     let items: Vec<MaskedItem> = sp
@@ -328,6 +463,7 @@ async fn translate_structured(
     let mut translations: Vec<String> = Vec::with_capacity(n);
     for (bi, chunk) in items.chunks(BATCH).enumerate() {
         if superseded() {
+            emit_superseded(app, gen, announce);
             return Err("翻译中止：已被新会话取代".into());
         }
         // 批量协议：借用 custom_prompt 通道注入批量指令（llm 侧用中性系统提示包裹）
@@ -372,15 +508,16 @@ async fn translate_structured(
                         Ok(t) => indiv.push(t),
                         Err(e) => {
                             if superseded() {
+                                emit_superseded(app, gen, announce);
                                 return Err("翻译中止：已被新会话取代".into());
                             }
                             let msg = format!("翻译失败：{e:#}");
                             if announce {
                                 let _ = app.emit(
                                     "sn-translate-error",
-                                    serde_json::json!({ "message": msg }),
+                                    serde_json::json!({ "gen": gen, "message": msg }),
                                 );
-                                crate::pipeline::hide_later(app, 6000);
+                                arm_hide(app, 6000);
                             }
                             return Err(msg);
                         }
@@ -408,8 +545,12 @@ async fn translate_structured(
 
     let out = crate::trans_struct::merge(sp, &translations);
     let ms = t0.elapsed().as_millis() as u64;
-    let auto_copied = auto_copy && crate::inject::copy_only(&out).is_ok();
-    crate::history::push(app, text, &out, 0, ms);
+    let (auto_copied, copy_failed) = if auto_copy {
+        auto_copy_guarded(gen, &out).await
+    } else {
+        (false, false)
+    };
+    crate::history::push(app, text, &out, 0, ms, "translate");
     if announce {
         let _ = app.emit(
             "sn-translate-result",
@@ -419,11 +560,12 @@ async fn translate_structured(
                 "ms": ms,
                 "firstMs": 0,
                 "autoCopied": auto_copied,
+                "copyFailed": copy_failed,
                 "structured": kind_label,
             }),
         );
         // 结构化文件通常较长：给足驻留阅读时间
-        crate::pipeline::hide_later(app, 12_000);
+        arm_hide(app, 12_000);
     }
     crate::trace_pipeline(
         app,
@@ -634,9 +776,66 @@ pub fn ensure_clipboard_watcher(app: &AppHandle) {
     });
 }
 
+/// 剪贴板守卫链：给定刚复制/剪贴板里的原文，判定是否应触发翻译并清洗。
+/// 复制即翻译（轮询）与 Ctrl+C+C（钩子）共用，None = 静默跳过
+fn guard_copied_text(app: &AppHandle, cfg: &Config, raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    // 结构化文件（语言包/配置）放宽上限——只译值本就该整文件处理，卡片可滚动阅读；
+    // 普通 prose 仍交给「输入翻译」工作台
+    let limit = if crate::trans_struct::split(raw).is_some() {
+        60_000
+    } else {
+        4000
+    };
+    if raw.chars().count() > limit {
+        return None;
+    }
+    // 本应用自己写入的（听写输出 / 译文复制 / OCR 自动复制）不触发
+    if crate::inject::last_own_clipboard_text().is_some_and(|own| own == raw) {
+        return None;
+    }
+    // 静默守卫：AI 未配置 / 黑名单应用 / 听写进行中，一律不打扰
+    if engine_ready(app, cfg).is_err() || blacklist_hit(cfg).is_some() {
+        return None;
+    }
+    if app
+        .state::<crate::Ctx>()
+        .recording
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return None;
+    }
+    Some(crate::selection::soft_wrap_join(raw))
+}
+
+/// Ctrl+C+C 双击触发（ccc.rs 工作线程调用）：以触发时刻捕获的剪贴板基线，
+/// 轮询等本次双击复制的新内容真正落盘（Word / 大 PDF 可达秒级，固定延时
+/// 盲读会翻译到上一次复制的内容）再走共享守卫链后弹卡。
+/// 与轮询式「复制即翻译」语义一致，只是由用户显式双击触发
+pub fn translate_clipboard_fresh(app: &AppHandle, baseline: crate::selection::ClipboardBaseline) {
+    let cfg = current_config(app);
+    let Some(raw) = baseline
+        .wait_changed(1200)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        // 1.2s 仍无新内容：双击时可能并无选区或复制被目标应用吞掉——
+        // 静默放弃，只留轻日志，不打扰用户
+        crate::trace_pipeline(app, "Ctrl+C+C：剪贴板未见新内容，放弃本次触发");
+        return;
+    };
+    if let Some(text) = guard_copied_text(app, &cfg, &raw) {
+        crate::trace_pipeline(app, &format!("Ctrl+C+C 触发翻译：{}字", text.chars().count()));
+        launch_card(app, &cfg, text);
+    }
+}
+
 fn clipboard_watch_loop(app: AppHandle) {
     /// 剪贴板里的内容长度上限：超长文本交给「输入翻译」工作台，卡片装不下也容易截断
-    const MAX_CHARS: usize = 4000;
     const TICK_MS: u64 = 600;
 
     let mut last_seq: u64 = 0;
@@ -686,42 +885,16 @@ fn clipboard_watch_loop(app: AppHandle) {
             last_text = raw.clone();
         }
 
-        if raw.is_empty() || raw == last_handled {
+        if raw == last_handled {
             continue;
         }
-        // 结构化文件（语言包/配置）放宽上限——只译值本就该整文件处理，卡片可滚动阅读；
-        // 普通 prose 仍交给「输入翻译」工作台
-        let limit = if crate::trans_struct::split(&raw).is_some() {
-            60_000
-        } else {
-            MAX_CHARS
-        };
-        if raw.chars().count() > limit {
-            continue;
+        if let Some(text) = guard_copied_text(&app, &cfg, &raw) {
+            last_handled = raw;
+            crate::trace_pipeline(
+                &app,
+                &format!("剪贴板监听触发翻译：{}字", text.chars().count()),
+            );
+            launch_card(&app, &cfg, text);
         }
-        // 本应用自己写入的（听写输出 / 译文复制 / OCR 自动复制）不触发
-        if crate::inject::last_own_clipboard_text().is_some_and(|own| own == raw) {
-            continue;
-        }
-        // 静默守卫：AI 未配置 / 黑名单应用 / 听写进行中，一律不打扰
-        if engine_ready(&app, &cfg).is_err() || blacklist_hit(&cfg).is_some() {
-            continue;
-        }
-        if app
-            .state::<crate::Ctx>()
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        {
-            continue;
-        }
-        last_handled = raw.clone();
-        let text = crate::selection::soft_wrap_join(&raw);
-        crate::trace_pipeline(
-            &app,
-            &format!("剪贴板监听触发翻译：{}字", text.chars().count()),
-        );
-        launch_card(&app, &cfg, text);
     }
 }

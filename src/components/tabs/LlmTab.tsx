@@ -11,7 +11,7 @@ import {
   Toggle,
 } from '../Controls';
 import { listLlmModels, testLlm } from '../../api';
-import type { ProviderProfile, TabProps } from '../../types';
+import type { PromptTemplate, ProviderProfile, TabProps } from '../../types';
 import { TRANSLATE_LANGS, langName } from '../../types';
 import { newProviderId, providerOptions } from './shared';
 
@@ -80,6 +80,10 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
   const [modelList, setModelList] = useState<string[] | null>(null);
   const [fetching, setFetching] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  /* ---- 指令模板库（行内命名 / 两段式删除） ---- */
+  const [addingTpl, setAddingTpl] = useState(false);
+  const [tplName, setTplName] = useState('');
+  const [delTpl, setDelTpl] = useState<string | null>(null);
   const providers = cfg.providers ?? [];
   const llmProfile = providers.find((x) => x.id === cfg.llm.providerId);
   const usingProfile = !!llmProfile;
@@ -120,6 +124,50 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
     const t = setTimeout(() => setConfirmDel(null), 3000);
     return () => clearTimeout(t);
   }, [confirmDel]);
+
+  /* ---- 指令模板库 ---- */
+  const templates = cfg.llm.promptTemplates ?? [];
+  // 模板删除同样两段确认：3 秒无操作自动复位
+  useEffect(() => {
+    if (!delTpl) return;
+    const t = setTimeout(() => setDelTpl(null), 3000);
+    return () => clearTimeout(t);
+  }, [delTpl]);
+
+  const applyTemplate = (t: PromptTemplate) => {
+    set('llm', { customPrompt: t.prompt });
+    toast('已套用模板');
+  };
+
+  const saveTemplate = () => {
+    const name = tplName.trim();
+    if (!name || !cfg.llm.customPrompt.trim()) return;
+    set('llm', {
+      promptTemplates: [
+        ...templates,
+        { id: Date.now().toString(36), name, prompt: cfg.llm.customPrompt },
+      ],
+    });
+    setAddingTpl(false);
+    setTplName('');
+    toast('模板已保存');
+  };
+
+  const removeTemplate = (id: string) => {
+    if (delTpl !== id) {
+      setDelTpl(id);
+      return;
+    }
+    setDelTpl(null);
+    set('llm', { promptTemplates: templates.filter((t) => t.id !== id) });
+  };
+
+  /* Key 未填写的「去填写」直达：滚动并聚焦到本页上方对应凭据组的 Key 输入框 */
+  const gotoProviderKey = (id: string) => {
+    const el = document.getElementById(`llm-key-${id}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el?.querySelector('input')?.focus();
+  };
 
   const run = async () => {
     setTest({ loading: true });
@@ -211,13 +259,16 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
                     onChange={(baseUrl) => updateProvider(p.id, { baseUrl })}
                     placeholder="Base URL：https://open.bigmodel.cn/api/paas/v4"
                   />
-                  <TextInput
-                    type="password"
-                    mono
-                    value={p.apiKey}
-                    onChange={(apiKey) => updateProvider(p.id, { apiKey })}
-                    placeholder="API Key（sk-…）"
-                  />
+                  {/* id 供「Key 未填写 · 去填写」直达链接滚动聚焦 */}
+                  <div id={`llm-key-${p.id}`}>
+                    <TextInput
+                      type="password"
+                      mono
+                      value={p.apiKey}
+                      onChange={(apiKey) => updateProvider(p.id, { apiKey })}
+                      placeholder="API Key（sk-…）"
+                    />
+                  </div>
                 </div>
               </div>
             );
@@ -338,7 +389,20 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
             <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] px-3.5 py-2.5 text-[11.5px] leading-5 text-emerald-200/80">
               🔑 正在使用凭据组「{llmProfile!.name || '未命名'}」· 地址{' '}
               {llmProfile!.baseUrl || '（未填写）'} · Key{' '}
-              {llmProfile!.apiKey.trim() ? '已配置' : '未填写（请在上方凭据组填写）'}
+              {llmProfile!.apiKey.trim() ? (
+                '已配置'
+              ) : (
+                <>
+                  未填写 ·{' '}
+                  <button
+                    type="button"
+                    onClick={() => gotoProviderKey(llmProfile!.id)}
+                    className="text-sky-400 underline decoration-sky-400/40 underline-offset-2 transition hover:text-sky-300"
+                  >
+                    去上方凭据组填写 ›
+                  </button>
+                </>
+              )}
               <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <Field
                   label="模型名称"
@@ -472,6 +536,93 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
               placeholder="{text}"
             />
           </Field>
+          {/* 指令模板库：chips 一键套用到上方指令框；＋ 把当前指令存为新模板 */}
+          <div className="rounded-xl border border-white/[0.07] bg-black/20 p-4">
+            <div className="mb-2.5 flex flex-wrap items-center gap-2">
+              <span className="text-[12.5px] font-medium text-slate-300">📋 指令模板</span>
+              {templates.length > 0 && (
+                <span className="rounded-full border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
+                  {templates.length} 个
+                </span>
+              )}
+              <span className="text-[11px] leading-4 text-slate-500">
+                点击模板 = 套用到上方指令框
+              </span>
+              <Button
+                onClick={() => {
+                  setAddingTpl(true);
+                  setTplName('');
+                }}
+              >
+                ＋ 新模板
+              </Button>
+            </div>
+            {addingTpl && (
+              <div className="mb-2.5 flex flex-wrap items-center gap-2">
+                <div className="w-60">
+                  <TextInput
+                    value={tplName}
+                    onChange={setTplName}
+                    placeholder="模板名称（如：翻译成英文）"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') saveTemplate();
+                    }}
+                  />
+                </div>
+                <Button
+                  kind="primary"
+                  onClick={saveTemplate}
+                  disabled={!tplName.trim() || !cfg.llm.customPrompt.trim()}
+                  title="把上方「自定义处理指令」当前内容存为该模板"
+                >
+                  保存当前指令
+                </Button>
+                <Button onClick={() => setAddingTpl(false)}>取消</Button>
+                {!cfg.llm.customPrompt.trim() && (
+                  <span className="text-[11px] text-amber-300/80">
+                    先在上方指令框写好内容
+                  </span>
+                )}
+              </div>
+            )}
+            {templates.length === 0 ? (
+              !addingTpl && (
+                <div className="text-[11.5px] leading-5 text-slate-500">
+                  把常用指令存成模板，一键套用
+                </div>
+              )
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {templates.map((t) => (
+                  <span
+                    key={t.id}
+                    className="flex items-center overflow-hidden rounded-full border border-white/10 bg-white/[0.04]"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => applyTemplate(t)}
+                      title={t.prompt}
+                      className="max-w-[260px] truncate px-3 py-1.5 text-[12px] text-slate-200 transition hover:bg-sky-500/10 hover:text-sky-300"
+                    >
+                      {t.name}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeTemplate(t.id)}
+                      title="删除该模板"
+                      className={`px-2 py-1.5 text-[11px] transition ${
+                        delTpl === t.id
+                          ? 'bg-red-500/15 text-red-300'
+                          : 'text-slate-500 hover:bg-red-500/10 hover:text-red-300'
+                      }`}
+                    >
+                      {delTpl === t.id ? '确认删除？' : '✕'}
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button onClick={run} disabled={test.loading}>
               {test.loading ? (

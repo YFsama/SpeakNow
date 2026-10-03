@@ -4,6 +4,7 @@ import { Button, Field, Section, Select, Toggle } from '../Controls';
 import {
   deleteBuiltin,
   downloadBuiltin,
+  isMac,
   ocrCapture,
   ocrLangs,
   openLanguageSettings,
@@ -29,6 +30,9 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
   /* 系统 OCR 语言包：检测 + 中文缺失时引导安装（不静默失败） */
   const [langs, setLangs] = useState<string[] | null>(null);
   useEffect(() => {
+    // 截图取词后端（框选窗/截屏/OCR 引擎）仅 Windows：mac 上跳过检测，
+    // langs 保持 null 即不渲染语言包区块，避免恒报「未检测到中文 OCR 语言包」
+    if (isMac) return;
     ocrLangs()
       .then(setLangs)
       .catch(() => setLangs([]));
@@ -132,22 +136,30 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
               也可用托盘菜单「截图取词（框选识别）」触发
             </span>
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button
-              onClick={async () => {
-                try {
-                  await ocrCapture();
-                } catch (e) {
-                  toast(`触发失败：${e}`);
-                }
-              }}
-            >
-              📷 试一下（拖拽框选屏幕区域）
-            </Button>
-            <span className="text-[11px] leading-4 text-slate-500">
-              Esc / 右键取消框选
-            </span>
-          </div>
+          {/* 截图取词仅 Windows：mac 上后端调用立即报错，隐藏无效触发入口，
+              换一段说明（处理方式与 AsrTab 对仅 Windows 的 Qwen3-ASR 一致） */}
+          {isMac ? (
+            <div className="mt-3 rounded-lg border border-white/[0.07] bg-black/20 px-3.5 py-2.5 text-[11.5px] leading-5 text-slate-400">
+              📷 截图取词暂支持 Windows：macOS 端尚在规划（见本页下方路线图）。热键槽位可先在「快捷键」页设置，Windows 机器上即按即用。
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button
+                onClick={async () => {
+                  try {
+                    await ocrCapture();
+                  } catch (e) {
+                    toast(`触发失败：${e}`);
+                  }
+                }}
+              >
+                📷 试一下（拖拽框选屏幕区域）
+              </Button>
+              <span className="text-[11px] leading-4 text-slate-500">
+                Esc / 右键取消框选
+              </span>
+            </div>
+          )}
         </div>
 
         <Toggle
@@ -206,7 +218,7 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
             onClick={() => set('ocr', { engine: 'system' })}
             className={`rounded-xl border px-3.5 py-3 text-left transition ${
               engine === 'system'
-                ? 'border-sky-500/70 bg-sky-500/[0.08]'
+                ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
                 : 'border-white/[0.07] bg-black/20 hover:border-white/20'
             }`}
           >
@@ -226,11 +238,11 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
             </div>
           </button>
 
-          {/* PP-OCR 质量档卡（含模型下载管理） */}
+          {/* PP-OCR 质量档卡（含模型下载管理）。选中态与其他引擎卡统一为 sky；violet 仅作类别徽章色 */}
           <div
             className={`rounded-xl border px-3.5 py-3 transition ${
               engine === 'ppocr'
-                ? 'border-violet-500/70 bg-violet-500/[0.08]'
+                ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
                 : 'border-white/[0.07] bg-black/20'
             }`}
           >
@@ -242,12 +254,15 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
               <span
                 className={`h-3.5 w-3.5 shrink-0 rounded-full border-2 transition ${
                   engine === 'ppocr'
-                    ? 'border-violet-400 bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.6)]'
+                    ? 'border-sky-400 bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.6)]'
                     : 'border-slate-600'
                 }`}
                 aria-hidden
               />
               <span className="text-[13px] font-medium text-slate-200">PP-OCRv5 质量档</span>
+              <span className="shrink-0 rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[9.5px] text-violet-300">
+                本地高精度
+              </span>
               {ppocr?.downloaded && (
                 <span className="rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[9.5px] text-violet-300">
                   已就绪
@@ -291,13 +306,13 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
             )}
           </div>
 
-          {/* 云端档引擎卡 */}
+          {/* 云端档引擎卡。选中态统一 sky；amber 仅作类别徽章色 */}
           <button
             type="button"
             onClick={() => set('ocr', { engine: 'cloud' })}
             className={`rounded-xl border px-3.5 py-3 text-left transition ${
               engine === 'cloud'
-                ? 'border-amber-500/70 bg-amber-500/[0.08]'
+                ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
                 : 'border-white/[0.07] bg-black/20 hover:border-white/20'
             }`}
           >
@@ -305,12 +320,15 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
               <span
                 className={`h-3.5 w-3.5 shrink-0 rounded-full border-2 transition ${
                   engine === 'cloud'
-                    ? 'border-amber-400 bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]'
+                    ? 'border-sky-400 bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.6)]'
                     : 'border-slate-600'
                 }`}
                 aria-hidden
               />
               <span className="text-[13px] font-medium text-slate-200">云端视觉大模型</span>
+              <span className="shrink-0 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9.5px] text-amber-300">
+                需联网 · 上传
+              </span>
             </div>
             <div className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
               GLM-4.6V-Flash 免费档起步 · 复杂版面最强 · 截图会上传

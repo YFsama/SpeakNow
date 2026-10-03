@@ -49,6 +49,10 @@ const MODE_LABELS: Record<string, string> = {
 interface TransCard {
   text: string;
   target: string;
+  /** 第二目标语言代码（原文已是目标语时改译为此语言；空 = 未启用） */
+  second: string;
+  /** 会话代数：result/error 事件的 gen 更旧时忽略（旧会话迟到结果不覆盖新卡片） */
+  gen: number;
   status: 'streaming' | 'done' | 'error';
   stream: string;
   thinking: string;
@@ -57,6 +61,8 @@ interface TransCard {
   ms: number;
   firstMs: number;
   autoCopied: boolean;
+  /** 「识别后自动复制」开启但写入剪贴板失败（被占用等）：徽标转红提示手动复制 */
+  copyFailed: boolean;
   /** 结构化翻译：结果事件携带的结构类型（JSON/YAML/键值），空 = 普通翻译 */
   structured: string;
 }
@@ -117,6 +123,22 @@ function fmtMs(ms?: number | null): string {
 function fmtSpeed(chars: number, genMs: number): string {
   if (genMs < 200 || chars <= 0) return '';
   return `${Math.round((chars * 1000) / genMs)}字/s`;
+}
+
+/* 错误信息清洗：命令层抛出的错误串到前端常带 "Error:" 前缀，网关失败时还会
+   嵌一整段 JSON 报文——去前缀并截断 160 字，避免错误卡被一屏报文淹没 */
+function prettyError(e: unknown): string {
+  let s = e instanceof Error ? e.message : String(e);
+  s = s.replace(/^Error:\s*/, '').trim();
+  return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+}
+
+/* 审阅编辑框 auto-grow：先 auto 还原再按 scrollHeight 长高，封顶 260px 后
+   转内部滚动（与 OCR 编辑框同手法，基线 rows=7） */
+function growReviewBox(el: HTMLTextAreaElement | null) {
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
 }
 
 /* ---- 长文本自适应：估算渲染行数（卡片内宽约 460px，14px 字号） ---- */
@@ -236,14 +258,17 @@ function LevelBars() {
         <span
           key={i}
           /* scaleY 替代 height 过渡：只走合成器，不逐帧触发布局；
-             静态微光替代按值切换的 boxShadow，避免每帧样式对象翻转 */
-          className="flex-1 rounded-full bg-gradient-to-t from-sky-500/90 to-indigo-400/90 transition-[transform,opacity] duration-100"
+             静态微光替代按值切换的 boxShadow，避免每帧样式对象翻转。
+             v>0.95 视为近削波：条身换琥珀色提醒音量顶着上限 */
+          className={`flex-1 rounded-full transition-[transform,opacity] duration-100 ${
+            v > 0.95 ? 'bg-amber-400' : 'bg-gradient-to-t from-sky-500/90 to-indigo-400/90'
+          }`}
           style={{
             height: '34px',
             transformOrigin: 'bottom',
             transform: `scaleY(${Math.max(5, v * 34) / 34})`,
             opacity: 0.35 + v * 0.65,
-            boxShadow: '0 0 8px rgba(56,189,248,0.32)',
+            boxShadow: v > 0.95 ? '0 0 8px rgba(251,191,36,0.36)' : '0 0 8px rgba(56,189,248,0.32)',
           }}
         />
       ))}
@@ -333,7 +358,12 @@ const LlmStream = memo(function LlmStream({
         </span>
         <div className="min-w-0">
           <div className="flex items-center gap-1 text-[13.5px] font-medium text-slate-100">
-            {stage === 'optimizing' && llmText ? 'AI 优化结果' : 'AI 纠错与优化中'}
+            {/* 三态标题：流式字幕是 ASR 识别而非 AI 阶段，避免误导用户以为已进优化 */}
+            {stage === 'optimizing' && llmText
+              ? 'AI 优化结果'
+              : stage === 'transcribing'
+                ? '语音识别中'
+                : 'AI 纠错与优化中'}
             {!(stage === 'optimizing' && llmText) && (
               <>
                 <span className="dot ml-0.5 inline-block h-1 w-1 rounded-full bg-indigo-400" />
@@ -349,7 +379,10 @@ const LlmStream = memo(function LlmStream({
             )}
           </div>
           <div className="text-[11px] text-slate-500">
-            {meta?.llmModel ? `${meta.asrModel} → ${meta.llmModel}` : ''}
+            {/* 识别阶段 LLM 尚未介入，只报 ASR；进优化才展示完整链路 */}
+            {stage === 'optimizing' && meta?.llmModel
+              ? `${meta.asrModel} → ${meta.llmModel}`
+              : (meta?.asrModel ?? '')}
           </div>
         </div>
       </div>
@@ -404,6 +437,11 @@ export default function Overlay() {
   const [result, setResult] = useState('');
   const [resultId, setResultId] = useState(0);
   const [usedLlm, setUsedLlm] = useState(false);
+  /* done 卡操作反馈：复制闪「已复制」/ 重新优化进行中 */
+  const [doneCopied, setDoneCopied] = useState(false);
+  const [doneReopt, setDoneReopt] = useState(false);
+  /* 错误卡「复制错误信息」反馈 */
+  const [errCopied, setErrCopied] = useState(false);
   const [timing, setTiming] = useState<{
     asr?: number | null;
     llm?: number | null;
@@ -431,11 +469,18 @@ export default function Overlay() {
   const [transReplacing, setTransReplacing] = useState(false);
   const [transActionErr, setTransActionErr] = useState('');
   const [srcExpanded, setSrcExpanded] = useState(false);
+  /* Esc 守存中间态：译文已写入剪贴板、卡片闪提示后延迟关闭（同 OCR 卡模式） */
+  const [transSaved, setTransSaved] = useState(false);
   /* 截图取词（OCR）卡片 */
   const [ocrBusy, setOcrBusy] = useState(false);
-  const [ocrCard, setOcrCard] = useState<{ text: string; ms: number } | null>(null);
+  const [ocrCard, setOcrCard] = useState<{ text: string; ms: number; copyFailed?: boolean } | null>(null);
   const [ocrCopied, setOcrCopied] = useState(false);
   const [ocrPasting, setOcrPasting] = useState(false);
+  /* OCR 取词失败消息（语言包缺失 / 引擎失败）；提前到与其余 OCR 状态同处声明，
+     供全局 Esc 兜底等更早出现的效果引用 */
+  const [ocrErr, setOcrErr] = useState('');
+  /* Esc 守存中间态：修改稿已写入剪贴板、卡片闪提示后延迟关闭 */
+  const [ocrSaved, setOcrSaved] = useState(false);
   /* 可编辑正文：识别错字先改再用（复制/翻译/输入都取编辑后的文本） */
   const [ocrEdit, setOcrEdit] = useState('');
   const ocrEditRef = useRef<HTMLTextAreaElement>(null);
@@ -448,6 +493,16 @@ export default function Overlay() {
   const streamTextRef = useRef('');
   /* 界面缩放：body.zoom 放大卡片的同时窗口必须同步放大，否则卡片被窗口边缘裁切 */
   const zoomRef = useRef(1);
+  /* 双击复制豁免：双击的第二次 mousedown 会先摧毁已有手动选区并自动选中
+     双击词，dblclick 时读 getSelection 恒非空、无法区分——只能在第一次
+     mousedown（e.detail===1）记录「当时是否已有选区」，dblclick 按该标志判定 */
+  const hadSelBeforeDbl = useRef(false);
+  /* 翻译卡片镜像：sn-translate-error 等监听器需要读最新卡片状态做代数过滤
+     与播音决策，避免监听器闭包里的过期 trans */
+  const transRef = useRef<TransCard | null>(null);
+  useEffect(() => {
+    transRef.current = trans;
+  }, [trans]);
   const winSize = (w: number, h: number) =>
     new LogicalSize(Math.round(w * zoomRef.current), Math.round(h * zoomRef.current));
 
@@ -483,6 +538,8 @@ export default function Overlay() {
       streamTextRef.current = e.payload.text;
       if (editorRef.current && editorRef.current.value !== e.payload.text) {
         editorRef.current.value = e.payload.text;
+        // 流式回填不经 React 状态：高度须在此同步调整
+        growReviewBox(editorRef.current);
       }
     });
     return () => {
@@ -497,6 +554,7 @@ export default function Overlay() {
     const t = streamTextRef.current;
     if (t && editorRef.current && editorRef.current.value !== t) {
       editorRef.current.value = t;
+      growReviewBox(editorRef.current);
     }
   });
 
@@ -508,6 +566,13 @@ export default function Overlay() {
     const t = setTimeout(() => editorRef.current?.focus(), 60);
     return () => clearTimeout(t);
   }, [stage]);
+
+  /* 审阅编辑框随内容长高（封顶 260px 后内部滚动，复用 OCR 卡的 auto-height
+     手法）；流式回填不经 React 短暂状态时的长高已由回填处直接调 growReviewBox */
+  useEffect(() => {
+    if (stage !== 'review') return;
+    growReviewBox(editorRef.current);
+  }, [stage, editText]);
 
   // 退出审阅或开始新一轮录音时恢复默认尺寸（完成阶段可能已把窗口自适应放大
   // 到 560px，不在录音时复位的话，长结果之后的下一轮会一直顶着放大的窗口）
@@ -554,14 +619,18 @@ export default function Overlay() {
         setTrans(null);
         setTransBusy(false);
         setTransActionErr('');
+        setTransSaved(false); // 取消挂起的 Esc 守存延迟关闭，避免吞掉新一轮会话
         setOcrBusy(false);
         setOcrCard(null);
+        setOcrSaved(false); // 取消可能挂起的 Esc 延迟关闭，避免吞掉新一轮会话
+        if (p.stage === 'error') setErrCopied(false);
         if (p.stage === 'recording') {
           setRawText('');
           setPartial('');
           setResult('');
           setUsedLlm(false);
           setTiming({});
+          setNotice(null); // 清掉上一会话遗留的操作反馈（done 卡也会显示 notice）
         }
         if (p.sound) {
           if (p.stage === 'recording') playTones([620, 880]);
@@ -598,6 +667,8 @@ export default function Overlay() {
         setReviewRaw(e.payload.raw);
         setUsedLlm(e.payload.llmUsed);
         setNotice(null);
+        // 保险：新审阅会话到来时清掉上一轮可能遗留的「确认中」状态
+        setConfirming(false);
       },
     );
     const un7 = listen<{ title: string; above?: boolean }>('sn-target', (e) => {
@@ -628,6 +699,8 @@ export default function Overlay() {
         setTrans({
           text: e.payload.text,
           target: e.payload.target,
+          second: e.payload.second ?? '',
+          gen: e.payload.gen,
           status: 'streaming',
           stream: '',
           thinking: '',
@@ -636,15 +709,18 @@ export default function Overlay() {
           ms: 0,
           firstMs: 0,
           autoCopied: false,
+          copyFailed: false,
           structured: '',
         });
         setTransBusy(true);
         setTransCopied(false);
         setTransActionErr('');
         setSrcExpanded(false);
+        setTransSaved(false); // 新会话接管旧卡：取消挂起的 Esc 守存延迟关闭
         // 翻译卡片接管悬浮窗：OCR 卡片让位（截图翻译一键链的切换点）
         setOcrBusy(false);
         setOcrCard(null);
+        setOcrSaved(false); // 同 sn-status：取消挂起的 Esc 延迟关闭
       },
     );
     const un2 = listen<{
@@ -653,10 +729,12 @@ export default function Overlay() {
       ms: number;
       firstMs: number;
       autoCopied?: boolean;
+      copyFailed?: boolean;
       structured?: string;
     }>('sn-translate-result', (e) => {
       setTrans((prev) => {
-        if (!prev) return prev;
+        // 旧会话的迟到结果不覆盖新卡片（新 start 已把卡片重置为 streaming）
+        if (!prev || e.payload.gen < prev.gen) return prev;
         return {
           ...prev,
           status: 'done',
@@ -665,28 +743,38 @@ export default function Overlay() {
           ms: e.payload.ms,
           firstMs: e.payload.firstMs,
           autoCopied: !!e.payload.autoCopied,
+          copyFailed: !!e.payload.copyFailed,
           structured: e.payload.structured ?? '',
         };
       });
       setTransBusy(false);
       if (soundRef.current) playTones([880, 1175, 1568], 0.07);
     });
-    const un3 = listen<{ message: string }>('sn-translate-error', (e) => {
-      // 无卡片时的独立错误（取词失败等）：创建只含错误信息的卡片
+    const un3 = listen<{ message: string; gen?: number }>('sn-translate-error', (e) => {
+      const p = e.payload;
+      const cur = transRef.current;
+      // 会话错误（带 gen）按代数过滤：更旧的迟到错误直接忽略；卡片已不在
+      // （Esc 作废 / 被新卡取代）也不再凭空重建错误卡。独立错误（取词失败
+      // 等，无 gen）没有卡片可依附，仍然建卡提示。播音与建卡同一判定，
+      // 避免 superseded 中止在窗口隐藏后还响一声错误音
+      if (cur ? p.gen !== undefined && p.gen < cur.gen : p.gen !== undefined) return;
       setTrans((prev) =>
         prev
-          ? { ...prev, status: 'error', error: e.payload.message }
+          ? { ...prev, status: 'error', error: p.message }
           : {
               text: '',
               target: '',
+              second: '',
+              gen: p.gen ?? 0,
               status: 'error',
               stream: '',
               thinking: '',
               final: '',
-              error: e.payload.message,
+              error: p.message,
               ms: 0,
               firstMs: 0,
               autoCopied: false,
+              copyFailed: false,
               structured: '',
             },
       );
@@ -715,19 +803,59 @@ export default function Overlay() {
     };
   }, []);
 
-  /* 翻译卡片：Esc 关闭 */
+  /* 翻译卡片：Esc 关闭（完成态守存：译文先落剪贴板、闪提示后延迟关闭） */
   useEffect(() => {
     if (!trans) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
         e.preventDefault();
+        /* 完成态且有译文：译文不进剪贴板历史找不回，先把 final 写入剪贴板并
+           闪提示，再延迟关闭；期间再按 Esc 立即关闭。trans 的字段进依赖是
+           为了读到最新 final 而非旧闭包（同 OCR 卡的 ocrEdit 依赖） */
+        if (trans.status === 'done' && trans.final.trim() && !transSaved) {
+          void copyText(trans.final)
+            .then(() => setTransSaved(true))
+            .catch(() => {
+              // 剪贴板被占用等失败：不谎报「已复制」，直接关闭
+              setTrans(null);
+              void dismissOverlay();
+            });
+          return;
+        }
         setTrans(null);
         void dismissOverlay();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [!!trans]);
+  }, [!!trans, trans?.status, trans?.final, transSaved]);
+
+  /* 翻译守存提示展示 900ms 后自动关闭；卡片被听写 / 新翻译接管时
+     setTransSaved(false) 触发 cleanup 取消定时器，避免迟到的关闭吞掉新会话 */
+  useEffect(() => {
+    if (!transSaved) return;
+    const t = setTimeout(() => {
+      setTrans(null);
+      void dismissOverlay();
+    }, 900);
+    return () => clearTimeout(t);
+  }, [transSaved]);
+
+  /* 全局 Esc 兜底：done/error 阶段没有专属 Esc 处理器，此处补齐关闭入口。
+     翻译卡 / OCR 卡 / 审阅编辑框各自的 Esc 处理器会先行 preventDefault 并接管
+     （关闭或守存），这里以「卡片在场即整体让位」+ defaultPrevented 双保险，
+     无论监听器注册先后都不会双触发 */
+  useEffect(() => {
+    if (stage !== 'done' && stage !== 'error') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (trans || ocrBusy || ocrCard || ocrErr) return;
+      e.preventDefault();
+      void dismissOverlay();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr]);
 
   /* 翻译卡片：按内容自适应窗口高度（流式与完成共用一条估算） */
   const transBody = trans
@@ -760,19 +888,32 @@ export default function Overlay() {
     const t = setTimeout(() => setTransActionErr(''), 3500);
     return () => clearTimeout(t);
   }, [transActionErr]);
+  /* done 卡复制 / 错误卡复制反馈自动消退 */
+  useEffect(() => {
+    if (!doneCopied) return;
+    const t = setTimeout(() => setDoneCopied(false), 1600);
+    return () => clearTimeout(t);
+  }, [doneCopied]);
+  useEffect(() => {
+    if (!errCopied) return;
+    const t = setTimeout(() => setErrCopied(false), 1600);
+    return () => clearTimeout(t);
+  }, [errCopied]);
 
   /* ---- 截图取词（OCR）卡片：生命周期事件 + 动作 ---- */
-  const [ocrErr, setOcrErr] = useState('');
   useEffect(() => {
     const un1 = listen('sn-ocr-start', () => {
       setOcrBusy(true);
       setOcrCard(null);
       setOcrErr('');
       setOcrCopied(false);
+      setOcrSaved(false);
     });
-    const un2 = listen<{ text: string; ms: number }>('sn-ocr-result', (e) => {
+    const un2 = listen<{ text: string; ms: number; copyFailed?: boolean }>('sn-ocr-result', (e) => {
       setOcrBusy(false);
-      setOcrCard({ text: e.payload.text, ms: e.payload.ms });
+      // copyFailed：「识别后自动复制」开启了但写入失败（剪贴板被占用）——
+      // 卡片如实提示手动复制，否则用户粘贴出旧内容还以为识别错了
+      setOcrCard({ text: e.payload.text, ms: e.payload.ms, copyFailed: !!e.payload.copyFailed });
       setOcrEdit(e.payload.text);
       if (soundRef.current) playTones([880, 1175, 1568], 0.07);
     });
@@ -793,6 +934,7 @@ export default function Overlay() {
     setOcrCard(null);
     setOcrErr('');
     setOcrEdit('');
+    setOcrSaved(false);
     void dismissOverlay();
   };
 
@@ -829,18 +971,35 @@ export default function Overlay() {
     }
   };
 
-  /* OCR 卡片：Esc 关闭（与翻译卡片同语义） */
+  /* OCR 卡片：Esc 关闭（与翻译卡片同语义；有手改内容时先落剪贴板再关） */
   useEffect(() => {
     if (!ocrCard && !ocrBusy && !ocrErr) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
         e.preventDefault();
+        /* OCR 结果不进历史，直接丢弃找不回：编辑稿与识别原文有差异时，
+           先把修改稿写入剪贴板并在卡片上闪提示，再延迟关闭；期间再按
+           Esc 立即关闭。ocrEdit 进依赖是为了读到最新编辑值而非旧闭包 */
+        if (ocrCard && ocrEdit.trim() && ocrEdit !== ocrCard.text && !ocrSaved) {
+          void copyText(ocrEdit)
+            .then(() => setOcrSaved(true))
+            .catch(() => closeOcrCard());
+          return;
+        }
         closeOcrCard();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [!!ocrCard, !!ocrBusy, !!ocrErr]);
+  }, [!!ocrCard, !!ocrBusy, !!ocrErr, ocrEdit, ocrSaved]);
+
+  /* 守存提示展示 900ms 后自动关闭；卡片被翻译/听写接管时 setOcrSaved(false)
+     触发 cleanup 取消定时器，避免迟到的关闭吞掉新会话 */
+  useEffect(() => {
+    if (!ocrSaved) return;
+    const t = setTimeout(() => closeOcrCard(), 900);
+    return () => clearTimeout(t);
+  }, [ocrSaved]);
 
   /* OCR 卡片：按内容自适应窗口高度（跟随编辑中的文本；编辑框另有滚动上限） */
   const ocrH = useMemo(() => {
@@ -882,10 +1041,23 @@ export default function Overlay() {
 
   /* 语言条切换目标语言并重译（持久化，托盘/设置页同步） */
   const onTransTarget = (code: string) => {
-    if (!trans || transBusy || code === trans.target) return;
+    /* 流式中允许直接换语言：后端 gen 代数会作废旧流（superseded 迟到结果
+       被忽略），无需用 transBusy 在前端拦死 */
+    if (!trans || code === trans.target) return;
     setTrans((prev) =>
       prev
-        ? { ...prev, target: code, status: 'streaming', stream: '', thinking: '', final: '', error: '' }
+        ? // 乐观更新即占用下一代号：旧会话同代的 superseded 错误若在乐观更新
+          // 与新 start 事件之间到达，会因 gen 相等漏过过滤、闪一下「已被取代」
+          {
+            ...prev,
+            gen: prev.gen + 1,
+            target: code,
+            status: 'streaming',
+            stream: '',
+            thinking: '',
+            final: '',
+            error: '',
+          }
         : prev,
     );
     setTransBusy(true);
@@ -893,7 +1065,7 @@ export default function Overlay() {
     setTransActionErr('');
     translateRetarget(trans.text, code).catch((e) => {
       setTransBusy(false);
-      setTrans((prev) => (prev ? { ...prev, status: 'error', error: String(e) } : prev));
+      setTrans((prev) => (prev ? { ...prev, status: 'error', error: prettyError(e) } : prev));
     });
   };
 
@@ -913,7 +1085,7 @@ export default function Overlay() {
         setTransBusy(false);
       })
       .catch((e) => {
-        setTrans((prev) => (prev ? { ...prev, status: 'error', error: String(e) } : prev));
+        setTrans((prev) => (prev ? { ...prev, status: 'error', error: prettyError(e) } : prev));
         setTransBusy(false);
       });
   };
@@ -955,7 +1127,13 @@ export default function Overlay() {
     setConfirming(true);
     try {
       await confirmEdit(editText);
-    } catch {
+    } catch (e) {
+      // 拒绝（无待确认项/粘贴失败）不能只吞掉：给出行内提示，用户才知道
+      // 为什么没输入出去（notice 会随下一次 sn-review 重置）
+      setNotice({ ok: false, msg: `输入失败：${String(e)}` });
+    } finally {
+      // 窗口隐藏不卸载 React 状态：成功路径也必须复位，否则下一次审阅的
+      // 「↵ 输入」永久停在「输入中…」且被 confirming 守卫拦死
       setConfirming(false);
     }
   };
@@ -987,7 +1165,38 @@ export default function Overlay() {
     return () => clearTimeout(t);
   }, [notice]);
 
-  if (stage === 'idle' && !trans) return <div className="h-screen w-screen" />;
+  /* done 卡「复制」：复制当前终稿（重新优化后为最新稿） */
+  const onDoneCopy = () => {
+    if (!result.trim()) return;
+    void copyText(result)
+      .then(() => setDoneCopied(true))
+      .catch(() => {});
+  };
+
+  /* done 卡「重新优化」：复用审阅卡的 optimize_text 通道（后端纯计算 + 流式
+     sn-llm-delta，不改 stage、不动待确认项与历史），结果直接更新终稿显示；
+     不经审阅编辑框，无需切换窗口形态，状态最短闭环 */
+  const onDoneReoptimize = async () => {
+    if (doneReopt || !result.trim()) return;
+    setDoneReopt(true);
+    setNotice(null);
+    try {
+      const t = await optimizeText(result);
+      setResult(t);
+      setResultId((n) => n + 1); // 换 diff 键：重放逐词入场动效与词级高亮
+      setUsedLlm(true);
+      setNotice({ ok: true, msg: '已重新优化' });
+    } catch (e) {
+      setNotice({ ok: false, msg: `重新优化失败：${prettyError(e)}` });
+    } finally {
+      setDoneReopt(false);
+    }
+  };
+
+  /* OCR 取词链路里后端先发 stage=idle 再发 sn-ocr-start（ocr.rs）：
+     早退条件必须放行 OCR 三态，否则截图取词的结果卡/错误卡永远渲染不出来 */
+  if (stage === 'idle' && !trans && !ocrBusy && !ocrCard && !ocrErr)
+    return <div className="h-screen w-screen" />;
 
   // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红；翻译卡=青绿
   const glow = trans
@@ -1007,7 +1216,18 @@ export default function Overlay() {
   return (
     <div
       className="overlay-feather flex h-screen w-screen items-start justify-center pt-4"
-      onClick={stage === 'review' ? undefined : dismissOverlay}
+      /* 录音中误点不隐藏窗口：麦克风仍在采集，结果会无 UI 地粘进当时聚焦的应用；
+         审阅模式本就不整体关闭 */
+      onClick={
+        stage === 'review' || stage === 'recording'
+          ? undefined
+          : (e) => {
+              // 拖选文本松手也产生 click 冒泡：有选区说明用户在选取内容
+              // （完成卡手动复制片段），不当作关闭意图
+              if (window.getSelection()?.toString()) return;
+              void dismissOverlay();
+            }
+      }
     >
       <div
         onMouseEnter={onEnter}
@@ -1170,8 +1390,17 @@ export default function Overlay() {
                     className="sn-scroll max-h-[300px] w-full resize-none whitespace-pre-wrap break-words rounded-lg border border-sky-400/15 bg-sky-500/[0.05] px-3 py-2.5 text-[13.5px] leading-[1.85] text-slate-100 outline-none transition select-text hover:border-sky-400/30 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-500/15"
                   />
                   <div className="mt-1 flex items-center gap-2 text-[10px] text-slate-600">
-                    <span>{ocrEdit.trim() ? `${ocrEdit.trim().length} 字` : ''}</span>
-                    <span className="ml-auto">可直接修改 · Esc 关闭</span>
+                    <span>{ocrEdit.trim() ? `${[...ocrEdit.trim()].length} 字` : ''}</span>
+                    {/* Esc 守存反馈 / 自动复制失败提示：与事实相符的卡片状态 */}
+                    <span
+                      className={`ml-auto ${ocrSaved ? 'text-emerald-300' : ocrCard?.copyFailed ? 'text-amber-400' : ''}`}
+                    >
+                      {ocrSaved
+                        ? '已复制修改后的文本'
+                        : ocrCard?.copyFailed
+                          ? '⚠ 自动复制失败，请点「复制」手动复制'
+                          : '可直接修改 · Esc 关闭'}
+                    </span>
                   </div>
                 </div>
               )}
@@ -1260,10 +1489,29 @@ export default function Overlay() {
                     {trans.ms ? ` · ${fmtMs(trans.ms)}` : ''}
                   </span>
                 )}
-                {trans.autoCopied && (
+                {/* 第二目标语言：仅提示文案，不改变语言条高亮（高亮恒等于目标语） */}
+                {trans.status === 'done' && trans.second && trans.second !== trans.target && (
+                  <span
+                    className="text-[10px] text-slate-500"
+                    title={`已启用第二目标语言：原文已是${langName(trans.target)}时会改译成${langName(trans.second)}`}
+                  >
+                    原文为{langName(trans.target)}时输出{langName(trans.second)}
+                  </span>
+                )}
+                {trans.autoCopied && !trans.copyFailed && (
                   <span className="rounded-full border border-sky-400/25 bg-sky-400/[0.07] px-2 py-0.5 text-[10px] text-sky-300/90">
                     已自动复制
                   </span>
+                )}
+                {trans.autoCopied && trans.copyFailed && (
+                  <button
+                    type="button"
+                    onClick={onTransCopy}
+                    title="自动复制写入剪贴板失败（可能被其他应用占用），点击手动复制"
+                    className="rounded-full border border-red-400/30 bg-red-400/10 px-2 py-0.5 text-[10px] text-red-300 transition hover:bg-red-400/20 active:scale-[0.97]"
+                  >
+                    自动复制失败 · 点此复制
+                  </button>
                 )}
                 <button
                   type="button"
@@ -1291,7 +1539,9 @@ export default function Overlay() {
                     {trans.text}
                   </span>
                   <span className="mt-1 block text-[10px] text-slate-600">
-                    {srcExpanded ? '收起源文' : `源文 ${trans.text.length} 字 · 点击展开`}
+                    {srcExpanded
+                      ? '收起源文'
+                      : `源文 ${[...trans.text].length} 字 · 点击展开`}
                   </span>
                 </button>
               )}
@@ -1317,7 +1567,19 @@ export default function Overlay() {
                 </div>
               ) : transBody || trans.status === 'streaming' ? (
                 <div
-                  onDoubleClick={onTransCopy}
+                  onMouseDown={(e) => {
+                    // 只在双击序列的第一次 mousedown 记录「是否已有手动选区」；
+                    // 第二次 mousedown（e.detail===2）会摧毁旧选区并自动选中
+                    // 双击词，那时再读 getSelection 已无法区分来源
+                    if (e.detail === 1)
+                      hadSelBeforeDbl.current = !!window.getSelection()?.toString();
+                  }}
+                  onDoubleClick={() => {
+                    // 双击前已有手动选区（用户在选取内容）：不打断、不整段复制；
+                    // 双击自动选词产生的选区不算（见上 mousedown 注释）
+                    if (hadSelBeforeDbl.current) return;
+                    onTransCopy();
+                  }}
                   title="双击复制译文"
                   className="sn-scroll mt-2.5 max-h-[300px] cursor-copy select-text overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-emerald-400/15 bg-emerald-500/[0.05] px-3 py-2.5 text-[13.5px] leading-[1.85] text-slate-100"
                 >
@@ -1347,13 +1609,15 @@ export default function Overlay() {
                       <button
                         key={code}
                         type="button"
-                        disabled={transBusy}
                         onClick={() => onTransTarget(code)}
+                        /* 流式中可点（点击即换语言重译），仅用脉动样式标注「进行中」 */
                         className={`rounded-full border px-2.5 py-[5px] text-[11px] transition active:scale-[0.97] ${
                           active
-                            ? 'border-emerald-400/60 bg-emerald-400/15 font-medium text-emerald-200'
+                            ? `border-emerald-400/60 bg-emerald-400/15 font-medium text-emerald-200 ${
+                                transBusy ? 'animate-pulse' : ''
+                              }`
                             : 'border-white/10 bg-black/25 text-slate-400 hover:border-white/25 hover:text-slate-200'
-                        } disabled:opacity-50`}
+                        }`}
                       >
                         {name}
                       </button>
@@ -1389,8 +1653,12 @@ export default function Overlay() {
                 >
                   ↻ 重译
                 </button>
-                <span className="ml-auto text-[10px] text-slate-600">
-                  悬停暂停 · 双击复制 · 点空白关闭
+                <span
+                  className={`ml-auto text-[10px] ${
+                    transSaved ? 'text-emerald-300' : 'text-slate-600'
+                  }`}
+                >
+                  {transSaved ? '已复制译文' : '悬停暂停 · 双击复制 · 点空白关闭'}
                 </span>
               </div>
               {transActionErr && (
@@ -1401,7 +1669,10 @@ export default function Overlay() {
             </div>
           )}
 
-          {stage === 'recording' && (
+          {/* 翻译卡在场时听写各阶段卡片一律让位（sn-status 已清 trans，这里的
+              !trans 兜底 done 驻留期等无 status 事件时到来的划词翻译，
+              避免两卡纵向堆叠被按 transH 计高的窗口 overflow-hidden 裁切） */}
+          {stage === 'recording' && !trans && (
             <div className="anim-rise">
               <div className="flex items-center gap-3">
                 <span className="relative flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shadow-sky-500/30">
@@ -1450,7 +1721,7 @@ export default function Overlay() {
             </div>
           )}
 
-          {stage === 'transcribing' && !rawText && !partial && (
+          {stage === 'transcribing' && !rawText && !partial && !trans && (
             <div className="anim-rise">
               <div className="flex items-center gap-3">
                 <span className="flex h-8 w-8 items-center justify-center rounded-full bg-sky-500/15">
@@ -1471,11 +1742,14 @@ export default function Overlay() {
             </div>
           )}
 
-          {((stage === 'transcribing' && (rawText || partial)) || stage === 'optimizing') && (
-            <LlmStream stage={stage} meta={meta} rawText={rawText} partial={partial} />
-          )}
+          {((stage === 'transcribing' && (rawText || partial)) || stage === 'optimizing') &&
+            !trans && (
+              <LlmStream stage={stage} meta={meta} rawText={rawText} partial={partial} />
+            )}
 
-          {stage === 'review' && (
+          {/* 审阅卡与翻译卡互斥（同 recording/done 块）：审阅期剪贴板监听/划词
+              热键仍可触发翻译卡，两卡纵向堆叠会被 overflow-hidden 裁切 */}
+          {stage === 'review' && !trans && (
             <div className="anim-rise">
               <div className="mb-2 flex items-center gap-2.5">
                 <span className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/15 text-[11px] text-amber-400">
@@ -1581,7 +1855,7 @@ export default function Overlay() {
             </div>
           )}
 
-          {stage === 'done' && (
+          {stage === 'done' && !trans && (
             <div className="anim-rise">
               <div className="flex items-center gap-2.5">
                 <span className="anim-pop flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-[12px] text-emerald-400 ring-2 ring-emerald-500/20">
@@ -1604,8 +1878,12 @@ export default function Overlay() {
                   <TokenText key={`final-${resultId}`} tokens={doneTokens} animate />
                 </div>
               )}
-              <div className="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-2 text-[10px] text-slate-600">
+              <div className="mt-3 flex items-center justify-between gap-2 border-t border-white/[0.06] pt-2 text-[10px] text-slate-600">
                 <span className="flex flex-wrap items-center gap-2.5 font-mono">
+                  {result ? <span>{[...result].length} 字</span> : null}
+                  {timing.audioSecs && timing.audioSecs > 0 ? (
+                    <span>音频 {timing.audioSecs.toFixed(1)}s</span>
+                  ) : null}
                   {timing.asr ? (
                     <span>
                       识别 {fmtMs(timing.asr)}
@@ -1632,19 +1910,76 @@ export default function Overlay() {
                     <span className="text-slate-500">合计 {fmtMs(timing.asr + timing.llm)}</span>
                   ) : null}
                 </span>
-                <span>悬停可暂停 · 点击关闭</span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={!result.trim()}
+                    /* 外层容器「点击空白即关闭」，按钮点击不能冒泡上去 */
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDoneCopy();
+                    }}
+                    className="rounded-full border border-white/10 bg-black/25 px-2.5 py-1 text-[11px] text-slate-300 transition hover:border-white/25 disabled:opacity-40"
+                  >
+                    {doneCopied ? '已复制 ✓' : '⧉ 复制'}
+                  </button>
+                  {/* 与审阅卡同源判定：配置态为准（meta 为会话开始时的快照，作兜底） */}
+                  {(llmEnabled || meta?.llmEnabled) && (
+                    <button
+                      type="button"
+                      disabled={doneReopt || !result.trim()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void onDoneReoptimize();
+                      }}
+                      title="对终稿再跑一次 AI 优化（模式跟随设置）"
+                      className="rounded-full border border-white/10 bg-black/25 px-2.5 py-1 text-[11px] text-slate-300 transition hover:border-white/25 disabled:opacity-40"
+                    >
+                      {doneReopt ? '✨ 优化中…' : '✨ 重新优化'}
+                    </button>
+                  )}
+                  <span>悬停可暂停 · 点击关闭</span>
+                </span>
               </div>
+              {notice && (
+                <div
+                  className={`mt-1.5 line-clamp-2 text-[11px] leading-4 ${
+                    notice.ok ? 'text-emerald-300' : 'text-red-300'
+                  }`}
+                >
+                  {notice.msg}
+                </div>
+              )}
             </div>
           )}
 
-          {stage === 'error' && (
-            <div className="anim-rise">
+          {stage === 'error' && !trans && (
+            <div
+              className="anim-rise"
+              /* 重试/管理员重启按钮的点击不冒泡到外层关闭悬浮窗（与翻译/OCR 卡
+                 一致），否则后台 retry_last 的结果全程不可见 */
+              onClick={(e) => e.stopPropagation()}
+            >
               <div className="flex items-start gap-3 py-0.5">
                 <span className="anim-pop mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-500/15 text-[13px] font-bold text-red-400 ring-2 ring-red-500/20">
                   !
                 </span>
                 <div className="min-w-0 flex-1 pt-0.5">
                   <div className="text-[13px] leading-5 text-red-300">{message}</div>
+                  {/* 裸 anyhow 错误链不便口述转述：一键复制原文给排查/报错用 */}
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void copyText(message)
+                          .then(() => setErrCopied(true))
+                          .catch(() => {});
+                      }}
+                      className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-black/25 px-2.5 py-1 text-[11px] text-slate-400 transition hover:border-white/25 hover:text-slate-200"
+                    >
+                      {errCopied ? '已复制 ✓' : '⧉ 复制错误信息'}
+                    </button>
+                  </div>
                   {message.includes('管理员') && (
                     <div className="mt-2.5">
                       <button

@@ -145,6 +145,67 @@ fn uia_selection_text() -> Option<String> {
 
 /* ---------- 模拟复制兜底 ---------- */
 
+/// 剪贴板变更基线：在「触发复制动作」的时刻捕获（必须早于复制落盘），
+/// 稍后用 wait_changed 轮询等待基线之后的新写入。Windows 记剪贴板序号
+/// （零拷贝，复制相同内容也能判定），其他平台退化为文本快照比较。
+/// 模拟复制取词与 Ctrl+C+C 双击共用：慢应用（Word / 大 PDF）的复制落盘
+/// 可达秒级，固定延时后盲读会拿到上一次复制的内容
+pub(crate) struct ClipboardBaseline {
+    #[cfg(target_os = "windows")]
+    seq: u64,
+    #[cfg(not(target_os = "windows"))]
+    text: String,
+}
+
+impl ClipboardBaseline {
+    pub(crate) fn capture() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                seq: crate::inject::clipboard_seq_now(),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self {
+                text: arboard::Clipboard::new()
+                    .ok()
+                    .and_then(|mut c| c.get_text().ok())
+                    .unwrap_or_default(),
+            }
+        }
+    }
+
+    /// 轮询等待基线之后出现的新文本（30ms 步进，上限 `timeout_ms`；
+    /// 序号已前移但暂时读不出内容时继续等到上限——写入方还占着剪贴板）
+    pub(crate) fn wait_changed(&self, timeout_ms: u64) -> Option<String> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            thread::sleep(Duration::from_millis(30));
+            #[cfg(target_os = "windows")]
+            let changed = crate::inject::clipboard_seq_now() > self.seq;
+            #[cfg(not(target_os = "windows"))]
+            let changed = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut c| c.get_text().ok())
+                .map(|t| t != self.text)
+                .unwrap_or(false);
+            if changed {
+                if let Some(t) = arboard::Clipboard::new()
+                    .ok()
+                    .and_then(|mut c| c.get_text().ok())
+                    .filter(|t| !t.is_empty())
+                {
+                    return Some(t);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+}
+
 fn copy_selection() -> Result<String, CaptureError> {
     #[cfg(target_os = "windows")]
     {
@@ -159,45 +220,32 @@ fn copy_selection() -> Result<String, CaptureError> {
     let _ = crate::inject::wait_modifiers_free(1200);
 
     let saved = crate::inject::save_clipboard_content();
-    // Windows 用剪贴板序号精确判定「复制真的发生了」；其他平台退化为内容比较
-    #[cfg(target_os = "windows")]
-    let seq0 = crate::inject::clipboard_seq_now();
-    #[cfg(not(target_os = "windows"))]
-    let prev_text = arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.get_text().ok())
-        .unwrap_or_default();
+    // 变更基线须在发出复制键之前捕获：「序号前移 / 内容变化」相对基线成立，
+    // 才能证明读到的是本次选区而不是剪贴板里的旧内容
+    let baseline = ClipboardBaseline::capture();
 
     send_copy_key().map_err(|e| CaptureError::Failed(format!("模拟复制失败：{e:#}")))?;
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(700);
-    let mut text = String::new();
-    while std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(30));
-        #[cfg(target_os = "windows")]
-        let changed = crate::inject::clipboard_seq_now() > seq0;
-        #[cfg(not(target_os = "windows"))]
-        let changed = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
-            .map(|t| t != prev_text)
-            .unwrap_or(false);
-        if !changed {
-            continue;
-        }
-        if let Some(t) = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
-            .filter(|t| !t.is_empty())
-        {
-            text = t;
-            break;
-        }
-    }
-    // 还原用户剪贴板（原本为空则保留取到的文本——多数场景反而有用）
+    let text = baseline.wait_changed(700).unwrap_or_default();
+    // 读取完成时刻的剪贴板序号：稍后还原前校验窗口期内无他人写入
+    #[cfg(target_os = "windows")]
+    let seq_read = crate::inject::clipboard_seq_now();
+    // 还原用户剪贴板（原本为空则保留取到的文本——多数场景反而有用）。
+    // 序号守卫：取词后的窗口期内用户/其他程序动过剪贴板就放弃还原——
+    // 用户新复制的内容优先，不拿取词前的旧内容盖回去（与 inject.rs
+    // 粘贴后的延迟恢复守卫同理；非 Windows 无序号，维持原行为）
     if let Some(prev) = saved.as_ref() {
         thread::sleep(Duration::from_millis(50));
-        crate::inject::restore_clipboard_content(prev);
+        #[cfg(target_os = "windows")]
+        {
+            if crate::inject::clipboard_seq_now() == seq_read {
+                crate::inject::restore_clipboard_content(prev);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            crate::inject::restore_clipboard_content(prev);
+        }
     }
     if text.trim().is_empty() {
         Err(CaptureError::Empty)

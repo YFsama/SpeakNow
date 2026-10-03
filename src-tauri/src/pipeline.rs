@@ -51,9 +51,9 @@ pub fn toggle(app: &AppHandle, skip_llm: bool, translate: bool) {
     if recording {
         let _ = stop(app);
     } else if let Err(e) = start(app, skip_llm, translate, false) {
+        // 失败的用户可见上报（error 状态 + 延迟隐藏）已收口在 start() 内部
+        // audio::start 失败处：此处再发一次会造成双份 error 事件干扰 UI
         eprintln!("[speaknow] 开始录音失败: {e}");
-        emit_status(app, "error", &format!("开始录音失败：{e}"), false);
-        hide_later(app, 3000);
     }
 }
 
@@ -81,6 +81,10 @@ pub struct Session {
     pub stream_finished: AtomicBool,
     pub stream_queue: Mutex<VecDeque<Vec<i16>>>,
     pub stream_texts: Mutex<Vec<String>>,
+    /// 流式分段识别最终失败（含段级重试）的累计段数：拼接结果缺句时收尾
+    /// 阶段据此在 done 消息里提示「可能不完整」，而不是静默给出残缺文本。
+    /// 计数只在 worker 线程写、run() 收尾读，无重置需求（随会话消亡）
+    pub stream_failed: AtomicUsize,
 }
 
 /// skip_llm=true：本次会话跳过 AI 优化（快速模式）
@@ -93,15 +97,77 @@ pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) ->
     }
     let cfg = state.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default();
 
-    let rec = audio::start(
+    // 反馈先行：WASAPI 开流要 20ms~1s+（无线麦唤醒更久），提示音/悬浮窗若
+    // 排在开流之后，每次听写都会先经历一段「按了没反应」的空窗。提示文案
+    // 只依赖 cfg（纯计算），整体提前到 audio::start 之前发出；开流失败再补
+    // 一条 error 状态收场。失败上报收口在此处，hold / toggle / 托盘所有
+    // 入口共用，调用方分支只留 eprintln（避免双份 error 事件）
+    let sound = cfg.general.sound_feedback;
+    // 翻译提示只在 LLM 真正可用时显示（凭据组解析后判定；LLM 未配置时
+    // run() 会静默退回默认模式，提前剧透「翻译为 X」只会误导）
+    let llm_ready = {
+        let rl = cfg.resolved_llm();
+        rl.enabled && !rl.base_url.trim().is_empty()
+    };
+    let force_translate = !skip_llm && translate && llm_ready;
+    let hold = cfg.hotkey.mode == "hold";
+    let hint = if skip_llm {
+        if hold {
+            "松开快捷键结束（快速模式 · 不经 AI）".to_string()
+        } else {
+            "再次按下快捷键结束（快速模式 · 不经 AI）".to_string()
+        }
+    } else if force_translate {
+        let target = crate::config::lang_name(&cfg.llm.translate_target);
+        if hold {
+            format!("松开快捷键结束（翻译为 {target}）")
+        } else {
+            format!("再次按下快捷键结束（翻译为 {target}）")
+        }
+    } else if hold {
+        "松开快捷键结束并输入".to_string()
+    } else {
+        "再次按下快捷键结束并输入".to_string()
+    };
+    // 旧卡遗留的隐藏倒计时可能在「show 之后、录音装入 slot 之前」的窗口内
+    // 到期（reaper 只认 recording=Some，装 slot 要等 audio::start 返回），
+    // 把刚亮出的聆听卡藏掉且本会话再无补显——show 之前先取消倒计时关死窗口
+    cancel_hide();
+    emit_status(app, "recording", &hint, sound);
+    if cfg.general.show_overlay && !suppress_local_overlay(&cfg) {
+        overlay::show(app);
+    }
+
+    let rec = match audio::start(
         cfg.audio.device.as_deref(),
         cfg.audio.vad_threshold,
         cfg.audio.gain_db,
-    )
-    .map_err(|e| format!("{e:#}"))?;
+    ) {
+        Ok(rec) => rec,
+        Err(e) => {
+            // 悬浮窗已随「反馈先行」show 过，error 消息展示 3 秒后随
+            // hide_later 隐藏——用户不会再经历按住说话松开后毫无反馈
+            eprintln!("[speaknow] 开始录音失败: {e:#}");
+            emit_status(app, "error", &format!("开始录音失败：{e:#}"), false);
+            hide_later(app, 3000);
+            return Err(format!("{e:#}"));
+        }
+    };
+    // 指定设备不可见 → 已回退系统默认（audio::find_device 判定）：声音进的
+    // 是另一支麦，必须让用户知情；提示音已随首条 recording 状态播过，这里
+    // 只更新文案、不再响一声
+    if rec.used_fallback {
+        emit_status(
+            app,
+            "recording",
+            &format!("{hint}（指定设备不可用，已用系统默认麦克风）"),
+            false,
+        );
+    }
     let shared = rec.shared.clone();
     // 开流后再上锁检查写入：并发双触发（按键弹跳 / UI 与热键同拍）时，
-    // 后到者发现已在录音，丢弃自己多开的流（Drop 即停流），不覆盖进行中的会话
+    // 后到者发现已在录音，丢弃自己多开的流（Drop 即停流），不覆盖进行中的
+    // 会话。此路径已提前发出过 recording 状态——本就正在录音，无需补偿
     let mut slot = state.recording.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.is_some() {
         drop(slot);
@@ -129,10 +195,10 @@ pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) ->
         stream_finished: AtomicBool::new(!streaming),
         stream_queue: Mutex::new(VecDeque::new()),
         stream_texts: Mutex::new(Vec::new()),
+        stream_failed: AtomicUsize::new(0),
     });
     *slot = Some((rec, sess.clone()));
     drop(slot);
-    let sound = cfg.general.sound_feedback;
 
     if streaming {
         let handle = app.clone();
@@ -144,37 +210,9 @@ pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) ->
         });
     }
 
-    if cfg.general.show_overlay && !suppress_local_overlay(&cfg) {
-        overlay::show(app);
-    }
+    // sn-retryable 维持「会话建立后」的原时机：过早发送会在 audio::start
+    // 失败场景误清 UI 的重试标记（失败路径已在上方提前返回，到不了这里）
     events::emit(app, "sn-retryable", serde_json::json!(false));
-    // 翻译提示只在 LLM 真正可用时显示（凭据组解析后判定；LLM 未配置时
-    // run() 会静默退回默认模式，提前剧透「翻译为 X」只会误导）
-    let llm_ready = {
-        let rl = cfg.resolved_llm();
-        rl.enabled && !rl.base_url.trim().is_empty()
-    };
-    let force_translate = !skip_llm && translate && llm_ready;
-    let hold = cfg.hotkey.mode == "hold";
-    let hint = if skip_llm {
-        if hold {
-            "松开快捷键结束（快速模式 · 不经 AI）".to_string()
-        } else {
-            "再次按下快捷键结束（快速模式 · 不经 AI）".to_string()
-        }
-    } else if force_translate {
-        let target = crate::config::lang_name(&cfg.llm.translate_target);
-        if hold {
-            format!("松开快捷键结束（翻译为 {target}）")
-        } else {
-            format!("再次按下快捷键结束（翻译为 {target}）")
-        }
-    } else if hold {
-        "松开快捷键结束并输入".to_string()
-    } else {
-        "再次按下快捷键结束并输入".to_string()
-    };
-    emit_status(app, "recording", &hint, sound);
 
     let handle = app.clone();
     let watch_device = cfg.audio.device.clone();
@@ -204,18 +242,36 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig, sess: Arc<Session>) 
         }
         let seg = sess.stream_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
         match seg {
-            Some(samples) => match asr::transcribe(&app, &asr_cfg, &samples).await {
-                Ok(t) if !t.trim().is_empty() => {
+            Some(samples) => {
+                // 段级重试：asr::transcribe 只对云端网络类错误在内部重试一次
+                // （with_retry；鉴权/参数类与本地模型路径一次即弃），而流式
+                // 分段一旦丢弃就是永久缺句。这里对失败段再补一次短退避重试；
+                // 仍失败才计入 stream_failed 并放弃，收尾时向用户提示结果
+                // 可能不完整（云端网络类错误最多三次尝试，宁可多试不可丢句）
+                let text = match asr::transcribe(&app, &asr_cfg, &samples).await {
+                    Ok(t) => t,
+                    Err(first) => {
+                        eprintln!("[speaknow] 流式分段识别失败，重试一次: {first:#}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        match asr::transcribe(&app, &asr_cfg, &samples).await {
+                            Ok(t) => t,
+                            Err(second) => {
+                                eprintln!("[speaknow] 流式分段重试仍失败，放弃该段: {second:#}");
+                                sess.stream_failed.fetch_add(1, Ordering::SeqCst);
+                                String::new()
+                            }
+                        }
+                    }
+                };
+                if !text.trim().is_empty() {
                     let joined = {
                         let mut texts = sess.stream_texts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        texts.push(t);
+                        texts.push(text);
                         asr::join_transcripts(&texts)
                     };
                     events::emit(&app, "sn-partial", serde_json::json!({ "text": joined }));
                 }
-                Ok(_) => {}
-                Err(e) => eprintln!("[speaknow] 流式分段识别失败: {e:#}"),
-            },
+            }
             None => {
                 if sess.stream_done.load(Ordering::SeqCst) {
                     sess.stream_finished.store(true, Ordering::SeqCst);
@@ -569,10 +625,15 @@ pub async fn process_audio(
     emit_status(&app, "transcribing", asr_note, false);
     let t_asr = Instant::now();
 
+    // 本次结果中「确定缺句」的流式分段数：只有最终采纳的是流式拼接结果时
+    // 失败分段才真的缺失（整段兜底成功会覆盖全部失败分段，不计入，否则
+    // 会对着完整文本误报「可能不完整」）
+    let mut failed_segs_in_result = 0usize;
     let raw = if let Some(sess) = stream.as_ref() {
         // 等待本会话分段 worker 处理完队列（上限 30 秒；会话被新录音
         // 取代时立即放弃等待，由后置的代数检查统一作废）
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut wait_timed_out = false;
         loop {
             if sess.stream_finished.load(Ordering::SeqCst) {
                 break;
@@ -583,6 +644,7 @@ pub async fn process_audio(
             }
             if Instant::now() > deadline {
                 eprintln!("[speaknow] 等待流式分段超时");
+                wait_timed_out = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -595,6 +657,18 @@ pub async fn process_audio(
             // 兜底：整段识别
             asr::transcribe(&app, &cfg.asr, &samples).await
         } else {
+            failed_segs_in_result = sess.stream_failed.load(Ordering::SeqCst);
+            if wait_timed_out {
+                // 超时放弃等待时队列里可能还有未识别的分段：这些段既没进
+                // stream_texts 也没进失败计数，一并计入缺句数，否则
+                // 「缺 N 段」提示会漏报
+                let left = sess
+                    .stream_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len();
+                failed_segs_in_result += left;
+            }
             Ok(joined)
         }
     } else {
@@ -658,6 +732,14 @@ pub async fn process_audio(
         );
         return;
     }
+
+    // 分段失败可见化：done 消息末尾附带警示（不混入转写文本本身、不新增
+    // 事件类型）。空串时 format! 拼接零开销，各收尾消息保持原文
+    let seg_fail_note = if failed_segs_in_result > 0 {
+        format!(" · ⚠ 有 {failed_segs_in_result} 个分段识别失败，结果可能不完整")
+    } else {
+        String::new()
+    };
 
     // 会话已过期：新录音已开始，本代结果不再上屏、不再输入（防止旧文本
     // 晚到覆盖新输入；先于 sn-raw，过期转写连悬浮窗都不闪现）
@@ -755,14 +837,30 @@ pub async fn process_audio(
     let final_text = crate::text_clean::tidy_punct(&final_text);
 
     if from_ui {
-        let _ = inject::copy_only(&final_text);
-        finish_status(
-            &app,
-            "done",
-            "已复制到剪贴板（测试模式）",
-            3200,
-            cfg.general.sound_feedback,
-        );
+        // 测试模式的复制同样可能失败（剪贴板被剪贴板管理器/其他进程占用）：
+        // 如实报错而不是照常提示「已复制」——否则用户一试回放粘出旧内容，
+        // 会误判成识别错误而不是剪贴板问题
+        match inject::copy_only(&final_text) {
+            Ok(()) => {
+                finish_status(
+                    &app,
+                    "done",
+                    &format!("已复制到剪贴板（测试模式）{seg_fail_note}"),
+                    3200,
+                    cfg.general.sound_feedback,
+                );
+            }
+            Err(e) => {
+                eprintln!("[speaknow] 测试模式复制到剪贴板失败: {e:#}");
+                finish_status(
+                    &app,
+                    "error",
+                    &format!("复制失败：{e:#}"),
+                    3500,
+                    cfg.general.sound_feedback,
+                );
+            }
+        }
         return;
     }
 
@@ -796,12 +894,15 @@ pub async fn process_audio(
         llm_first_ms,
         duration_secs,
         stop_info,
+        &seg_fail_note,
     )
     .await;
 }
 
 /// 直接输入路径（历史 + 事件 + 粘贴）。gen 为本代会话代数：粘贴前若已有
 /// 新录音开始（代数前移），放弃输入并提示「已跳过」，杜绝旧句子晚到落进光标。
+/// note：追加到 done 阶段消息末尾的附加提示（流式分段失败警示；空 = 无）。
+/// 只挂在 done 消息上——error 阶段消息已自带失败原因，再追加缺句警示只会冲淡重点
 #[allow(clippy::too_many_arguments)]
 pub async fn finish_and_input(
     app: &AppHandle,
@@ -814,8 +915,9 @@ pub async fn finish_and_input(
     llm_first_ms: u64,
     audio_secs: f64,
     stop_info: Option<(u64, Instant)>,
+    note: &str,
 ) {
-    history::push(app, raw, final_text, asr_ms, llm_ms);
+    history::push(app, raw, final_text, asr_ms, llm_ms, "dictation");
     events::emit(
         app,
         "sn-result",
@@ -868,14 +970,14 @@ pub async fn finish_and_input(
         match r {
             Ok(true) => {
                 crate::trace_pipeline(app, "已输入");
-                finish_status(app, "done", &ok_msg, 3200, cfg.general.sound_feedback);
+                finish_status(app, "done", &format!("{ok_msg}{note}"), 3200, cfg.general.sound_feedback);
             }
             Ok(false) => {
                 crate::trace_pipeline(app, "输入跳过（已被新录音取代，结果已复制到剪贴板）");
                 finish_status(
                     app,
                     "done",
-                    "已被新录音取代 · 结果已复制，可右键 / Ctrl+V 手动粘贴",
+                    &format!("已被新录音取代 · 结果已复制，可右键 / Ctrl+V 手动粘贴{note}"),
                     3200,
                     cfg.general.sound_feedback,
                 );
@@ -892,14 +994,29 @@ pub async fn finish_and_input(
             }
         }
     } else {
-        let _ = inject::copy_only(final_text);
-        finish_status(
-            app,
-            "done",
-            "已复制到剪贴板",
-            3200,
-            cfg.general.sound_feedback,
-        );
+        // auto_paste 关闭时剪贴板是唯一输出通道：写入失败必须如实报错，
+        // 否则「已复制」提示会让用户对着旧剪贴板内容 Ctrl+V
+        match inject::copy_only(final_text) {
+            Ok(()) => {
+                finish_status(
+                    app,
+                    "done",
+                    &format!("已复制到剪贴板{note}"),
+                    3200,
+                    cfg.general.sound_feedback,
+                );
+            }
+            Err(e) => {
+                eprintln!("[speaknow] 结果复制到剪贴板失败: {e:#}");
+                finish_status(
+                    app,
+                    "error",
+                    &format!("复制失败：{e:#}"),
+                    3500,
+                    cfg.general.sound_feedback,
+                );
+            }
+        }
     }
 }
 
@@ -927,8 +1044,12 @@ pub fn hide_later(app: &AppHandle, ms: u64) {
                 HIDE_REMAINING_MS.store(0, Ordering::SeqCst);
                 continue;
             }
-            if state.overlay_pinned.load(Ordering::SeqCst) {
-                continue; // 悬停阅读中，计时暂停
+            if state.overlay_pinned.load(Ordering::SeqCst)
+                || crate::translate::overlay_hide_guarded()
+            {
+                // 悬停阅读中，或翻译卡生命周期内（听写晚到的收尾会重新武装
+                // 倒计时，不得把流式进行中的翻译卡连窗藏掉）：计时暂停
+                continue;
             }
             let left = HIDE_REMAINING_MS.load(Ordering::SeqCst);
             if left == 0 {
@@ -947,6 +1068,12 @@ pub fn hide_later(app: &AppHandle, ms: u64) {
             }
         });
     });
+}
+
+/// 取消待隐藏倒计时（翻译卡启动前调用：旧听写卡遗留的倒计时若不清，
+/// 会在新翻译流式期间把悬浮窗连卡片一起藏掉）
+pub fn cancel_hide() {
+    HIDE_REMAINING_MS.store(0, Ordering::SeqCst);
 }
 
 pub fn emit_status(app: &AppHandle, stage: &str, message: &str, sound: bool) {

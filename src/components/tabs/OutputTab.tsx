@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Button, Field, Section, Segmented, Select, Toggle } from '../Controls';
-import { isElevated, restartElevated } from '../../api';
+import { isElevated, isMac, restartElevated } from '../../api';
 import type { Config, TabProps } from '../../types';
 
 /* ============ 输出 ============ */
@@ -8,6 +8,8 @@ export function OutputTab({ cfg, set }: TabProps) {
   const [elevated, setElevated] = useState<boolean | null>(null);
   const [restarting, setRestarting] = useState(false);
   useEffect(() => {
+    // 管理员提权是 Windows 概念（is_elevated 恒 false、重启必失败）：mac 跳过探测
+    if (isMac) return;
     isElevated()
       .then(setElevated)
       .catch(() => setElevated(null));
@@ -37,34 +39,38 @@ export function OutputTab({ cfg, set }: TabProps) {
           ]}
         />
       </Field>
-      <Field
-        label="运行权限"
-        hint="终端 / PowerShell 若以管理员身份运行，系统（UIPI）会阻止普通权限程序向其粘贴或键入；SpeakNow 需同样以管理员运行才能输入"
-      >
-        <div className="flex flex-wrap items-center gap-3">
-          {elevated ? (
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-3 py-1.5 text-[12px] text-emerald-300">
-              ✓ 已以管理员身份运行 · 可向管理员窗口输入
-            </span>
-          ) : (
-            <>
-              <Button
-                kind="primary"
-                disabled={restarting}
-                onClick={() => {
-                  setRestarting(true);
-                  restartElevated().catch(() => setRestarting(false));
-                }}
-              >
-                {restarting ? '正在请求提权…' : '🛡 以管理员身份重启'}
-              </Button>
-              <span className="text-[11px] text-slate-500">
-                会弹出 UAC 确认；热键、配置与悬浮窗均保持不变
+      {/* 运行权限整块仅 Windows：mac 上 is_elevated 恒 false、提权重启静默失败，
+          UIPI/UAC 文案也无意义，直接隐藏（对齐 AsrTab/OcrTab 的平台门控方式） */}
+      {!isMac && (
+        <Field
+          label="运行权限"
+          hint="终端 / PowerShell 若以管理员身份运行，系统（UIPI）会阻止普通权限程序向其粘贴或键入；SpeakNow 需同样以管理员运行才能输入"
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            {elevated ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-3 py-1.5 text-[12px] text-emerald-300">
+                ✓ 已以管理员身份运行 · 可向管理员窗口输入
               </span>
-            </>
-          )}
-        </div>
-      </Field>
+            ) : (
+              <>
+                <Button
+                  kind="primary"
+                  disabled={restarting}
+                  onClick={() => {
+                    setRestarting(true);
+                    restartElevated().catch(() => setRestarting(false));
+                  }}
+                >
+                  {restarting ? '正在请求提权…' : '🛡 以管理员身份重启'}
+                </Button>
+                <span className="text-[11px] text-slate-500">
+                  会弹出 UAC 确认；热键、配置与悬浮窗均保持不变
+                </span>
+              </>
+            )}
+          </div>
+        </Field>
+      )}
       {cfg.output.method === 'clipboard' && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Field label="粘贴按键" hint="自动模式：Windows Terminal / WSL 等用 Ctrl+Shift+V，传统控制台用 Shift+Insert，其余窗口用 Ctrl+V；终端键入模式不依赖任何粘贴快捷键">
