@@ -85,6 +85,13 @@ pub fn foreground_process_name() -> String {
     }
 }
 
+/// 非 Windows：无 Win32 前台进程探测，返回空串（黑名单退化为仅标题匹配，
+/// 与 selection::foreground_title 的非 Windows 行为一致）
+#[cfg(not(target_os = "windows"))]
+pub fn foreground_process_name() -> String {
+    String::new()
+}
+
 /// 前台是否终端类窗口（终端里模拟 Ctrl+C 是中断信号，划词翻译须避开）
 #[cfg(target_os = "windows")]
 pub fn foreground_is_terminal() -> bool {
