@@ -1,6 +1,6 @@
 [package]
 name = "speaknow"
-version = "0.4.8"
+version = "0.4.9"
 description = "语音输入助手：全局快捷键 → 大模型 ASR 转写 → AI 纠错优化 → 自动输入到任意输入框"
 authors = ["SpeakNow Contributors"]
 license = "MIT"
@@ -72,6 +72,7 @@ features = [
   "Win32_System_Ole",
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_JobObjects",
   "Win32_System_Diagnostics_ToolHelp",

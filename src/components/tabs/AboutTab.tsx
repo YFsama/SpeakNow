@@ -6,7 +6,7 @@ import type { Config, TabProps } from '../../types';
 /* 历史更新（CHANGELOG 摘要）：默认只展开最近 2 期，其余折叠 */
 const RELEASES: { v: string; date: string; title: string; items: string[] }[] = [
   {
-    v: '开发中',
+    v: 'v0.4.9',
     date: '2026-10-03',
     title: '划词翻译 + 截图取词 + 本地翻译引擎 + 体验全面打磨',
     items: [
