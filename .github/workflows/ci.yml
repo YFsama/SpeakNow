@@ -67,6 +67,11 @@ jobs:
       - name: TypeScript typecheck
         run: npx tsc --noEmit
 
+      # 前后端契约对账：sn-* 事件与 invoke 命令名两侧字符串匹配，编译期
+      # 查不了拼写——这里机器兜底（错误级不对称直接红）
+      - name: Frontend/backend contract check
+        run: npm run contracts
+
       - name: Rust compile check (incl. examples)
         shell: bash
         run: |
