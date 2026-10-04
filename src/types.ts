@@ -38,6 +38,8 @@ export interface HotkeyConfig {
   keyOcr: string;
   mode: HotkeyMode;
   enabled: boolean;
+  /** 短于该时长的录音视为误触忽略（ms，默认 800；hold 模式说短口令可调低） */
+  minDurationMs: number;
 }
 
 /** 「系统默认输入」模式在按设备增益映射中的键 */
@@ -137,6 +139,8 @@ export interface TranslateConfig {
   clipboardWatch: boolean;
   /** Ctrl+C+C 双击复制即翻译（DeepL 式低级键盘钩子，仅 Windows，默认关） */
   ccc: boolean;
+  /** 双击判定窗口（ms，默认 350；慢手按不出可放宽到 500~600） */
+  cccWindowMs: number;
   /** 结构化智能翻译：JSON/YAML/键值只翻译字符串值，键名、注释、格式原样保留（默认开） */
   structuredTranslate: boolean;
   /** 翻译引擎：cloud（云端 LLM，默认）| local（本地 llama.cpp，离线·隐私·免费） */
@@ -168,6 +172,9 @@ export interface OutputConfig {
   restoreClipboard: boolean;
   /** 输入前在悬浮窗中确认（可编辑后再输入） */
   review: boolean;
+  /** 「自动回车」进程黑名单（关键字，大小写不敏感子串匹配）：命中只输入不回车，
+   *  防微信/QQ 等聊天工具把半句话直接发送 */
+  autoSubmitBlocklist: string[];
 }
 
 export interface GeneralConfig {

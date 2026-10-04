@@ -175,6 +175,20 @@ export function HotkeyTab({ cfg, set }: TabProps) {
           ]}
         />
       </Field>
+      <Field
+        label={`误触忽略阈值：低于 ${(cfg.hotkey.minDurationMs || 800) / 1000}s 的录音忽略`}
+        hint="防止衣袖擦过 / 误碰触发识别。按住说话模式下说「好」「停」这类单词级短口令被吞时，可调低到 0.3~0.5s"
+      >
+        <input
+          type="range"
+          min={300}
+          max={1500}
+          step={50}
+          value={cfg.hotkey.minDurationMs || 800}
+          onChange={(e) => set('hotkey', { minDurationMs: Number(e.target.value) })}
+          className="w-full"
+        />
+      </Field>
       <Toggle
         checked={cfg.hotkey.enabled}
         onChange={(enabled) => set('hotkey', { enabled })}

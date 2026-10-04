@@ -571,9 +571,16 @@ pub fn paste_text_checked(
             )
         })?;
         if cfg.auto_submit {
-            thread::sleep(Duration::from_millis(120));
-            e.key(Key::Return, Direction::Click)
-                .map_err(|err| anyhow::anyhow!("模拟回车失败: {err}"))?;
+            // 命中黑名单的前台应用只输入不回车：微信/QQ 等聊天工具里回车
+            // 等于「直接发送」，把还没改完的半句话发出去。文本已敲入，用户
+            // 自己按回车（跳过仅记日志，不打断输入流程）
+            if let Some(hit) = auto_submit_blocked(cfg) {
+                eprintln!("[speaknow] 自动回车被跳过：前台进程 {hit} 命中黑名单");
+            } else {
+                thread::sleep(Duration::from_millis(120));
+                e.key(Key::Return, Direction::Click)
+                    .map_err(|err| anyhow::anyhow!("模拟回车失败: {err}"))?;
+            }
         }
         return Ok(true);
     }
@@ -669,9 +676,14 @@ pub fn paste_text_checked(
     }
 
     if cfg.auto_submit {
-        thread::sleep(Duration::from_millis(150));
-        let mut e = new_enigo()?;
-        e.key(Key::Return, Direction::Click)?;
+        if let Some(hit) = auto_submit_blocked(cfg) {
+            // 同 typing 路径：文本已粘贴成功，只跳过回车；理由见该助手注释
+            eprintln!("[speaknow] 自动回车被跳过：前台进程 {hit} 命中黑名单");
+        } else {
+            thread::sleep(Duration::from_millis(150));
+            let mut e = new_enigo()?;
+            e.key(Key::Return, Direction::Click)?;
+        }
     }
     Ok(true)
 }
@@ -680,6 +692,26 @@ fn new_enigo() -> Result<Enigo> {
     Enigo::new(&Settings::default()).context(
         "初始化键盘模拟失败（macOS 需在 系统设置 → 隐私与安全性 → 辅助功能 中授权本应用）",
     )
+}
+
+/// 自动回车黑名单命中判定：前台进程名（不区分大小写的子串）命中配置的
+/// 任一关键字时返回命中项。聊天工具里回车=发送，误触代价是「把没改完的
+/// 半句话发出去」，故粘贴/键入照常、只拦回车；探测失败（进程名取不到）
+/// 时不拦截——黑名单是收紧项，宁可不误伤正常应用
+fn auto_submit_blocked(cfg: &OutputConfig) -> Option<String> {
+    if cfg.auto_submit_blocklist.is_empty() {
+        return None;
+    }
+    let fg = foreground_process_name();
+    if fg.is_empty() {
+        return None;
+    }
+    let fg = fg.to_lowercase();
+    cfg.auto_submit_blocklist
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .find(|k| fg.contains(k.as_str()))
 }
 
 fn send_paste_key(paste_key: &str) -> Result<()> {

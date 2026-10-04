@@ -447,14 +447,23 @@ export default function App() {
   }, []);
 
   // 设备列表自动刷新：无线接收器休眠/重新枚举后设备会迟到，
-  // 只在启动时拉一次会让已保存的麦克风在列表里「消失」，看起来像配置丢失
+  // 只在启动时拉一次会让已保存的麦克风在列表里「消失」，看起来像配置丢失。
+  // 窗口最小化到托盘后页面不可见：跳过轮询（WASAPI 枚举并非零开销，
+  // 部分驱动枚举还会引发音频卡顿），重新可见时立即补拉一次
   useEffect(() => {
-    const iv = setInterval(() => refreshDevices(), 10000);
+    const iv = setInterval(() => {
+      if (document.visibilityState === 'visible') refreshDevices();
+    }, 10000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refreshDevices();
+    };
     const onFocus = () => refreshDevices();
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       clearInterval(iv);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [refreshDevices]);
 

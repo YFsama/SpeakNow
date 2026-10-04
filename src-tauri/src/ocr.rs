@@ -668,10 +668,12 @@ fn cloud_ocr_region(
                 ]
             }]
         });
-        let client = reqwest::blocking::Client::builder()
+        // 共享阻塞客户端（连接复用）；60s 超时按请求覆盖默认的 2s 探测超时
+        let client = &*crate::http::CLIENT_BLOCKING;
+        let mut req = client
+            .post(&url)
             .timeout(Duration::from_secs(60))
-            .build()?;
-        let mut req = client.post(&url).json(&body);
+            .json(&body);
         if !llm.api_key.trim().is_empty() {
             req = req.bearer_auth(llm.api_key.trim());
         }

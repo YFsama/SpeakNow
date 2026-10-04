@@ -7,7 +7,7 @@
 //! 钩子永远不吞按键（始终 CallNextHookEx 透传）。注入事件（LLKHF_INJECTED，
 //! 含本应用模拟复制的 Ctrl+C）一律忽略，防止自激励。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -20,9 +20,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static TRIGGER_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
-/// 配置变化时应用：置开关；首次开启时装载钩子（之后常驻，开关只控制行为）
+/// 配置变化时应用：置开关 + 同步双击窗口；首次开启时装载钩子（之后常驻，开关只控制行为）
 pub fn apply(app: &AppHandle, cfg: &Config) {
     ENABLED.store(cfg.translate.ccc, Ordering::SeqCst);
+    WINDOW_MS.store(cfg.translate.ccc_window_ms.max(100) as u64, Ordering::SeqCst);
     if cfg.translate.ccc {
         start(app.clone());
     }
@@ -52,8 +53,10 @@ fn start(app: AppHandle) {
 
 /* ---------- 双击判定（纯逻辑，可单测） ---------- */
 
-/// 双击窗口：DeepL / pot 同类实现的常见值，快于常规连击、慢于滚键连发
-const WINDOW_MS: u64 = 350;
+/// 双击窗口（ms）：默认 350——DeepL / pot 同类实现的常见值，快于常规连击、
+/// 慢于滚键连发。用户可在翻译页放宽（慢手按不出 350ms 时）；apply 同步配置，
+/// 下限钳到 100ms 防止误配成「任何两次复制都算双击」
+static WINDOW_MS: AtomicU64 = AtomicU64::new(350);
 /// 小于该间隔视为一次按键的系统重复投递（自动重复/抖动），不算双击
 const NOISE_MS: u64 = 30;
 
@@ -67,8 +70,9 @@ impl CccState {
     /// 输入一次按键按下事件，返回是否构成 Ctrl+C 双击。
     /// 注入事件不参与判定也不清记忆（本应用模拟复制不打断用户节奏）；
     /// 非 C 键、无 Ctrl 的 C 一律重置记忆——
-    /// 「Ctrl+C → 别的键 → Ctrl+C」不触发，只有干净的双击才算
-    fn on_key(&mut self, vk_c: bool, ctrl: bool, injected: bool, now_ms: u64) -> bool {
+    /// 「Ctrl+C → 别的键 → Ctrl+C」不触发，只有干净的双击才算。
+    /// window_ms 由调用方传入（配置热更新），保持本函数纯逻辑可单测
+    fn on_key(&mut self, vk_c: bool, ctrl: bool, injected: bool, now_ms: u64, window_ms: u64) -> bool {
         if injected {
             return false;
         }
@@ -78,7 +82,7 @@ impl CccState {
         }
         let last = self.last_c_ms;
         self.last_c_ms = now_ms;
-        last != 0 && now_ms > last && now_ms - last <= WINDOW_MS && now_ms - last > NOISE_MS
+        last != 0 && now_ms > last && now_ms - last <= window_ms && now_ms - last > NOISE_MS
     }
 }
 
@@ -115,7 +119,10 @@ fn hook_thread() {
                     let st = STATE.get_or_init(|| std::sync::Mutex::new(CccState::default()));
                     let mut g = st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let now = windows::Win32::System::SystemInformation::GetTickCount64();
-                    if g.on_key(kb.vkCode == 0x43, ctrl, false, now) {
+                    // 窗口长度从静态原子量读（apply 热更新），回调仍只做一次
+                    // 原子读 + 时间戳比对，符合「纳秒级返回」的工程约束
+                    let win = WINDOW_MS.load(Ordering::Relaxed);
+                    if g.on_key(kb.vkCode == 0x43, ctrl, false, now, win) {
                         let _ = tx.send(());
                     }
                 }
@@ -139,9 +146,12 @@ fn hook_thread() {
 mod tests {
     use super::CccState;
 
+    /// 默认双击窗口（与线上默认一致；判定函数已参数化，测试显式传入）
+    const W: u64 = 350;
+
     /// 进度辅助：模拟一次按键并断言是否触发
     fn press(s: &mut CccState, vk_c: bool, ctrl: bool, injected: bool, at: u64) -> bool {
-        s.on_key(vk_c, ctrl, injected, at)
+        s.on_key(vk_c, ctrl, injected, at, W)
     }
 
     #[test]
@@ -159,6 +169,17 @@ mod tests {
         assert!(!press(&mut s, true, true, false, 1500));
         assert!(!press(&mut s, true, true, false, 2000));
         assert!(!press(&mut s, true, true, false, 3000));
+    }
+
+    #[test]
+    fn wider_window_accepts_slower_double_press() {
+        let mut s = CccState::default();
+        // 放宽到 500ms：420ms 的慢速双击默认窗口拒收、放宽后命中
+        assert!(!s.on_key(true, true, false, 1000, 350));
+        assert!(!s.on_key(true, true, false, 1420, 350));
+        let mut s2 = CccState::default();
+        assert!(!s2.on_key(true, true, false, 1000, 500));
+        assert!(s2.on_key(true, true, false, 1420, 500));
     }
 
     #[test]

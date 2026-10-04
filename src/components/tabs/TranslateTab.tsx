@@ -262,8 +262,24 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
             checked={cfg.translate.ccc === true}
             onChange={(ccc) => set('translate', { ccc })}
             label="Ctrl+C+C 双击复制即翻译"
-            desc="DeepL 式：350ms 内连按两次 Ctrl+C，把刚复制的内容直接送进翻译卡片——只译你想译的那一段，不用像剪贴板监听那样逢复制必弹。守卫与黑名单同上；仅 Windows"
+            desc="DeepL 式：短时间连按两次 Ctrl+C，把刚复制的内容直接送进翻译卡片——只译你想译的那一段，不用像剪贴板监听那样逢复制必弹。守卫与黑名单同上；仅 Windows"
           />
+        )}
+        {!isMac && cfg.translate.ccc && (
+          <Field
+            label={`双击判定窗口：${cfg.translate.cccWindowMs || 350}ms`}
+            hint="两次 Ctrl+C 的间隔在该窗口内才算双击。按不出双击（手慢 / 键程长）可放宽；过大会把两次独立复制误判为双击"
+          >
+            <input
+              type="range"
+              min={200}
+              max={600}
+              step={25}
+              value={cfg.translate.cccWindowMs || 350}
+              onChange={(e) => set('translate', { cccWindowMs: Number(e.target.value) })}
+              className="w-full"
+            />
+          </Field>
         )}
         <Toggle
           checked={cfg.translate.structuredTranslate !== false}

@@ -693,9 +693,11 @@ pub async fn process_audio(
         .map(|s| s.gen)
         .unwrap_or_else(|| app.state::<Ctx>().run_gen.load(Ordering::SeqCst));
 
-    // 极短录音视为误触，温和忽略（不识别、不写入历史）
+    // 极短录音视为误触，温和忽略（不识别、不写入历史）。阈值可调：hold
+    // 模式说单词级短口令（「好」「停」）被 800ms 默认吞掉时可在快捷键页调低
     let duration_secs = samples.len() as f64 / 16_000.0;
-    if duration_secs < 0.8 {
+    let min_secs = (cfg.hotkey.min_duration_ms.max(0) as f64) / 1000.0;
+    if duration_secs < min_secs {
         emit_status(&app, "done", "已忽略（录音太短）", false);
         hide_later(&app, 1400);
         return;

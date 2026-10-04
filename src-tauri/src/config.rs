@@ -102,6 +102,9 @@ pub struct HotkeyConfig {
     /// hold（按住说话）/ toggle（按一下开始/结束）
     pub mode: String,
     pub enabled: bool,
+    /// 短于该时长的录音视为误触忽略（不识别不进历史）。默认 800ms 防
+    /// 衣袖/误碰；hold 模式说单词级短口令（「好」「停」）可调低到 300~500
+    pub min_duration_ms: u32,
 }
 
 impl Default for HotkeyConfig {
@@ -114,6 +117,7 @@ impl Default for HotkeyConfig {
             key_ocr: String::new(),
             mode: "toggle".into(),
             enabled: true,
+            min_duration_ms: 800,
         }
     }
 }
@@ -315,6 +319,10 @@ pub struct TranslateConfig {
     /// 默认关闭；与剪贴板监听互不冲突，守卫（黑名单/自写/听写中）一致
     #[serde(default)]
     pub ccc: bool,
+    /// 双击判定窗口（ms）：两次 Ctrl+C 间隔在该窗口内才算双击。
+    /// 慢手用户按不出默认 350ms 时可放宽；过大会把两次独立复制误判为双击
+    #[serde(default = "default_ccc_window_ms")]
+    pub ccc_window_ms: u32,
     /// 结构化文本智能翻译：检测到 JSON / YAML / properties 等结构时只翻译字符串值，
     /// 键名、注释与格式原样保留（默认开启）
     pub structured_translate: bool,
@@ -338,6 +346,8 @@ impl Default for TranslateConfig {
             // 默认 Index-Translate-2B：B 站开源翻译专项模型，1.3GB 比 4B 对话模型
             // 更小、翻译质量更优（原生配方见 llm.rs）。已存配置的旧选择不受影响
             local_model: "index-translate-2b".into(),
+            // Ctrl+C+C 双击判定窗口：慢手用户按不出 350ms 可放宽到 500~600
+            ccc_window_ms: 350,
         }
     }
 }
@@ -400,6 +410,24 @@ pub struct OutputConfig {
     pub restore_clipboard: bool,
     /// 输入前在悬浮窗中确认（可编辑后再输入）
     pub review: bool,
+    /// 「输入后自动按回车」的进程黑名单（每行一个关键字，大小写不敏感）：
+    /// 前台进程名命中时只粘贴文本、不模拟回车——微信/QQ 等聊天工具里回车
+    /// 会把还没改完的半句话直接发出去。typing 输入方式同样受限
+    #[serde(default = "default_auto_submit_blocklist")]
+    pub auto_submit_blocklist: Vec<String>,
+}
+
+/// 常用即时通讯进程关键字：自动回车在这些应用里等于「直接发送」，
+/// 预置进黑名单让该开关从「全局危险」变「默认安全」
+fn default_auto_submit_blocklist() -> Vec<String> {
+    ["wechat", "weixin", "qq", "dingtalk", "feishu", "telegram", "discord", "slack"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_ccc_window_ms() -> u32 {
+    350
 }
 
 impl Default for OutputConfig {
@@ -411,6 +439,7 @@ impl Default for OutputConfig {
             auto_submit: false,
             restore_clipboard: true,
             review: false,
+            auto_submit_blocklist: default_auto_submit_blocklist(),
         }
     }
 }

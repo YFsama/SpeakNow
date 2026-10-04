@@ -787,11 +787,11 @@ async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, S
     if base.is_empty() {
         return Err("未配置接口地址".into());
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.get(format!("{base}/models"));
+    // 共享客户端（连接复用）；超时按请求覆盖
+    let client = &*crate::http::CLIENT;
+    let mut req = client
+        .get(format!("{base}/models"))
+        .timeout(Duration::from_secs(8));
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key.trim());
     }

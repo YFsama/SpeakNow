@@ -38,6 +38,7 @@ const mockConfig = {
     keyOcr: 'Alt+S',
     mode: 'toggle',
     enabled: true,
+    minDurationMs: 800,
   },
   audio: {
     device: 'DJI Mic 2 (USB)',
@@ -92,6 +93,7 @@ const mockConfig = {
     blacklist: '1Password\nKeePass',
     clipboardWatch: false,
     ccc: false,
+    cccWindowMs: 350,
     structuredTranslate: true,
     engine: 'local',
     localModel: 'index-translate-2b',
@@ -110,6 +112,7 @@ const mockConfig = {
     autoSubmit: false,
     restoreClipboard: true,
     review: false,
+    autoSubmitBlocklist: ['wechat', 'weixin', 'qq', 'dingtalk', 'feishu', 'telegram', 'discord', 'slack'],
   },
   general: {
     showOverlay: true,

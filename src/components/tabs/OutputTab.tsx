@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Field, Section, Segmented, Select, Toggle } from '../Controls';
+import { Button, Field, Section, Segmented, Select, TextArea, Toggle } from '../Controls';
 import { isElevated, isMac, restartElevated } from '../../api';
 import type { Config, TabProps } from '../../types';
 
@@ -119,8 +119,28 @@ export function OutputTab({ cfg, set }: TabProps) {
         checked={cfg.output.autoSubmit}
         onChange={(autoSubmit) => set('output', { autoSubmit })}
         label="输入后自动按回车提交"
-        desc="配合 Codex / ZCode 可实现「说完即发送」；终端类应用请谨慎开启"
+        desc="配合 Codex / ZCode 等可实现「说完即发送」；聊天类应用已由下方黑名单保护（只输入不回车）"
       />
+      {cfg.output.autoSubmit && (
+        <Field
+          label="回车黑名单（每行一个关键字）"
+          hint="前台进程名包含关键字时只输入文本、不模拟回车——微信 / QQ 等聊天工具里回车会把还没改完的话直接发送。已预置常见 IM，可增删"
+        >
+          <TextArea
+            rows={3}
+            value={cfg.output.autoSubmitBlocklist.join('\n')}
+            onChange={(v) =>
+              set('output', {
+                autoSubmitBlocklist: v
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              })
+            }
+            placeholder={'wechat\nqq\ntelegram'}
+          />
+        </Field>
+      )}
     </Section>
   );
 }
