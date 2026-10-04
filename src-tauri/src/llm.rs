@@ -624,6 +624,8 @@ async fn stream_once(
     let mut acc = String::new();
     let mut finish_reason: Option<String> = None;
     let mut reasoning_seen = false;
+    // 上次携带全量正文的时刻：节流用（见下方 content 增量处）
+    let mut last_full_emit: Option<Instant> = None;
     // 按字节缓冲、按完整行切分：多字节 UTF-8 字符可能被网络分块拦腰截断，
     // 逐 chunk 转字符串会产生乱码（U+FFFD）混进正文
     let mut buf: Vec<u8> = Vec::new();
@@ -683,17 +685,37 @@ async fn stream_once(
                         }
                     }
                     acc.push_str(c);
-                    events::emit(
-                        app,
-                        "sn-llm-delta",
-                        delta_payload(scope, "content", c, Some(&acc)),
-                    );
+                    // 全量累计正文按 120ms 节流：每 token 携带 O(n) 全文会让长输出
+                    // 的传输与序列化膨胀到 O(n²)（8k token 优化 / 60k 字结构化
+                    // 翻译批可达数十 MB IPC）；增量 delta 仍逐 token 发送，流末
+                    // 再补发一条全量正文对齐最终累计
+                    let full = match last_full_emit {
+                        Some(t) => t.elapsed().as_millis() >= 120,
+                        None => true,
+                    };
+                    let text = if full {
+                        last_full_emit = Some(Instant::now());
+                        Some(acc.as_str())
+                    } else {
+                        None
+                    };
+                    events::emit(app, "sn-llm-delta", delta_payload(scope, "content", c, text));
                 }
             }
         }
     }
     if superseded.is_some_and(|f| f()) {
         bail!("已被新的录音取代，中止本次优化");
+    }
+    // 流末补发全量正文：节流窗口内最后几段增量未带全文，消费端（悬浮窗
+    // 流式卡 / 审阅回填 textarea / 外接显示转发）以本条对齐最终累计。
+    // delta 为空串——只消费 delta 的累计器拼接 no-op，只看 text 的直接覆盖
+    if !acc.is_empty() {
+        events::emit(
+            app,
+            "sn-llm-delta",
+            delta_payload(scope, "content", "", Some(&acc)),
+        );
     }
     if acc.trim().is_empty() {
         // 全程无任何产出（非思考、无结束原因）多为网关不支持流式输出——回退非流式；
