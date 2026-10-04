@@ -302,8 +302,15 @@ async fn session(
         }
     }
 
-    let out = match crate::llm::optimize_streaming(&llm, &text, &app, Some(&first), Some(&superseded))
-        .await
+    let out = match crate::llm::optimize_streaming_scoped(
+        &llm,
+        &text,
+        &app,
+        Some(&first),
+        Some(&superseded),
+        crate::llm::SCOPE_TRANSLATE,
+    )
+    .await
     {
         Ok(t) => t,
         Err(e) => {
@@ -483,12 +490,13 @@ async fn translate_structured(
              译文中的字面 \\n 表示换行。文本：{{text}}"
         );
         let start = translations.len();
-        let numbered = match crate::llm::optimize_streaming(
+        let numbered = match crate::llm::optimize_streaming_scoped(
             &batch_llm,
             &list,
             app,
             None,
             Some(superseded),
+            crate::llm::SCOPE_TRANSLATE,
         )
         .await
         {
@@ -535,10 +543,12 @@ async fn translate_structured(
         if announce && total_batches > 1 {
             let _ = app.emit(
                 "sn-llm-delta",
-                serde_json::json!({
-                    "kind": "reasoning",
-                    "delta": format!("已完成 {}/{} 批…\n", bi + 1, total_batches),
-                }),
+                crate::llm::delta_payload(
+                    crate::llm::SCOPE_TRANSLATE,
+                    "reasoning",
+                    &format!("已完成 {}/{} 批…\n", bi + 1, total_batches),
+                    None,
+                ),
             );
         }
     }
@@ -838,6 +848,9 @@ fn clipboard_watch_loop(app: AppHandle) {
     /// 剪贴板里的内容长度上限：超长文本交给「输入翻译」工作台，卡片装不下也容易截断
     const TICK_MS: u64 = 600;
 
+    // 剪贴板序号（Windows 变更检测用；其使用点均在 windows 门控分支内，
+    // 非 Windows 走 last_text 内容比较——不门控会在 mac 上产生未用变量警告）
+    #[cfg(target_os = "windows")]
     let mut last_seq: u64 = 0;
     #[cfg(not(target_os = "windows"))]
     let mut last_text = String::new();

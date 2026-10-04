@@ -9,6 +9,7 @@ import type {
   LocalModelStatus,
   MicTestResult,
   ProviderProfile,
+  UsageStats,
 } from './types';
 
 export const isMac =
@@ -113,6 +114,11 @@ export const testLlm = (config: LlmConfig, providers: ProviderProfile[]) =>
 export const getHistory = () => invoke<HistoryItem[]>('get_history');
 export const clearHistory = () => invoke('clear_history');
 export const deleteHistory = (ts: number) => invoke('delete_history', { ts });
+/** 全量使用统计（累计口径：历史超窗删除后仍持续累计）。旧后端无此命令会 reject，调用方需回退 */
+export const getStats = () => invoke<UsageStats>('get_stats');
+/** 批量删除历史（多选），返回实际删除条数 */
+export const deleteHistoryBatch = (ts: number[]) =>
+  invoke<number>('delete_history_batch', { ts });
 /** mode 可选：本次重优化覆盖使用的模式（correct / polish / prompt / translate），不改全局配置 */
 export const regenerate = (ts: number, mode?: string | null) =>
   invoke<HistoryItem>('regenerate', { ts, mode: mode ?? null });
@@ -120,6 +126,12 @@ export const regenerate = (ts: number, mode?: string | null) =>
  *  Rust 形参 final_text，invoke 键须用 camelCase finalText */
 export const updateHistoryFinal = (ts: number, final: string) =>
   invoke('update_history_final', { ts, finalText: final });
+/** 收藏 / 取消收藏一条历史（置顶显示，不占保留条数名额） */
+export const historySetPin = (ts: number, pinned: boolean) =>
+  invoke('history_set_pin', { ts, pinned });
+/** 截取选区窗自身物理区域为 PNG base64（截图框选放大镜数据源） */
+export const ocrScreenSource = (x: number, y: number, w: number, h: number) =>
+  invoke<{ png: string; width: number; height: number }>('ocr_screen_source', { x, y, w, h });
 export const copyText = (text: string) => invoke('copy_text', { text });
 export const dismissOverlay = () => invoke('dismiss_overlay');
 export const overlayPin = (pinned: boolean) => invoke('overlay_pin', { pinned });
@@ -205,7 +217,9 @@ function applyThemeClass() {
 }
 
 /** 应用主题与缩放到当前窗口。theme === 'auto' 时跟随系统配色，
- *  系统切换实时响应；手动 dark / light 时忽略系统变化。 */
+ *  系统切换实时响应；手动 dark / light 时忽略系统变化。
+ *  实际解析出的外观写入 localStorage，供下次启动在配置加载前预应用
+ *  （消除浅色用户首屏骨架「先深后浅」闪变）。 */
 export function applyAppearance(theme: string, fontScale: number) {
   curTheme = theme;
   if (!mediaListenerInstalled) {
@@ -213,11 +227,26 @@ export function applyAppearance(theme: string, fontScale: number) {
     window
       .matchMedia('(prefers-color-scheme: light)')
       .addEventListener('change', () => {
-        if (curTheme === 'auto') applyThemeClass();
+        if (curTheme === 'auto') {
+          applyThemeClass();
+          cacheLight();
+        }
       });
   }
   applyThemeClass();
+  cacheLight();
   document.body.style.zoom = String(fontScale || 1);
+}
+
+function cacheLight() {
+  try {
+    localStorage.setItem(
+      'sn:light',
+      document.documentElement.classList.contains('light') ? '1' : '0',
+    );
+  } catch {
+    /* 隐私模式等 localStorage 不可用：跳过预缓存 */
+  }
 }
 
 const CODE_LABELS: Record<string, string> = {

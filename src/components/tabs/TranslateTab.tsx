@@ -143,11 +143,17 @@ export function TranslateTab({ cfg, set, toast, navigate, localModels, refreshLo
   }, [cfg.translate.engine, set, toast]);
 
   useEffect(() => {
-    const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
-      if (!busyRef.current || e.payload.kind !== 'content' || e.payload.text === undefined)
-        return;
-      setStream(e.payload.text);
-    });
+    const un = listen<{ kind: string; delta?: string; text?: string; scope?: string }>(
+      'sn-llm-delta',
+      (e) => {
+        // 仅消费翻译会话的流（scope=translate）：听写优化/重优化共用本频道，
+        // 并发时不得把别的卡的增量写进工作台（契约 C2）
+        if (e.payload.scope !== 'translate') return;
+        if (!busyRef.current || e.payload.kind !== 'content' || e.payload.text === undefined)
+          return;
+        setStream(e.payload.text);
+      },
+    );
     return () => {
       un.then((f) => f());
     };

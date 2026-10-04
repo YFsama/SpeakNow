@@ -236,6 +236,17 @@ export interface HistoryItem {
   llmMs?: number | null;
   /** dictation（听写）/ translate（划词·输入翻译）/ ocr（截图取词）；旧数据缺省时按 asrMs==null 推断为 translate */
   kind?: 'dictation' | 'translate' | 'ocr';
+  /** 收藏置顶：不占保留条数名额，截断时始终保留（后端上限 20 个） */
+  pinned?: boolean;
+}
+
+/** 全量使用统计（后端 stats.json 持久累计，不受历史保留窗口影响）。
+ *  days 为 [YYYY-MM-DD, 条数]，按日期升序、只含最近 60 天；
+ *  chars 与前端 [...str].length 同为码点口径。 */
+export interface UsageStats {
+  total: number;
+  chars: number;
+  days: [string, number][];
 }
 
 export type Stage =

@@ -482,6 +482,22 @@ fn capture_region(
     h: i32,
     target: Option<(i32, i32)>,
 ) -> anyhow::Result<BgraFrame> {
+    capture_region_opts(x, y, w, h, target, true)
+}
+
+/// `layered`：是否带 CAPTUREBLT（纳入分层窗口）。OCR 识别路径需要（其他
+/// 应用的悬浮层也是屏幕内容）；放大镜底图必须**不带**——选区窗自身就是
+/// 透明分层窗，带着截会把遮罩/十字准线/提示横幅烤进底图（本窗口自己的
+/// 140ms 残影等待就是同一问题的自证），像素级对准会被自家准线遮蔽
+#[allow(clippy::too_many_arguments)]
+fn capture_region_opts(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    target: Option<(i32, i32)>,
+    layered: bool,
+) -> anyhow::Result<BgraFrame> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
         GetDIBits, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
@@ -499,10 +515,11 @@ fn capture_region(
             anyhow::bail!("打开屏幕 DC 失败");
         }
         let memdc = CreateCompatibleDC(Some(screen));
-        // 中转位图：按原始尺寸整块 BitBlt（CAPTUREBLT 纳入分层窗口）
+        // 中转位图：按原始尺寸整块 BitBlt（layered 时 CAPTUREBLT 纳入分层窗口）
+        let rop = if layered { SRCCOPY | CAPTUREBLT } else { SRCCOPY };
         let src_bmp = CreateCompatibleBitmap(screen, w, h);
         let src_old = SelectObject(memdc, HGDIOBJ::from(src_bmp));
-        let blit_ok = BitBlt(memdc, 0, 0, w, h, Some(screen), x, y, SRCCOPY | CAPTUREBLT).is_ok();
+        let blit_ok = BitBlt(memdc, 0, 0, w, h, Some(screen), x, y, rop).is_ok();
         if !blit_ok {
             SelectObject(memdc, src_old);
             let _ = DeleteObject(HGDIOBJ::from(src_bmp));
@@ -689,6 +706,35 @@ pub(crate) fn capture_region_pub(
     target: Option<(i32, i32)>,
 ) -> anyhow::Result<BgraFrame> {
     capture_region(x, y, w, h, target)
+}
+
+/// 截取指定物理像素区域并编码为 PNG base64（截图框选放大镜的数据源）。
+/// 返回 (base64, 宽, 高)。区域取自屏幕实时内容——调用时机在选区层起笔时，
+/// 层上尚无任何已绘制元素，不会把框选 UI 自己拍进去
+#[cfg(target_os = "windows")]
+pub(crate) fn screen_source(x: i32, y: i32, w: i32, h: i32) -> anyhow::Result<(String, u32, u32)> {
+    // 不带 CAPTUREBLT：把选区窗自身（遮罩/准线/横幅）排除在底图之外
+    let frame = capture_region_opts(x, y, w, h, None, false)?;
+    let img = image::RgbaImage::from_raw(frame.width, frame.height, {
+        let mut rgba = frame.pixels.clone();
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2); // BGRA → RGBA
+        }
+        rgba
+    })
+    .ok_or_else(|| anyhow::anyhow!("像素缓冲尺寸异常"))?;
+    let (width, height) = (img.width(), img.height());
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("PNG 编码失败: {e}"))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+    Ok((b64, width, height))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn screen_source(_x: i32, _y: i32, _w: i32, _h: i32) -> anyhow::Result<(String, u32, u32)> {
+    anyhow::bail!("截图放大镜当前仅支持 Windows")
 }
 
 /* ---------- PP-OCRv5 质量档（oar-ocr + ModelScope 模型，约 21MB） ---------- */

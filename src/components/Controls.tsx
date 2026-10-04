@@ -332,6 +332,97 @@ export function Segmented<T extends string>({
   );
 }
 
+/* ============ 单选卡片外壳（键盘/读屏可达） ============ */
+
+/** 选择卡的语义化外壳：div + role="radio" + roving tabindex + 合成键盘操作。
+    用 div 而非 button 是刻意的——卡片内部常含子按钮（⚡测试 / ↓下载 / 🗑删除），
+    button 嵌套 button 是无效 HTML（React 告警 validateDOMNesting，读屏播报降级）；
+    Enter/Space 由 onKeyDown 合成触发（带 e.target 守卫，不劫持卡内子按钮），
+    方向键在组内兄弟卡间移动焦点并选中（WAI-ARIA radiogroup 模式）。
+    不自带任何选中样式——选中态视觉差异由使用方经 className/children 传入；
+    本组件只补焦点环与指针光标。roving tabindex：选中项 0、其余 -1；组内
+    无选中项时第一张卡兜底 0（见 useEffect）。容器需标 role="radiogroup" + aria-label */
+export function RadioCard({
+  checked,
+  onCheck,
+  children,
+  className = '',
+  disabled = false,
+  title,
+}: {
+  checked: boolean;
+  onCheck: () => void;
+  children: ReactNode;
+  className?: string;
+  disabled?: boolean;
+  title?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  /* roving tabindex 兜底：组内无任何选中项（如已保存设备被拔出）时，
+     第一张卡保持可聚焦，避免整组被 Tab 跳过。直接改 DOM 的 tabIndex 与
+     React 属性共存——prop 值不变时 React 不会回写覆盖，本副作用每次
+     渲染后自纠 */
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (checked) {
+      el.tabIndex = 0;
+      return;
+    }
+    const group = el.parentElement;
+    const hasChecked = !!group?.querySelector('[role="radio"][aria-checked="true"]');
+    const isFirst = group?.querySelector('[role="radio"]') === el;
+    el.tabIndex = !hasChecked && isFirst ? 0 : -1;
+  });
+
+  return (
+    <div
+      ref={ref}
+      role="radio"
+      aria-checked={checked}
+      aria-disabled={disabled || undefined}
+      tabIndex={checked ? 0 : -1}
+      onClick={disabled ? undefined : onCheck}
+      onKeyDown={(e) => {
+        if (disabled) return;
+        /* 只处理落在本卡上的按键：卡内子按钮（⚡测试 / ↓下载 / 🗑删除）的
+           Enter/Space 冒泡到此处时不得劫持——否则键盘触发子按钮会变成选中整卡 */
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onCheck();
+          return;
+        }
+        /* WAI-ARIA radiogroup 方向键导航：焦点与选中一起移到上/下一张卡 */
+        const dir =
+          e.key === 'ArrowLeft' || e.key === 'ArrowUp'
+            ? -1
+            : e.key === 'ArrowRight' || e.key === 'ArrowDown'
+              ? 1
+              : 0;
+        if (dir === 0) return;
+        e.preventDefault();
+        const cards = [
+          ...(e.currentTarget.parentElement?.querySelectorAll<HTMLElement>(
+            '[role="radio"]:not([aria-disabled="true"])',
+          ) ?? []),
+        ];
+        const i = cards.indexOf(e.currentTarget);
+        const next = cards[(i + dir + cards.length) % cards.length];
+        if (next && next !== e.currentTarget) {
+          next.focus();
+          next.click();
+        }
+      }}
+      title={title}
+      className={`cursor-pointer focus-visible:ring-2 focus-visible:ring-sky-400/60 focus-visible:outline-none ${className}`}
+    >
+      {children}
+    </div>
+  );
+}
+
 /* ============ 按钮 ============ */
 
 export function Button({
@@ -385,6 +476,7 @@ export function ConfirmButton({
   onConfirm,
   className = '',
   timeoutMs = 3500,
+  title,
 }: {
   label: ReactNode;
   confirmLabel?: ReactNode;
@@ -392,6 +484,8 @@ export function ConfirmButton({
   className?: string;
   /** 待确认态无操作多久自动复位 */
   timeoutMs?: number;
+  /** 悬停提示（透传原生 title） */
+  title?: string;
 }) {
   const [arming, setArming] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -425,6 +519,7 @@ export function ConfirmButton({
     <button
       type="button"
       onClick={onClick}
+      title={title}
       className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] ${
         arming
           ? 'border-red-400/30 bg-red-500/15 text-red-300'

@@ -11,6 +11,23 @@ use crate::events;
 /// 判断本次优化是否已过期（如已被新录音取代）；返回 true 时流式读取立即中止
 pub type Superseded<'a> = Option<&'a (dyn Fn() -> bool + Send + Sync)>;
 
+/// sn-llm-delta 流归属标记（契约 C2）：听写优化 / 设置页重优化链路
+pub(crate) const SCOPE_LLM: &str = "llm";
+/// sn-llm-delta 流归属标记：划词 / 复制即翻译 / 输入翻译工作台链路
+pub(crate) const SCOPE_TRANSLATE: &str = "translate";
+
+/// sn-llm-delta 载荷构造：`scope` 标记本条流属于哪条链路（llm / translate），
+/// 前端各卡据此分流——审阅重优化与划词翻译真并发时各归各卡，互不串字。
+/// `text`：content 增量随带的累计正文（reasoning 增量无此字段）
+pub(crate) fn delta_payload(scope: &str, kind: &str, delta: &str, text: Option<&str>) -> Value {
+    match text {
+        Some(t) => {
+            serde_json::json!({ "scope": scope, "kind": kind, "delta": delta, "text": t })
+        }
+        None => serde_json::json!({ "scope": scope, "kind": kind, "delta": delta }),
+    }
+}
+
 /// 术语表条目：规范写法 + 常见误识形式。
 /// 支持两种行格式：`Rust` 或 `Rust=拉斯特|拉斯`（「=」右侧为该词的典型 ASR 误识，
 /// 原文命中误识形式时会在提示词里点名要求纠正，命中比泛泛列出有效得多）。
@@ -399,19 +416,34 @@ async fn chat_nostream(
     })
 }
 
-/// 流式优化：SSE 逐 token 经 sn-llm-delta 事件推给悬浮窗（content 逐字上屏、
-/// reasoning_content 以「思考中」暗色小字展示），返回完整正文。
-/// 输出经过关键词对齐守卫：先做确定性的术语误识替换，仍有丢失时以「思考中」
-/// 提示并定点修补重试一次（带上一次输出、只修关键词），重试不占优则保留原版。
-/// `first_token_ms`：可选输出——首个正文 token 的耗时（流式体验的关键指标）。
-/// `superseded`：可选谓词——为 true 时（如已被新录音取代）立即中止，不再耗费流量。
-/// 接口不支持 stream 或流式全程未产出内容时，自动回退非流式请求。
+/// 流式优化（听写优化 / 设置页重优化链路，scope 固定为 "llm"）：
+/// 参数与行为见 [`optimize_streaming_scoped`]
 pub async fn optimize_streaming(
     cfg: &LlmConfig,
     raw: &str,
     app: &AppHandle,
     first_token_ms: Option<&std::sync::atomic::AtomicU64>,
     superseded: Superseded<'_>,
+) -> anyhow::Result<String> {
+    optimize_streaming_scoped(cfg, raw, app, first_token_ms, superseded, SCOPE_LLM).await
+}
+
+/// 流式优化：SSE 逐 token 经 sn-llm-delta 事件推给悬浮窗（content 逐字上屏、
+/// reasoning_content 以「思考中」暗色小字展示），返回完整正文。
+/// 输出经过关键词对齐守卫：先做确定性的术语误识替换，仍有丢失时以「思考中」
+/// 提示并定点修补重试一次（带上一次输出、只修关键词），重试不占优则保留原版。
+/// `first_token_ms`：可选输出——首个正文 token 的耗时（流式体验的关键指标）。
+/// `superseded`：可选谓词——为 true 时（如已被新录音取代）立即中止，不再耗费流量。
+/// `scope`：sn-llm-delta 载荷的流归属标记——听写优化/重优化传 [`SCOPE_LLM`]，
+/// 划词/输入翻译传 [`SCOPE_TRANSLATE`]（前端按 scope 把并发流各归各卡）。
+/// 接口不支持 stream 或流式全程未产出内容时，自动回退非流式请求。
+pub async fn optimize_streaming_scoped(
+    cfg: &LlmConfig,
+    raw: &str,
+    app: &AppHandle,
+    first_token_ms: Option<&std::sync::atomic::AtomicU64>,
+    superseded: Superseded<'_>,
+    scope: &str,
 ) -> anyhow::Result<String> {
     let user = user_content(cfg, raw);
     // 思考系模型在纠错/润色任务首轮即关思考（快路径）：语音输入首字延迟优先，
@@ -423,6 +455,7 @@ pub async fn optimize_streaming(
         app,
         first_token_ms,
         superseded,
+        scope,
         TOKEN_FLOOR,
         fast.as_ref(),
     )
@@ -446,7 +479,7 @@ pub async fn optimize_streaming(
         events::emit(
             app,
             "sn-llm-delta",
-            serde_json::json!({ "kind": "reasoning", "delta": format!("⚠ {why}…\n") }),
+            delta_payload(scope, "reasoning", &format!("⚠ {why}…\n"), None),
         );
         let extra = starved_retry_extra(&outcome);
         match stream_once(
@@ -455,6 +488,7 @@ pub async fn optimize_streaming(
             app,
             first_token_ms,
             superseded,
+            scope,
             TOKEN_FLOOR_RETRY,
             Some(&extra),
         )
@@ -494,10 +528,7 @@ pub async fn optimize_streaming(
     events::emit(
         app,
         "sn-llm-delta",
-        serde_json::json!({
-            "kind": "reasoning",
-            "delta": format!("⚠ {why}，定点修补中…\n")
-        }),
+        delta_payload(scope, "reasoning", &format!("⚠ {why}，定点修补中…\n"), None),
     );
     match stream_once(
         cfg,
@@ -505,6 +536,7 @@ pub async fn optimize_streaming(
         app,
         first_token_ms,
         superseded,
+        scope,
         TOKEN_FLOOR_RETRY,
         None,
     )
@@ -533,7 +565,7 @@ pub async fn optimize_streaming(
     }
 }
 
-/// 单次流式请求（守卫逻辑在外层包装）
+/// 单次流式请求（守卫逻辑在外层包装）；`scope` 透传 sn-llm-delta 载荷
 #[allow(clippy::too_many_arguments)]
 async fn stream_once(
     cfg: &LlmConfig,
@@ -541,6 +573,7 @@ async fn stream_once(
     app: &AppHandle,
     first_token_ms: Option<&std::sync::atomic::AtomicU64>,
     superseded: Superseded<'_>,
+    scope: &str,
     token_floor: usize,
     extra: Option<&Value>,
 ) -> anyhow::Result<ChatOutcome> {
@@ -623,7 +656,7 @@ async fn stream_once(
                     events::emit(
                         app,
                         "sn-llm-delta",
-                        serde_json::json!({ "kind": "reasoning", "delta": rc }),
+                        delta_payload(scope, "reasoning", rc, None),
                     );
                 }
             }
@@ -644,7 +677,7 @@ async fn stream_once(
                     events::emit(
                         app,
                         "sn-llm-delta",
-                        serde_json::json!({ "kind": "content", "delta": c, "text": acc }),
+                        delta_payload(scope, "content", c, Some(&acc)),
                     );
                 }
             }

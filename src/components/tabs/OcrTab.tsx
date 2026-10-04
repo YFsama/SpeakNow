@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { Button, Field, Section, Select, Toggle } from '../Controls';
+import { Button, Field, RadioCard, Section, Select, Toggle } from '../Controls';
 import {
   deleteBuiltin,
   downloadBuiltin,
@@ -211,11 +211,17 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
         title="识别引擎"
         desc="系统内置引擎零下载、毫秒级；PP-OCR 质量档中文准确率更高（约 21MB 模型，离线推理零上传）。"
       >
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        {/* 三张引擎卡统一为 RadioCard 语义化单选组（role=radio + roving tabindex），
+            选中样式类与视觉结构原样保留 */}
+        <div
+          role="radiogroup"
+          aria-label="识别引擎"
+          className="grid grid-cols-1 gap-3 sm:grid-cols-3"
+        >
           {/* 系统内置引擎卡 */}
-          <button
-            type="button"
-            onClick={() => set('ocr', { engine: 'system' })}
+          <RadioCard
+            checked={engine === 'system'}
+            onCheck={() => set('ocr', { engine: 'system' })}
             className={`rounded-xl border px-3.5 py-3 text-left transition ${
               engine === 'system'
                 ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
@@ -236,21 +242,20 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
             <div className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
               零下载零依赖 · 毫秒级 · 依赖系统语言包
             </div>
-          </button>
+          </RadioCard>
 
-          {/* PP-OCR 质量档卡（含模型下载管理）。选中态与其他引擎卡统一为 sky；violet 仅作类别徽章色 */}
-          <div
-            className={`rounded-xl border px-3.5 py-3 transition ${
+          {/* PP-OCR 质量档卡（含模型下载管理）。选中态与其他引擎卡统一为 sky；violet 仅作类别徽章色。
+              外层换 RadioCard 后整卡可选中（与两侧卡一致），原内层全宽选择按钮退化为纯排版行 */}
+          <RadioCard
+            checked={engine === 'ppocr'}
+            onCheck={() => set('ocr', { engine: 'ppocr' })}
+            className={`rounded-xl border px-3.5 py-3 text-left transition ${
               engine === 'ppocr'
                 ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
                 : 'border-white/[0.07] bg-black/20'
             }`}
           >
-            <button
-              type="button"
-              onClick={() => set('ocr', { engine: 'ppocr' })}
-              className="flex w-full items-center gap-2 text-left"
-            >
+            <div className="flex w-full items-center gap-2">
               <span
                 className={`h-3.5 w-3.5 shrink-0 rounded-full border-2 transition ${
                   engine === 'ppocr'
@@ -273,13 +278,14 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
                   {fmtSize(ppocr.sizeMb)}
                 </span>
               )}
-            </button>
+            </div>
             <div className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
               中文准确率更高 · 离线推理零上传 · 首次识别加载约 1 秒
             </div>
 
+            {/* 下载/删除区 stopPropagation：点击管理按钮不连带触发整卡选中（与换壳前的点击行为一致） */}
             {ppocr && !ppocr.downloaded && !downloading && (
-              <div className="mt-2.5">
+              <div className="mt-2.5" onClick={(e) => e.stopPropagation()}>
                 <Button onClick={onDownload}>↓ 下载模型（ModelScope 直连）</Button>
               </div>
             )}
@@ -298,18 +304,18 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
               </div>
             )}
             {ppocr?.downloaded && (
-              <div className="mt-2.5">
+              <div className="mt-2.5" onClick={(e) => e.stopPropagation()}>
                 <Button kind="ghost" onClick={onDelete}>
                   {confirmDel ? '再点一次确认删除' : '删除模型（释放空间）'}
                 </Button>
               </div>
             )}
-          </div>
+          </RadioCard>
 
           {/* 云端档引擎卡。选中态统一 sky；amber 仅作类别徽章色 */}
-          <button
-            type="button"
-            onClick={() => set('ocr', { engine: 'cloud' })}
+          <RadioCard
+            checked={engine === 'cloud'}
+            onCheck={() => set('ocr', { engine: 'cloud' })}
             className={`rounded-xl border px-3.5 py-3 text-left transition ${
               engine === 'cloud'
                 ? 'border-sky-500/70 bg-sky-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
@@ -333,7 +339,7 @@ export function OcrTab({ cfg, set, toast, navigate, localModels, refreshLocalMod
             <div className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
               GLM-4.6V-Flash 免费档起步 · 复杂版面最强 · 截图会上传
             </div>
-          </button>
+          </RadioCard>
         </div>
         {engine === 'cloud' && (
           <div className="rounded-xl border border-amber-400/25 bg-amber-400/[0.06] px-3.5 py-3 text-[11.5px] leading-relaxed text-amber-200/90">

@@ -195,6 +195,30 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
     }
   };
 
+  /* 测试连接行（按钮 + 结果反馈）：由 Section 尾部上移至凭据选择区之后，
+     改完凭据即可就近验证；原底部入口移除避免双入口，
+     loading / 成功 / 失败反馈复用同一 state，逻辑不变 */
+  const testConnRow = (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button onClick={run} disabled={test.loading}>
+        {test.loading ? (
+          <>
+            <Spinner size={13} /> 测试中…
+          </>
+        ) : (
+          '测试连接'
+        )}
+      </Button>
+      {test.msg && (
+        <span
+          className={`text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
+        >
+          {test.msg}
+        </span>
+      )}
+    </div>
+  );
+
   return (
     <Section
       icon="✨"
@@ -305,6 +329,8 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
               />
             </Field>
           )}
+          {/* 测试连接上移：「启用 AI 优化」与凭据选择区之后，改完凭据即可就近验证 */}
+          {testConnRow}
           <Field label="服务商预设">
             <Select
               value={preset}
@@ -621,24 +647,6 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
                   </span>
                 ))}
               </div>
-            )}
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={run} disabled={test.loading}>
-              {test.loading ? (
-                <>
-                  <Spinner size={13} /> 测试中…
-                </>
-              ) : (
-                '测试连接'
-              )}
-            </Button>
-            {test.msg && (
-              <span
-                className={`text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
-              >
-                {test.msg}
-              </span>
             )}
           </div>
         </>

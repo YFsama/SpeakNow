@@ -45,6 +45,30 @@ const MODE_LABELS: Record<string, string> = {
   translate: '翻译',
 };
 
+/* sn-llm-delta 载荷：scope 标记流的归属链路（"llm"=听写优化 / 设置页重优化，
+   "translate"=划词 · 复制即翻译 · 输入翻译工作台）。各消费端按 scope 分流，
+   审阅重优化与划词翻译真并发时各归各卡、互不串字（契约 C2）；
+   scope 缺省视作 "llm"，兼容未携带该字段的旧后端 */
+type LlmDelta = { kind: string; delta?: string; text?: string; scope?: string };
+
+/* sn-partial 载荷：text=已完成段的拼接字幕（旧字段，语义不变）；segs=已
+   定稿段数；last=最后一段原文（后端以 trim 后段落拼接，text 恒以 last 结
+   尾）——供段尾切分渲染「暂存样式」。segs/last 缺省（旧后端）时前端归一
+   化为 0/''，整体按普通样式渲染，行为与旧版一致 */
+type PartialPayload = { text: string; segs?: number; last?: string };
+/* 前端持有的 partial 状态：segs/last 归一化必有值 */
+type PartialState = { text: string; segs: number; last: string };
+
+/* 段尾切分：last 命中 text 末尾时切出 head（已定稿段）/ tail（最后一段 →
+   暂存样式）。不命中（旧后端无 last / 极端拼接差异）则整体作为 head 正常
+   渲染——endsWith/slice 均按 UTF-16 码元切分，与命中判定口径一致 */
+function splitPartialTail(p: { text: string; last: string }): { head: string; tail: string } {
+  if (p.last && p.text.endsWith(p.last)) {
+    return { head: p.text.slice(0, p.text.length - p.last.length), tail: p.last };
+  }
+  return { head: p.text, tail: '' };
+}
+
 /* 划词翻译卡片状态（独立于听写 stage 机器：由 sn-translate-* 事件驱动） */
 interface TransCard {
   text: string;
@@ -320,7 +344,10 @@ const LlmStream = memo(function LlmStream({
   }, [stage]);
 
   useEffect(() => {
-    const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
+    const un = listen<LlmDelta>('sn-llm-delta', (e) => {
+      /* 只消费听写侧的流：翻译会话共用本频道（scope 见 LlmDelta 注释），
+         并发时不得把译文增量写进听写优化卡 */
+      if (e.payload.scope === 'translate') return;
       if (e.payload.kind === 'content' && e.payload.text !== undefined) {
         setLlmText(e.payload.text);
       } else if (e.payload.kind === 'reasoning' && e.payload.delta) {
@@ -433,7 +460,7 @@ export default function Overlay() {
   const [meta, setMeta] = useState<MetaPayload | null>(null);
   const [target, setTarget] = useState('');
   const [rawText, setRawText] = useState('');
-  const [partial, setPartial] = useState('');
+  const [partial, setPartial] = useState<PartialState>({ text: '', segs: 0, last: '' });
   const [result, setResult] = useState('');
   const [resultId, setResultId] = useState(0);
   const [usedLlm, setUsedLlm] = useState(false);
@@ -452,6 +479,9 @@ export default function Overlay() {
   const [aboveInput, setAboveInput] = useState(true);
   const [retryable, setRetryable] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  /* 录音期提示（临近最长时长自动结束等）：来自 sn-status 的 hint 型载荷，
+     常规状态切换时清空 */
+  const [recHint, setRecHint] = useState('');
   const [editText, setEditText] = useState('');
   const [optimizing, setOptimizing] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -528,9 +558,10 @@ export default function Overlay() {
   /* 审阅窗口「重新优化」的流式回填：增量不进 React 状态（逐 token setState 会
      整卡重渲染审阅 UI），改为把事件携带的累计文本直接写入 textarea */
   useEffect(() => {
-    const un = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
+    const un = listen<LlmDelta>('sn-llm-delta', (e) => {
       if (
         !reoptStreamRef.current ||
+        e.payload.scope === 'translate' || // 与划词翻译并发时互不串字（C2）
         e.payload.kind !== 'content' ||
         e.payload.text === undefined
       )
@@ -609,10 +640,17 @@ export default function Overlay() {
   }, [stage, result, doneTextH]);
 
   useEffect(() => {
-    const un1 = listen<{ stage: Stage; message: string; sound?: boolean }>(
+    const un1 = listen<{ stage: Stage; message: string; sound?: boolean; hint?: boolean }>(
       'sn-status',
       (e) => {
         const p = e.payload;
+        // hint 型状态（录音临近最长时长等，后端 watch 循环发出）：只刷新提示
+        // 文案——常规路径的阶段切换与清场会把录音中的流式字幕等闪断
+        if (p.hint) {
+          setRecHint(p.message ?? '');
+          return;
+        }
+        setRecHint('');
         setStage(p.stage);
         setMessage(p.message ?? '');
         // 听写接管 / 悬浮窗隐藏（含替换原文后的复位）：翻译与 OCR 卡片一并清场
@@ -626,7 +664,7 @@ export default function Overlay() {
         if (p.stage === 'error') setErrCopied(false);
         if (p.stage === 'recording') {
           setRawText('');
-          setPartial('');
+          setPartial({ text: '', segs: 0, last: '' });
           setResult('');
           setUsedLlm(false);
           setTiming({});
@@ -641,7 +679,13 @@ export default function Overlay() {
     );
     const un2 = listen<MetaPayload>('sn-meta', (e) => setMeta(e.payload));
     const un3 = listen<{ text: string }>('sn-raw', (e) => setRawText(e.payload.text));
-    const un4 = listen<{ text: string }>('sn-partial', (e) => setPartial(e.payload.text));
+    const un4 = listen<PartialPayload>('sn-partial', (e) =>
+      setPartial({
+        text: e.payload.text,
+        segs: e.payload.segs ?? 0,
+        last: e.payload.last ?? '',
+      }),
+    );
     const un5 = listen<{
       raw: string;
       final: string;
@@ -660,17 +704,22 @@ export default function Overlay() {
       });
       setResultId((n) => n + 1);
     });
-    const un6 = listen<{ text: string; raw: string; llmUsed: boolean }>(
-      'sn-review',
-      (e) => {
-        setEditText(e.payload.text);
-        setReviewRaw(e.payload.raw);
-        setUsedLlm(e.payload.llmUsed);
-        setNotice(null);
-        // 保险：新审阅会话到来时清掉上一轮可能遗留的「确认中」状态
-        setConfirming(false);
-      },
-    );
+    const un6 = listen<{
+      text: string;
+      raw: string;
+      llmUsed: boolean;
+      asrMs?: number | null;
+      llmMs?: number | null;
+    }>('sn-review', (e) => {
+      setEditText(e.payload.text);
+      setReviewRaw(e.payload.raw);
+      setUsedLlm(e.payload.llmUsed);
+      // 耗时徽标与 done 卡同源（识别 X · 优化 Y；0/缺省的段前端省略）
+      setTiming({ asr: e.payload.asrMs, llm: e.payload.llmMs, first: null, audioSecs: null });
+      setNotice(null);
+      // 保险：新审阅会话到来时清掉上一轮可能遗留的「确认中」状态
+      setConfirming(false);
+    });
     const un7 = listen<{ title: string; above?: boolean }>('sn-target', (e) => {
       setTarget(e.payload.title || '');
       setAboveInput(e.payload.above !== false);
@@ -782,8 +831,10 @@ export default function Overlay() {
       setOcrBusy(false); // 截图翻译链在翻译阶段失败：OCR 卡片同样让位给错误卡
       if (soundRef.current) playTones([340, 230], 0.12);
     });
-    /* 翻译会话的流式增量：仅卡片处于 streaming 时累计（事件与听写优化共用频道） */
-    const un4 = listen<{ kind: string; delta?: string; text?: string }>('sn-llm-delta', (e) => {
+    /* 翻译会话的流式增量：仅消费 scope=translate 的流（听写优化/重优化共用本
+       频道，并发时互不串字，C2），且仅卡片处于 streaming 时累计 */
+    const un4 = listen<LlmDelta>('sn-llm-delta', (e) => {
+      if (e.payload.scope !== 'translate') return;
       setTrans((prev) => {
         if (!prev || prev.status !== 'streaming') return prev;
         if (e.payload.kind === 'content' && e.payload.text !== undefined) {
@@ -1192,6 +1243,9 @@ export default function Overlay() {
       setDoneReopt(false);
     }
   };
+
+  /* 流式字幕段尾切分（录音卡字幕区渲染用，见 splitPartialTail） */
+  const partialSplit = splitPartialTail(partial);
 
   /* OCR 取词链路里后端先发 stage=idle 再发 sn-ocr-start（ocr.rs）：
      早退条件必须放行 OCR 三态，否则截图取词的结果卡/错误卡永远渲染不出来 */
@@ -1709,19 +1763,45 @@ export default function Overlay() {
                 <RecTimer />
               </div>
               <LevelBars />
-              {/* 流式实时字幕 */}
-              {partial && (
-                <div className="mt-2 flex max-h-14 flex-col justify-end overflow-hidden text-[13px] leading-6 text-slate-300">
-                  <div className="line-clamp-2">{partial}</div>
+              {/* 流式实时字幕：前面的段正常色；最后一段是停顿切出的暂存段
+                  （之后仍会续说新段），暗色 + 虚线下划线标出段边界。
+                  段计数徽标 segs>1 时显示——1 段无边界可标，避免噪音 */}
+              {partial.text && (
+                <div className="mt-2 flex items-end gap-2">
+                  <div className="min-w-0 flex-1 text-[13px] leading-6 text-slate-300">
+                    <div className="line-clamp-2">
+                      {partialSplit.head}
+                      {partialSplit.tail && (
+                        <span
+                          className="text-slate-400/75 underline decoration-dotted underline-offset-4"
+                          title="本句为分段暂存，继续说或停顿定稿"
+                        >
+                          {partialSplit.tail}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {partial.segs > 1 && (
+                    <span
+                      className="mb-1 shrink-0 rounded-full border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9.5px] leading-none text-slate-500"
+                      title="已完成分段数：每次停顿切一段，此为已定稿句数"
+                    >
+                      第 {partial.segs} 段
+                    </span>
+                  )}
                 </div>
               )}
               <div className="mt-1.5 text-center text-[11px] text-slate-500">
                 {message || '再次按下快捷键结束'}
               </div>
+              {/* 临近最长录音时长提示（琥珀色小字，每会话一次，自动结束前预警） */}
+              {recHint && (
+                <div className="mt-1 text-center text-[11px] text-amber-400/90">{recHint}</div>
+              )}
             </div>
           )}
 
-          {stage === 'transcribing' && !rawText && !partial && !trans && (
+          {stage === 'transcribing' && !rawText && !partial.text && !trans && (
             <div className="anim-rise">
               <div className="flex items-center gap-3">
                 <span className="flex h-8 w-8 items-center justify-center rounded-full bg-sky-500/15">
@@ -1742,9 +1822,9 @@ export default function Overlay() {
             </div>
           )}
 
-          {((stage === 'transcribing' && (rawText || partial)) || stage === 'optimizing') &&
+          {((stage === 'transcribing' && (rawText || partial.text)) || stage === 'optimizing') &&
             !trans && (
-              <LlmStream stage={stage} meta={meta} rawText={rawText} partial={partial} />
+              <LlmStream stage={stage} meta={meta} rawText={rawText} partial={partial.text} />
             )}
 
           {/* 审阅卡与翻译卡互斥（同 recording/done 块）：审阅期剪贴板监听/划词
@@ -1761,6 +1841,14 @@ export default function Overlay() {
                 {usedLlm && (
                   <span className="rounded-full border border-indigo-400/25 bg-indigo-400/10 px-2 py-0.5 text-[10px] text-indigo-300">
                     AI 已优化 · 可继续修改
+                  </span>
+                )}
+                {/* 耗时徽标：与 done 卡对齐（识别 X · 优化 Y，值为 0/缺省的段省略） */}
+                {(timing.asr || timing.llm) && (
+                  <span className="rounded-full border border-white/10 bg-black/25 px-2 py-0.5 font-mono text-[10px] text-slate-500">
+                    {timing.asr ? `识别 ${fmtMs(timing.asr)}` : ''}
+                    {timing.asr && timing.llm ? ' · ' : ''}
+                    {timing.llm ? `优化 ${fmtMs(timing.llm)}` : ''}
                   </span>
                 )}
                 <span className="ml-auto text-[10px] text-slate-600">

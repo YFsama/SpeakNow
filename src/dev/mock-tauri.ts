@@ -231,6 +231,7 @@ const mockHistory = [
     asrMs: 510,
     llmMs: 690,
     kind: 'dictation',
+    pinned: true,
   },
   {
     ts: now - 1000 * 60 * 60 * 27,
@@ -311,6 +312,21 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'get_history':
           resolve(mockHistory);
           return;
+        case 'get_stats': {
+          // 从 mock 历史推算（与后端播种口径一致），days 覆盖近 7 天
+          const byDay = new Map<string, number>();
+          for (const h of mockHistory) {
+            const d = new Date(h.ts);
+            const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            byDay.set(k, (byDay.get(k) ?? 0) + 1);
+          }
+          resolve({
+            total: mockHistory.length,
+            chars: mockHistory.reduce((s, h) => s + [...h.final].length, 0),
+            days: [...byDay.entries()].sort(),
+          });
+          return;
+        }
         case 'update_history_final': {
           const { ts, finalText } = args as { ts: number; finalText: string };
           const item = mockHistory.find((h) => h.ts === ts);
@@ -318,6 +334,17 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
           resolve(undefined);
           return;
         }
+        case 'history_set_pin': {
+          const { ts, pinned } = args as { ts: number; pinned: boolean };
+          const item = mockHistory.find((h) => h.ts === ts);
+          if (item) item.pinned = pinned;
+          resolve(undefined);
+          return;
+        }
+        case 'ocr_screen_source':
+          // 浏览器无截屏能力：空图返回，前端放大镜据此自然禁用（真机才有）
+          resolve({ png: '', width: 0, height: 0 });
+          return;
         case 'mic_test':
           resolve({ avgLevel: 42, peakLevel: 87, wavBase64: null });
           return;
@@ -386,6 +413,10 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'ocr_capture_cmd':
           resolve('ok');
           return;
+        case 'ocr_region_selected':
+          console.info('[mock-tauri] OCR 选区提交', args);
+          resolve('ok');
+          return;
         case 'ocr_langs':
           resolve(['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko']);
           return;
@@ -444,6 +475,7 @@ declare global {
       toast: (msg: string) => void;
       tab: (tab: string) => void;
       config: typeof mockConfig;
+      setHistory: (items: unknown[]) => void;
     };
   }
 }
@@ -462,6 +494,12 @@ window.__mock = {
   toast: (msg) => emit('sn-toast', { message: msg }),
   tab: (tab) => emit('sn-navigate', { tab }),
   config: mockConfig,
+  /** 替换 mock 历史并广播刷新（视觉验证用，如测试上手清单需要 <3 条） */
+  setHistory: (items: unknown[]) => {
+    mockHistory.length = 0;
+    mockHistory.push(...(items as (typeof mockHistory)[number][]));
+    emit('sn-history-changed');
+  },
 };
 
 console.info(

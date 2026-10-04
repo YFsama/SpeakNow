@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { Button, Field, Section, Spinner, Toggle } from '../Controls';
+import { Button, Field, RadioCard, Section, Spinner, Toggle } from '../Controls';
 import {
   autoCalibrate,
   isMac,
@@ -68,8 +68,11 @@ const DeviceCard = memo(function DeviceCard({
   gainDb?: number;
 }) {
   return (
-    <div
-      onClick={() => onSelect(value)}
+    /* RadioCard：外层 div 换成语义化单选外壳（role=radio + 原生 button 键盘触发），
+       视觉类原样透传，选中样式与内部结构不变；卡内「⚡ 测试」子按钮 stopPropagation 不受影响 */
+    <RadioCard
+      checked={selected}
+      onCheck={() => onSelect(value)}
       className={`cursor-pointer rounded-xl border px-3.5 py-3 transition ${
         selected
           ? 'border-sky-500/70 bg-sky-500/[0.08]'
@@ -126,7 +129,7 @@ const DeviceCard = memo(function DeviceCard({
           )}
         </div>
       )}
-    </div>
+    </RadioCard>
   );
 });
 
@@ -457,7 +460,7 @@ export function MicTab({ cfg, set, devices, refreshDevices, toast }: TabProps) {
           label={`输入设备（${devices.length + 1} 个可选）`}
           hint="点击卡片选择用于语音输入的设备；每张卡片可单独快测 1.4 秒"
         >
-          <div className="space-y-2">
+          <div role="radiogroup" aria-label="输入设备" className="space-y-2">
             <DeviceCard
               name="系统默认"
               value={null}

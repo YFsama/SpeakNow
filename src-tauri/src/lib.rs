@@ -824,6 +824,20 @@ fn delete_history(app: AppHandle, ts: i64) {
     history::delete(&app, ts);
 }
 
+/// 全量使用统计（stats.json 持久累计，不受历史保留窗口影响）：
+/// days 为按日期升序的 [YYYY-MM-DD, 条数]，只含最近 60 天。
+/// 首次调用时若 stats.json 不存在，会从现有历史一次性播种（数字不回退）。
+#[tauri::command]
+fn get_stats(app: AppHandle) -> history::StatsView {
+    history::stats(&app).into()
+}
+
+/// 批量删除历史（多选）：返回实际删除条数；统计为累计口径，不随删除回退
+#[tauri::command]
+fn delete_history_batch(app: AppHandle, ts: Vec<i64>) -> usize {
+    history::delete_batch(&app, &ts)
+}
+
 /// 用当前 AI 设置重新优化某条历史记录的原始转写。
 /// mode 可选：本次覆盖使用的模式（correct / polish / prompt / translate），
 /// 只影响这一次调用、不落盘改全局配置。
@@ -872,6 +886,28 @@ async fn regenerate(
 #[tauri::command]
 fn update_history_final(app: AppHandle, ts: i64, final_text: String) -> Result<(), String> {
     history::update_final(&app, ts, &final_text).ok_or_else(|| "未找到该条记录".into())
+}
+
+/// 收藏 / 取消收藏一条历史（置顶显示，不占保留条数名额）。
+#[tauri::command]
+fn history_set_pin(app: AppHandle, ts: i64, pinned: bool) -> Result<(), String> {
+    history::set_pinned(&app, ts, pinned).ok_or_else(|| "未找到该条记录".into())
+}
+
+/// 截取指定物理像素区域返回 PNG base64（截图框选放大镜数据源）。
+/// 前端传选区窗自身的外框物理坐标（getCurrentWindow().outerPosition/Size），
+/// 位图与窗口 CSS 坐标按 devicePixelRatio 换算对齐。
+/// 整屏 GDI 截取 + PNG 编码是百毫秒级重活：spawn_blocking 避免占住主线程
+/// （同 list_devices 等既有重路径的约定）。
+#[tauri::command]
+async fn ocr_screen_source(x: i32, y: i32, w: i32, h: i32) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (b64, width, height) =
+            ocr::screen_source(x, y, w, h).map_err(|e| format!("截屏失败：{e:#}"))?;
+        Ok(serde_json::json!({ "png": b64, "width": width, "height": height }))
+    })
+    .await
+    .map_err(|e| format!("截屏任务失败：{e}"))?
 }
 
 #[tauri::command]
@@ -1261,8 +1297,12 @@ pub fn run() {
             get_history,
             clear_history,
             delete_history,
+            delete_history_batch,
+            get_stats,
             regenerate,
             update_history_final,
+            history_set_pin,
+            ocr_screen_source,
             copy_text,
             dismiss_overlay,
             overlay_pin,

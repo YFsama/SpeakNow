@@ -3,8 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import {
   Button,
   Field,
+  RadioCard,
   Section,
-  Segmented,
   Select,
   Spinner,
   TextArea,
@@ -198,6 +198,30 @@ export function AsrTab({
 
   const isLocal = cfg.asr.provider === 'local';
 
+  /* 测试连接行（按钮 + 结果反馈）：由 Section 尾部上移——云端放凭据组选择区
+     下方、本地放模型选择下方，改完配置即可就近验证；原底部入口移除避免双入口，
+     loading / 成功 / 失败反馈复用同一 state，逻辑不变 */
+  const testConnRow = (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button onClick={run} disabled={test.loading}>
+        {test.loading ? (
+          <>
+            <Spinner size={13} /> 测试中…
+          </>
+        ) : (
+          '测试连接'
+        )}
+      </Button>
+      {test.msg && (
+        <span
+          className={`text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
+        >
+          {test.msg}
+        </span>
+      )}
+    </div>
+  );
+
   return (
     <Section
       icon="📝"
@@ -205,27 +229,75 @@ export function AsrTab({
       desc="云端接口即配即用；或切换本地离线引擎，下载一次模型后零 Key、零联网。"
     >
       <Field label="识别引擎">
-        <Segmented
-          value={cfg.asr.provider === 'mimo' ? 'mimo' : cfg.asr.provider}
-          onChange={(provider) =>
-            set('asr', {
-              provider,
-              // 切引擎时同步纠正端点路径：MiMo 走 chat/completions（从云端 API
-              // 切过来带着 /audio/transcriptions 会静默失败），切回云端 API 则还原
-              // transcriptions（否则残留 MiMo 端点同样失败）；本地引擎不用端点
-              ...(provider === 'mimo'
-                ? { endpointPath: '/chat/completions' }
-                : provider === 'http'
-                  ? { endpointPath: '/audio/transcriptions' }
-                  : {}),
-            })
-          }
-          options={[
-            { value: 'mimo', label: 'MiMo 云端', desc: '小米 MiMo-V2.5-ASR' },
-            { value: 'http', label: '云端 API', desc: 'GLM-ASR / Whisper 等 · 需 Key' },
-            { value: 'local', label: '本地离线', desc: 'Whisper / Qwen3-ASR · 免 Key 免联网' },
-          ]}
-        />
+        {/* RadioCard 语义化单选组：视觉类与原 Segmented 卡完全一致（含选中渐变、
+            右上角光点、desc 排版）——div[role=radio] + 合成 Enter/Space 与方向键
+            导航（见 Controls.RadioCard）；视觉类如有调整需与 Segmented 同步 */}
+        <div
+          role="radiogroup"
+          aria-label="识别引擎"
+          className="grid grid-cols-1 gap-2 sm:grid-cols-3"
+        >
+          {(
+            [
+              { value: 'mimo', label: 'MiMo 云端', desc: '小米 MiMo-V2.5-ASR' },
+              {
+                value: 'http',
+                label: '云端 API',
+                desc: 'GLM-ASR / Whisper 等 · 需 Key',
+              },
+              {
+                value: 'local',
+                label: '本地离线',
+                desc: 'Whisper / Qwen3-ASR · 免 Key 免联网',
+              },
+            ] as const
+          ).map((o) => {
+            const active = cfg.asr.provider === o.value;
+            return (
+              <RadioCard
+                key={o.value}
+                checked={active}
+                onCheck={() =>
+                  set('asr', {
+                    provider: o.value,
+                    // 切引擎时同步纠正端点路径：MiMo 走 chat/completions（从云端 API
+                    // 切过来带着 /audio/transcriptions 会静默失败），切回云端 API 则还原
+                    // transcriptions（否则残留 MiMo 端点同样失败）；本地引擎不用端点
+                    ...(o.value === 'mimo'
+                      ? { endpointPath: '/chat/completions' }
+                      : o.value === 'http'
+                        ? { endpointPath: '/audio/transcriptions' }
+                        : {}),
+                  })
+                }
+                className={`card-lift relative overflow-hidden rounded-2xl border px-3.5 py-2.5 text-left transition active:scale-[0.98] ${
+                  active
+                    ? 'border-sky-500/70 bg-gradient-to-br from-sky-500/[0.12] to-indigo-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
+                    : 'border-white/[0.08] bg-black/20 hover:border-white/20 hover:bg-black/[0.3]'
+                }`}
+              >
+                {active && (
+                  <span
+                    className="absolute right-2.5 top-2.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-sky-400/20"
+                    aria-hidden
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.9)]" />
+                  </span>
+                )}
+                <span
+                  className={`block text-[13px] font-medium ${
+                    active ? 'text-sky-300' : 'text-slate-200'
+                  }`}
+                >
+                  {o.label}
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-4 text-slate-500">
+                  {o.desc}
+                </span>
+              </RadioCard>
+            );
+          })}
+        </div>
       </Field>
 
       {!isLocal && (
@@ -251,6 +323,8 @@ export function AsrTab({
               />
             </Field>
           )}
+          {/* 测试连接上移：凭据组选择区下方（引擎选择器之后的显眼位置） */}
+          {testConnRow}
           <Field label="服务商预设">
             <Select
               value={preset}
@@ -401,7 +475,7 @@ export function AsrTab({
             label="本地模型"
             hint="首次下载需联网（Whisper 走镜像、Qwen3-ASR 走 HuggingFace 官方源直连），之后识别过程完全离线、数据不出本机"
           >
-            <div className="space-y-2">
+            <div role="radiogroup" aria-label="本地模型" className="space-y-2">
               {/* Qwen3-ASR 引擎（llama.cpp Vulkan/CPU）目前仅支持 Windows，mac 上隐藏卡片避免误选 */}
               {localModels
                 // ppocr 属于「截图取词」页的模型，不在语音识别页展示
@@ -412,9 +486,12 @@ export function AsrTab({
                 const busy = downloading === m.id;
                 const isQwen = m.kind === 'qwen';
                 return (
-                  <div
+                  /* RadioCard：外层 div 换成语义化单选外壳，视觉类原样透传；
+                      卡内「下载 / 删除」子按钮 stopPropagation 不受影响 */
+                  <RadioCard
                     key={m.id}
-                    onClick={() => {
+                    checked={selected}
+                    onCheck={() => {
                       set('asr', { localModel: m.id });
                       setConfirmDel(null);
                     }}
@@ -527,11 +604,13 @@ export function AsrTab({
                         </div>
                       </div>
                     )}
-                  </div>
+                  </RadioCard>
                 );
               })}
             </div>
           </Field>
+          {/* 测试连接上移：本地模式下放在模型选择下方（引擎选择器之后） */}
+          {testConnRow}
           <Field
             label="下载镜像"
             hint="仅作用于 Whisper 系列模型；Qwen3-ASR 始终从 HuggingFace 官方源直连下载"
@@ -591,25 +670,6 @@ export function AsrTab({
         label="边说边出字（流式分段）"
         desc="说话时按停顿自动分段识别，悬浮窗实时滚动字幕；云端与本地引擎通用"
       />
-
-      <div className="flex flex-wrap items-center gap-2">
-        <Button onClick={run} disabled={test.loading}>
-          {test.loading ? (
-            <>
-              <Spinner size={13} /> 测试中…
-            </>
-          ) : (
-            '测试连接'
-          )}
-        </Button>
-        {test.msg && (
-          <span
-            className={`text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
-          >
-            {test.msg}
-          </span>
-        )}
-      </div>
     </Section>
   );
 }

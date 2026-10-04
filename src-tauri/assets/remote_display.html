@@ -274,6 +274,9 @@
         els.text.className = 'text';
         break;
       case 'delta':
+        // 字幕屏只展示听写链路的流（scope 见 sn-llm-delta 载荷）；
+        // 划词/工作台翻译与听写优化并发时互不覆盖（翻译卡不外接）
+        if (d.scope === 'translate') break;
         showBody();
         if (d.kind === 'reasoning') {
           els.reasoning.style.display = '';

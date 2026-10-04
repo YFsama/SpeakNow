@@ -429,12 +429,18 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
                 );
             }
             if last_note.elapsed() >= Duration::from_secs(5) {
+                // 本地翻译引擎只服务翻译链路（ensure_server 的调用方是翻译会话
+                // 与启动预热的同款引擎），启动提示归属 translate 流：翻译卡/
+                // 工作台监听器只消费 scope=translate 的增量，误标 llm 会让
+                // 「引擎启动中」提示从翻译卡上凭空消失
                 let _ = app.emit(
                     "sn-llm-delta",
-                    serde_json::json!({
-                        "kind": "reasoning",
-                        "delta": "本地翻译引擎启动中…（首次加载模型需十几秒）\n"
-                    }),
+                    crate::llm::delta_payload(
+                        crate::llm::SCOPE_TRANSLATE,
+                        "reasoning",
+                        "本地翻译引擎启动中…（首次加载模型需十几秒）\n",
+                        None,
+                    ),
                 );
                 last_note = Instant::now();
             }

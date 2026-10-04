@@ -1,7 +1,15 @@
-import { useMemo } from 'react';
-import type { Stage, TabProps } from '../types';
+import { useEffect, useMemo, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import type { Stage, TabProps, UsageStats } from '../types';
 import { resolvedAsrCreds, resolvedLlmCreds } from '../types';
-import { isMac, copyText, ocrCapture, shortcutChips, translateSelection } from '../api';
+import {
+  isMac,
+  copyText,
+  getStats,
+  ocrCapture,
+  shortcutChips,
+  translateSelection,
+} from '../api';
 import { Button, Toggle } from './Controls';
 
 const STAGE_INFO: Record<
@@ -52,12 +60,16 @@ const STAGE_INFO: Record<
   },
 };
 
-const STAT_ICONS = ['🔤', '✍️', '📅', '⚡', '⏱'];
-
 /** 历史时间戳旧记录为秒、新记录为毫秒，统一折算为毫秒 */
 const tsMs = (ts: number) => (ts < 1e12 ? ts * 1000 : ts);
 
 const dayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/** 本地日期 YYYY-MM-DD（零填充，与后端 stats.json 的 days 键格式一致） */
+const isoDay = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+    d.getDate(),
+  ).padStart(2, '0')}`;
 
 /** 相对时间：刚刚 / X分钟前 / X小时前 / 昨天 / X天前 */
 function relTime(ts: number): string {
@@ -94,19 +106,56 @@ export default function Dashboard({
   onRecordToggle,
   toast,
 }: TabProps) {
+  /* 全量使用统计（后端 stats.json 累计口径，不受历史保留窗口影响）：
+     挂载拉一次 + 历史变化重拉；拉取失败（旧后端无 get_stats 命令）置 null，
+     下方统计卡自动回退从 props.history 推算——不白屏 */
+  const [usage, setUsage] = useState<UsageStats | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    const pull = () => {
+      getStats()
+        .then((s) => {
+          if (alive) setUsage(s);
+        })
+        .catch(() => {
+          if (alive) setUsage(null);
+        });
+    };
+    pull();
+    void listen('sn-history-changed', pull).then((f) => {
+      un = f;
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
+
   const stats = useMemo(() => {
-    const total = history.length;
-    const chars = history.reduce((n, h) => n + h.final.length, 0);
-    // 按本地日期分组（今日 / 昨日 / 近 7 天柱图共用一张表）
+    // 按本地日期分组（今日 / 昨日 / 近 7 天柱图共用一张表）：
+    // 优先后端全量统计（isoDay 键）；无 stats 时从保留窗口推算（旧后端回退）
     const byDay = new Map<string, number>();
-    for (const h of history) {
-      const k = dayKey(new Date(tsMs(h.ts)));
-      byDay.set(k, (byDay.get(k) ?? 0) + 1);
+    if (usage) {
+      for (const [d, n] of usage.days) byDay.set(d, n);
+    } else {
+      for (const h of history) {
+        const k = isoDay(new Date(tsMs(h.ts)));
+        byDay.set(k, (byDay.get(k) ?? 0) + 1);
+      }
     }
+    const total = usage ? usage.total : history.length;
+    // 码点口径（与后端 .chars().count() 一致；回退路径同样用展开计数）
+    const chars = usage
+      ? usage.chars
+      : history.reduce((n, h) => n + [...h.final].length, 0);
     const now = new Date();
-    const today = byDay.get(dayKey(now)) ?? 0;
+    const today = byDay.get(isoDay(now)) ?? 0;
     // 昨日无记录（undefined）时不显示对比
-    const yesterday = byDay.get(dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)));
+    const yesterday = byDay.get(
+      isoDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)),
+    );
+    // —— 以下为保留窗口性质：平均耗时与分位数只能从最近 N 条历史推算 ——
     const proc = history
       .map((h) => (h.asrMs ?? 0) + (h.llmMs ?? 0))
       .filter((v) => v > 0);
@@ -127,11 +176,26 @@ export default function Dashboard({
         wd: d.getDay(),
         md: `${d.getMonth() + 1}/${d.getDate()}`,
         isToday: i === 6,
-        count: byDay.get(dayKey(d)) ?? 0,
+        count: byDay.get(isoDay(d)) ?? 0,
       };
     });
-    return { total, chars, today, yesterday, avg, p50, p95, week };
-  }, [history]);
+    // 连续使用天数（streak）：只认后端全量统计的 days（旧后端无 usage 时上方
+    // 卡片直接隐藏）；「今天还没用」不算断档——起点取今天，今天无记录则宽限
+    // 到昨天（昨天也没有即断档为 0），再往前逐日核对连续有记录的天数
+    const activeDays = new Set(
+      usage ? usage.days.filter(([, n]) => n > 0).map(([d]) => d) : [],
+    );
+    let streak = 0;
+    if (usage) {
+      const cur = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      if (!activeDays.has(isoDay(cur))) cur.setDate(cur.getDate() - 1);
+      while (activeDays.has(isoDay(cur))) {
+        streak++;
+        cur.setDate(cur.getDate() - 1);
+      }
+    }
+    return { total, chars, today, yesterday, avg, p50, p95, week, streak };
+  }, [history, usage]);
 
   const info = STAGE_INFO[stage];
   const hotkeyChips = shortcutChips(cfg.hotkey.key);
@@ -195,6 +259,82 @@ export default function Dashboard({
           };
     })(),
   ];
+
+  /* 上手清单：新用户四步引导，位于状态卡之后。收起（或老用户首开）即写
+     localStorage('sn:onboarded') 永久隐藏；能力级检查仍在下方「配置自检」卡保留 */
+  const [onboarded, setOnboarded] = useState(() => {
+    try {
+      return localStorage.getItem('sn:onboarded') === '1';
+    } catch {
+      return false;
+    }
+  });
+  // 老用户（已有 ≥3 条历史）默认收起：首次打开直接写入记忆，此后不再展示
+  useEffect(() => {
+    if (history.length >= 3 && !onboarded) {
+      try {
+        localStorage.setItem('sn:onboarded', '1');
+      } catch {
+        /* localStorage 不可用：仅本次会话收起 */
+      }
+      setOnboarded(true);
+    }
+  }, [history.length, onboarded]);
+
+  // ① 语音识别引擎：云端（http/mimo）按解析后的生效 Key（凭据组或内联）判空，
+  //    local 则要求所选模型已下载；② 麦克风：已指定设备或仅单一设备即视为无需选
+  const obAsrOk =
+    cfg.asr.provider === 'local'
+      ? asrLocalReady === true
+      : asrCreds.apiKey.trim() !== '';
+  const obMicDevice = (cfg.audio.device ?? '').trim();
+  const obMicOk = obMicDevice !== '' || devices.length === 1;
+  const obFirstOk = history.length > 0;
+  const obHotkeyOk = cfg.hotkey.key.trim() !== '';
+
+  const onboard = [
+    {
+      ok: obAsrOk,
+      title: '选择语音识别引擎',
+      desc: obAsrOk
+        ? cfg.asr.provider === 'local'
+          ? `本地模型已就绪（${cfg.asr.localModel}）`
+          : '云端识别已配置'
+        : cfg.asr.provider === 'local'
+          ? '先在「语音识别」页下载本地模型'
+          : '填写 API Key，或在「AI 优化」页选凭据组',
+      hint: '去设置',
+      go: () => navigate('asr'),
+    },
+    {
+      ok: obMicOk,
+      title: '选择麦克风设备',
+      desc: obMicDevice
+        ? `已选择：${obMicDevice}`
+        : devices.length === 1
+          ? '仅检测到单一设备，无需选择'
+          : devices.length === 0
+            ? '未检测到输入设备，去检查权限'
+            : `检测到 ${devices.length} 个设备，指定常用麦克风`,
+      hint: '去选择',
+      go: () => navigate('mic'),
+    },
+    {
+      ok: obFirstOk,
+      title: '完成第一次听写',
+      desc: obFirstOk ? '第一条语音已送达输入框' : '按快捷键说话，或点此试录一段',
+      hint: '去试录',
+      go: onRecordToggle,
+    },
+    {
+      ok: obHotkeyOk,
+      title: '自定义快捷键（可选）',
+      desc: obHotkeyOk ? '全局快捷键已配置' : '设置一个顺手的触发键',
+      hint: '去设置',
+      go: () => navigate('hotkey'),
+    },
+  ];
+  const obDone = onboard.filter((o) => o.ok).length;
 
   return (
     <div className="space-y-5">
@@ -318,42 +458,158 @@ export default function Dashboard({
         </button>
       </section>
 
-      {/* 统计 */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        {[
-          { label: '累计使用', value: String(stats.total), unit: '次' },
-          { label: '累计输入', value: stats.chars.toLocaleString(), unit: '字' },
-          {
-            label: '今日',
-            value: String(stats.today),
-            unit: '次',
-            // 昨日无数据（undefined）时不显示对比
-            sub:
-              stats.yesterday === undefined
-                ? undefined
-                : stats.today > stats.yesterday
-                  ? `较昨日 +${stats.today - stats.yesterday}`
-                  : stats.today < stats.yesterday
-                    ? `较昨日 -${stats.yesterday - stats.today}`
-                    : '与昨日持平',
-          },
-          { label: '平均处理', value: stats.avg, unit: '' },
-          {
-            label: '识别 p50 / p95',
-            value:
-              stats.p50 !== null && stats.p95 !== null
-                ? `${(stats.p50 / 1000).toFixed(1)}s / ${(stats.p95 / 1000).toFixed(1)}s`
-                : '—',
-            unit: '',
-          },
-        ].map((s, i) => (
+      {/* 上手清单：新用户第一眼即见；收起后 localStorage 记忆，不再展示 */}
+      {!onboarded && (
+        <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="text-[15px] font-semibold text-slate-100">🚀 上手清单</h2>
+              <p className="mt-0.5 text-[11px] text-slate-500">
+                四步配好，语音输入随时待命
+              </p>
+            </div>
+            <span
+              className={`shrink-0 rounded-full px-2 py-0.5 text-[10.5px] ${
+                obDone === onboard.length
+                  ? 'bg-emerald-500/15 text-emerald-300'
+                  : 'bg-sky-500/15 text-sky-300'
+              }`}
+            >
+              {obDone} / {onboard.length}
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {onboard.map((o) => (
+              <button
+                key={o.title}
+                type="button"
+                onClick={o.ok ? undefined : o.go}
+                className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left ${
+                  o.ok ? 'cursor-default' : 'transition hover:bg-white/[0.04]'
+                }`}
+              >
+                <span
+                  className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-[9px] font-bold leading-none ${
+                    o.ok ? 'bg-emerald-500/15 text-emerald-400' : 'border border-sky-400/40'
+                  }`}
+                >
+                  {o.ok ? '✓' : ''}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span
+                    className={`block text-[13px] ${
+                      o.ok ? 'text-slate-300' : 'text-slate-200'
+                    }`}
+                  >
+                    {o.title}
+                  </span>
+                  <span className="mt-0.5 block truncate text-[11px] text-slate-500">
+                    {o.desc}
+                  </span>
+                </span>
+                {!o.ok && (
+                  <span className="shrink-0 text-[11px] text-sky-400/80">{o.hint} ›</span>
+                )}
+              </button>
+            ))}
+          </div>
+          {obDone === onboard.length && (
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.08] px-3.5 py-2.5">
+              <span className="text-[13px] text-emerald-300">🎉 全部就绪，开始使用吧！</span>
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    localStorage.setItem('sn:onboarded', '1');
+                  } catch {
+                    /* localStorage 不可用：仅本次会话收起 */
+                  }
+                  setOnboarded(true);
+                }}
+                className="shrink-0 rounded-lg border border-white/10 px-2.5 py-1 text-[11.5px] text-slate-300 transition hover:border-white/25 hover:bg-white/[0.06] active:scale-95"
+              >
+                收起
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* 统计：累计/今日/柱图来自全量统计（超窗仍准确）；平均与分位数是
+          窗口性质，只能从最近 N 条历史推算（tooltip 注明）。
+          连续天数卡仅在有后端全量统计时出现（旧后端回退口径不同，直接隐藏） */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {(
+          [
+            { label: '累计使用', value: String(stats.total), unit: '次', icon: '🔤' },
+            { label: '累计输入', value: stats.chars.toLocaleString(), unit: '字', icon: '✍️' },
+            {
+              label: '今日',
+              value: String(stats.today),
+              unit: '次',
+              icon: '📅',
+              // 昨日无数据（undefined）时不显示对比
+              sub:
+                stats.yesterday === undefined
+                  ? undefined
+                  : stats.today > stats.yesterday
+                    ? `较昨日 +${stats.today - stats.yesterday}`
+                    : stats.today < stats.yesterday
+                      ? `较昨日 -${stats.yesterday - stats.today}`
+                      : '与昨日持平',
+            },
+            ...(usage
+              ? [
+                  {
+                    label: '连续使用',
+                    value: stats.streak > 0 ? String(stats.streak) : '—',
+                    unit: stats.streak > 0 ? '天' : '',
+                    // 今日已有记录时明确「含今日」，否则提示今天还未断
+                    sub:
+                      stats.streak > 0
+                        ? stats.today > 0
+                          ? '含今日'
+                          : '今日还未使用'
+                        : undefined,
+                    tip: '连续每天至少 1 条的天数；今天还没用不算断档（按最近 60 天窗口计）',
+                    icon: '🔥',
+                  },
+                ]
+              : []),
+            {
+              label: '平均处理',
+              value: stats.avg,
+              unit: '',
+              icon: '⚡',
+              tip: `最近 ${history.length} 条`,
+            },
+            {
+              label: '识别 p50 / p95',
+              value:
+                stats.p50 !== null && stats.p95 !== null
+                  ? `${(stats.p50 / 1000).toFixed(1)}s / ${(stats.p95 / 1000).toFixed(1)}s`
+                  : '—',
+              unit: '',
+              icon: '⏱',
+              tip: `最近 ${history.length} 条`,
+            },
+          ] as {
+            label: string;
+            value: string;
+            unit: string;
+            sub?: string;
+            tip?: string;
+            icon: string;
+          }[]
+        ).map((s) => (
           <div
             key={s.label}
+            title={s.tip}
             className="card-lift rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3.5"
           >
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-500">{s.label}</span>
-              <span className="text-[12px] opacity-70">{STAT_ICONS[i]}</span>
+              <span className="text-[12px] opacity-70">{s.icon}</span>
             </div>
             <div className="mt-1.5 font-mono text-xl font-semibold tabular-nums text-slate-100">
               {s.value}

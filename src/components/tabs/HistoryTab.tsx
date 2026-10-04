@@ -5,7 +5,9 @@ import {
   clearHistory,
   copyText,
   deleteHistory,
+  deleteHistoryBatch,
   exportText,
+  historySetPin,
   openConfigDir,
   regenerate,
   updateHistoryFinal,
@@ -50,6 +52,9 @@ const KIND_FILTERS: { value: 'all' | HistKind; label: string }[] = [
   { value: 'translate', label: '🌐 翻译' },
   { value: 'ocr', label: '📷 OCR' },
 ];
+
+/** 置顶小节标题：置顶条目固定排在最前、不参与日期分组（也不占保留条数名额） */
+const PINNED_SECTION = '⭐ 已收藏';
 
 /** 重优化模式：空 = 跟随全局配置；其余只影响本次调用（后端不落盘） */
 const REGEN_MODES = [
@@ -109,6 +114,39 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
   }, [confirmDelTs]);
   /* 复制成功的行内反馈：按钮短暂变「已复制 ✓」，替代无反馈的静默复制 */
   const [copiedTs, setCopiedTs] = useState<number | null>(null);
+  /* 批量删除：多选模式（与行内单条删除/编辑互斥），selected 为按 ts 勾选的集合 */
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  /* 乐观置顶：ts → { from: 点击时的服务端真值, to: 目标值 }。合并规则见 pinnedOf——
+     服务端真值一旦变化（sn-history-changed 刷新追上，或后端 20 上限自动取消），
+     覆盖自动失效回落真值，因此无需手动清理，也不会挡住后续刷新 */
+  const [pinOverride, setPinOverride] = useState<Record<number, { from: boolean; to: boolean }>>(
+    {},
+  );
+  const pinnedOf = (h: HistoryItem): boolean => {
+    const ov = pinOverride[h.ts];
+    const server = h.pinned ?? false;
+    if (!ov || ov.from !== server) return server;
+    return ov.to;
+  };
+
+  /* 点击即本地翻转星标（不等事件往返），成功后由 sn-history-changed 广播自然对齐；
+     失败 toast 报错并回退到服务端真值 */
+  const onTogglePin = async (h: HistoryItem) => {
+    const next = !pinnedOf(h);
+    setPinOverride((m) => ({ ...m, [h.ts]: { from: h.pinned ?? false, to: next } }));
+    try {
+      await historySetPin(h.ts, next);
+    } catch (e) {
+      setPinOverride((m) => {
+        const n = { ...m };
+        delete n[h.ts];
+        return n;
+      });
+      toast(`置顶失败：${String(e)}`, 'error');
+    }
+  };
 
   /* 空状态提示用当前主快捷键动态渲染（原硬编码 Ctrl+Shift+Space 改键后即误导） */
   const hotkeyChips = shortcutChips(cfg.hotkey.key);
@@ -250,10 +288,54 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
     refreshHistory();
   };
 
-  /* 分组行：firstOfDay 标记处插入小节标题 */
+  /* ---- 批量删除（多选模式）---- */
+  const toggleSel = (ts: number) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      if (n.has(ts)) n.delete(ts);
+      else n.add(ts);
+      return n;
+    });
+
+  /* 进入多选时收起行内编辑与单条删除的待确认态（两套操作互斥） */
+  const enterSelect = () => {
+    setSelectMode(true);
+    setEditingTs(null);
+    setConfirmDelTs(null);
+  };
+  const exitSelect = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+
+  /* 全选当前筛选结果；已全选时清空（起反选作用） */
+  const selectAll = () =>
+    setSelected((s) => {
+      const all = new Set(filtered.map((h) => h.ts));
+      if (all.size === s.size && [...all].every((t) => s.has(t))) return new Set();
+      return all;
+    });
+
+  const onDeleteBatch = async () => {
+    if (selected.size === 0) return;
+    try {
+      const n = await deleteHistoryBatch([...selected]);
+      exitSelect();
+      toast(`已删除 ${n} 条`, 'ok');
+      refreshHistory();
+    } catch (e) {
+      toast(`删除失败：${String(e)}`, 'error');
+    }
+  };
+
+  /* 分组行：置顶条目稳定排最前（filter 保序即 stable 排序），独立成「⭐ 已收藏」小节
+     且不参与日期判定；其余按原新→旧序走「今天/昨天/更早」分组 */
   const rows: { h: HistoryItem; day: string; firstOfDay: boolean }[] = [];
+  filtered.filter((h) => pinnedOf(h)).forEach((h, i) => {
+    rows.push({ h, day: PINNED_SECTION, firstOfDay: i === 0 });
+  });
   let prevDay = '';
-  for (const h of filtered) {
+  for (const h of filtered.filter((x) => !pinnedOf(x))) {
     const day = dayKey(h.ts);
     rows.push({ h, day, firstOfDay: day !== prevDay });
     prevDay = day;
@@ -263,7 +345,7 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
     <Section
       icon="🕘"
       title="识别历史"
-      desc={`本地保存最近 ${historyLimit} 条，支持搜索、类型筛选、对比原文、行内编辑、按模式重优化与导出。`}
+      desc={`本地保存最近 ${historyLimit} 条，支持搜索、类型筛选、对比原文、行内编辑、批量删除、按模式重优化与导出。`}
     >
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-[200px] flex-1">
@@ -290,6 +372,15 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
         <Button onClick={() => setShowRaw((v) => !v)}>
           {`对比原文：${showRaw ? '开' : '关'}`}
         </Button>
+        {history.length > 0 && (
+          <Button
+            onClick={() => (selectMode ? exitSelect() : enterSelect())}
+            title="勾选多条记录后批量删除"
+            kind={selectMode ? 'primary' : 'ghost'}
+          >
+            {selectMode ? '退出选择' : '选择'}
+          </Button>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -366,6 +457,7 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
               label="清空"
               confirmLabel="确认清空全部？"
               onConfirm={() => void onClear()}
+              title="使用统计为累计口径（里程表式），清空历史不影响统计数字"
             />
           </div>
         </div>
@@ -420,6 +512,7 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
             const kind = kindOf(h);
             const meta = KIND_META[kind];
             const editing = editingTs === h.ts;
+            const isPinned = pinnedOf(h);
             /* 对照视图：全局开关，或搜索词仅命中原文时该行自动展开 */
             const matchFinal = !re || re.test(h.final);
             const matchRaw = !!re && re.test(h.raw);
@@ -428,13 +521,33 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
               <div key={`${h.ts}-${idx}`}>
                 {firstOfDay && (
                   <div
-                    className={`text-[10px] tracking-widest text-slate-600 ${idx > 0 ? 'mt-3' : ''} mb-1`}
+                    title={day === PINNED_SECTION ? '收藏不占保留条数名额；最多 20 条，超出自动取消最早的' : undefined}
+                    className={`text-[10px] tracking-widest ${
+                      day === PINNED_SECTION ? 'text-amber-500/80' : 'text-slate-600'
+                    } ${idx > 0 ? 'mt-3' : ''} mb-1`}
                   >
                     ── {day} ──
                   </div>
                 )}
                 <div className="group rounded-lg border border-white/[0.06] bg-black/20 px-3.5 py-2.5 transition hover:border-white/[0.14]">
                   <div className="flex items-start gap-3">
+                    {selectMode && (
+                      <button
+                        type="button"
+                        role="checkbox"
+                        aria-checked={selected.has(h.ts)}
+                        onClick={() => toggleSel(h.ts)}
+                        title="选中 / 取消选中"
+                        aria-label="选中该条记录"
+                        className={`mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition ${
+                          selected.has(h.ts)
+                            ? 'border-sky-400 bg-sky-500/80 text-white'
+                            : 'border-white/25 text-transparent hover:border-sky-400/60'
+                        }`}
+                      >
+                        ✓
+                      </button>
+                    )}
                     <div className="min-w-0 flex-1">
                       {editing ? (
                         <div className="space-y-2">
@@ -470,13 +583,32 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
                       )}
                       <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10.5px] text-slate-600">
                         <span title={meta.label}>{meta.icon}</span>
+                        {/* 置顶收藏：星标常显（置顶态 amber），多选模式下与行内按钮一起隐藏 */}
+                        {!selectMode && (
+                          <button
+                            type="button"
+                            onClick={() => void onTogglePin(h)}
+                            title={isPinned ? '取消置顶' : '置顶收藏'}
+                            aria-label={isPinned ? '取消置顶' : '置顶收藏'}
+                            aria-pressed={isPinned}
+                            className={`text-[11px] leading-none transition ${
+                              isPinned
+                                ? 'text-amber-400'
+                                : 'text-slate-600 hover:text-amber-300'
+                            }`}
+                          >
+                            {isPinned ? '⭐' : '☆'}
+                          </button>
+                        )}
                         <span className="font-mono">{fmtTime(h.ts)}</span>
                         {h.asrMs != null && <span>识别 {fmtMs(h.asrMs)}</span>}
                         {h.llmMs != null && h.llmMs > 0 && <span>优化 {fmtMs(h.llmMs)}</span>}
                         <span>{[...h.final].length} 字</span>
                       </div>
                     </div>
-                    <div className="flex shrink-0 flex-col items-end gap-1 opacity-70 transition group-hover:opacity-100">
+                    {/* 多选模式与行内操作（复制/重优化/编辑/单条删除）互斥：进入多选即隐藏 */}
+                    {!selectMode && (
+                      <div className="flex shrink-0 flex-col items-end gap-1 opacity-70 transition group-hover:opacity-100">
                       {editing ? (
                         <>
                           <button
@@ -548,12 +680,40 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
                           </button>
                         </>
                       )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* 多选模式底部操作条：全选当前筛选结果 → 一次批量删除 */}
+      {selectMode && (
+        <div className="sticky bottom-0 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-black/70 px-4 py-2.5 backdrop-blur">
+          <span className="text-xs text-slate-300">已选 {selected.size} 条</span>
+          <Button
+            kind="subtle"
+            onClick={selectAll}
+            disabled={filtered.length === 0}
+            title="全选当前筛选结果（已全选时点击清空选择）"
+          >
+            全选
+          </Button>
+          {selected.size > 0 ? (
+            <ConfirmButton
+              label="删除"
+              confirmLabel={`确认删除 ${selected.size} 条？`}
+              onConfirm={() => void onDeleteBatch()}
+            />
+          ) : (
+            <Button kind="danger" disabled title="先勾选要删除的记录">
+              删除
+            </Button>
+          )}
+          <Button onClick={exitSelect}>取消</Button>
         </div>
       )}
     </Section>
