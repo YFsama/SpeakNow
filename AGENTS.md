@@ -102,4 +102,4 @@ devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
 
 ## 版本
 
-SpeakNow v0.4.9 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
+SpeakNow v0.4.10 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
