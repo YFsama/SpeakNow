@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { Field, Section, Segmented, Toggle } from '../Controls';
 import HotkeyRecorder from '../HotkeyRecorder';
+import { hotkeyStatus } from '../../api';
 import type { TabProps } from '../../types';
 import { langName } from '../../types';
 
@@ -18,6 +20,27 @@ const HOTKEY_FIELD_LABELS: Record<HotkeyField, string> = {
 const HOTKEY_FIELDS: HotkeyField[] = ['key', 'keyQuick', 'keyTranslate', 'keyTranslateSel', 'keyOcr'];
 
 export function HotkeyTab({ cfg, set }: TabProps) {
+  // 系统级注册状态：应用内查重只能拦本应用的组合冲突，被其他应用（输入法、
+  // 截图工具、游戏加速器…）占用的组合键要在后端注册时才失败——失败曾被完全
+  // 静默，用户以为改绑成功。挂载拉一次 + 监听保存后的广播，失败即常驻横幅
+  const [regError, setRegError] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    hotkeyStatus().then((e) => {
+      if (alive) setRegError(e ?? null);
+    });
+    let un: (() => void) | undefined;
+    void listen<{ error: string | null }>('sn-hotkey-status', (e) => {
+      setRegError(e.payload?.error ?? null);
+    }).then((f) => {
+      un = f;
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
+
   // 组合键查重：同一组合注册到多个快捷键会在后端静默失效，录入重复值时
   // 拒绝写入（保留原值）并在对应录入器下显示红色警告，直到冲突解除
   const [dup, setDup] = useState<{
@@ -71,6 +94,14 @@ export function HotkeyTab({ cfg, set }: TabProps) {
       title="触发快捷键"
       desc="任意应用内全局触发，无需切换窗口；可另设快速键（跳过 AI）与翻译键（本次听写直接输出译文）。"
     >
+      {regError && (
+        <div className="mb-4 rounded-xl border border-red-500/30 bg-red-500/[0.08] px-3.5 py-2.5 text-[12px] leading-5 text-red-300">
+          ⚠ 快捷键注册失败：{regError}
+          <div className="mt-0.5 text-[11px] text-slate-400">
+            该组合键可能已被其他应用占用（输入法 / 截图工具 / 游戏加速器等），请换一个组合；其余快捷键不受影响
+          </div>
+        </div>
+      )}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field
           label="主快捷键"

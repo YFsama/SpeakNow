@@ -57,6 +57,9 @@ pub struct Ctx {
     pub overlay_manual: AtomicBool,
     /// 录音会话代数：新录音开始时 +1，仍在处理中的旧结果若晚到则作废（避免旧文本覆盖新输入）
     pub run_gen: AtomicU64,
+    /// 最近一次快捷键注册失败的原因（None = 全部注册成功）。注册失败曾被
+    /// 完全静默——用户以为改绑成功，实际组合键被其他应用占用着
+    pub hotkey_error: Mutex<Option<String>>,
 }
 
 impl Ctx {
@@ -121,11 +124,11 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
 
     let mut messages = vec!["已保存".to_string()];
     if config.hotkey != old.hotkey {
-        // 后台线程重注册：不阻塞保存响应；失败记入追踪日志
+        // 后台线程重注册：不阻塞保存响应；失败记入追踪日志 + Ctx（设置页横幅）
         let h = app.clone();
         let hk = config.hotkey.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            if let Err(e) = hotkey::apply(&h, &hk) {
+            if let Err(e) = hotkey::apply_tracked(&h, &hk) {
                 eprintln!("[speaknow] 快捷键重注册失败: {e:#}");
                 trace_save(&h, &format!("快捷键注册失败 {e:#}"));
             } else {
@@ -213,12 +216,33 @@ fn reset_config(app: AppHandle) -> Result<config::Config, String> {
     let h = app.clone();
     let hk = cfg.hotkey.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(e) = hotkey::apply(&h, &hk) {
+        if let Err(e) = hotkey::apply_tracked(&h, &hk) {
             eprintln!("[speaknow] {e:#}");
         }
     });
     let _ = apply_autostart(&app, false);
     Ok(cfg)
+}
+
+/// 最近一次快捷键注册结果：None = 全部成功；Some(原因) 供设置页横幅展示
+#[tauri::command]
+fn hotkey_status(app: AppHandle) -> Option<String> {
+    app.state::<Ctx>()
+        .hotkey_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// 打开主设置窗口并切到指定页（悬浮窗错误卡「打开设置」按钮的落点）。
+/// tab 为前端 TabId（dash/hotkey/mic/asr/llm/translate/ocr/output/display/
+/// history/about），未识别时只开窗不切页
+#[tauri::command]
+fn open_settings(app: AppHandle, tab: Option<String>) {
+    tray::open_main_window(&app);
+    if let Some(tab) = tab {
+        let _ = app.emit("sn-navigate", tab);
+    }
 }
 
 #[tauri::command]
@@ -1177,6 +1201,7 @@ pub fn run() {
             last_audio: Mutex::new(None),
             overlay_manual: AtomicBool::new(false),
             run_gen: AtomicU64::new(0),
+            hotkey_error: Mutex::new(None),
         })
         .setup(|app| {
             let cfg = config::load(app.handle());
@@ -1190,7 +1215,7 @@ pub fn run() {
                 });
             }
             tray::setup(app.handle())?;
-            if let Err(e) = hotkey::apply(app.handle(), &cfg.hotkey) {
+            if let Err(e) = hotkey::apply_tracked(app.handle(), &cfg.hotkey) {
                 eprintln!("[speaknow] {e:#}");
             }
             // 剪贴板监听（复制即翻译）：常驻轮询线程，开关由配置每 tick 判定
@@ -1276,6 +1301,8 @@ pub fn run() {
             save_config,
             reset_config,
             open_config_dir,
+            hotkey_status,
+            open_settings,
             list_devices,
             mic_test,
             mic_volume_info,

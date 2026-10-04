@@ -332,6 +332,17 @@ export default function App() {
         savedRef.current = JSON.stringify(c);
       });
     });
+    // 悬浮窗错误卡「打开设置」：后端 open_settings 命令开窗后广播本事件，
+    // tab 未识别（旧后端/异常值）时保持当前页
+    const un6 = listen<string>('sn-navigate', (e) => {
+      const hit = NAV.find((n) => n.id === e.payload);
+      if (hit) setTab(hit.id);
+    });
+    // 快捷键注册失败不再静默：保存/启动时后端广播结果，失败即 toast
+    // （设置页「快捷键」另有常驻横幅展示同一状态）
+    const un7 = listen<{ error: string | null }>('sn-hotkey-status', (e) => {
+      if (e.payload?.error) setToast(`快捷键注册失败：${e.payload.error}`, 'error');
+    });
     return () => {
       if (idleTimer) clearTimeout(idleTimer);
       un1.then((f) => f());
@@ -339,6 +350,8 @@ export default function App() {
       un3.then((f) => f());
       un4.then((f) => f());
       un5.then((f) => f());
+      un6.then((f) => f());
+      un7.then((f) => f());
     };
   }, []);
 

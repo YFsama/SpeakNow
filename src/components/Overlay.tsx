@@ -19,6 +19,7 @@ import {
   getConfig,
   ocrCapture,
   ocrPaste,
+  openSettings,
   optimizeText,
   overlayPin,
   overlaySetManual,
@@ -166,13 +167,16 @@ function growReviewBox(el: HTMLTextAreaElement | null) {
 }
 
 /* ---- 长文本自适应：估算渲染行数（卡片内宽约 460px，14px 字号） ---- */
+/* 宽度判定正则提升为模块常量：流式期间 estimateDisplayLines 高频执行，
+   逐字符新建正则字面量会让引擎反复走编译路径（V8 有缓存但非零成本） */
+const CJK_WIDTH_RE = /[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]/;
 function estimateDisplayLines(text: string, widthPx: number): number {
   let n = 0;
   for (const ln of text.split('\n')) {
     let w = 0;
     for (const ch of ln) {
       // CJK 与全角按 14px，其余按 7.6px 估宽
-      w += /[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch) ? 14 : 7.6;
+      w += CJK_WIDTH_RE.test(ch) ? 14 : 7.6;
     }
     n += Math.max(1, Math.ceil(w / widthPx));
   }
@@ -2067,6 +2071,19 @@ export default function Overlay() {
                     >
                       {errCopied ? '已复制 ✓' : '⧉ 复制错误信息'}
                     </button>
+                    {/* 凭据类错误给出直达出口：401/403 一律是 Key 问题，报错
+                        文案再可读也不如一键跳到填写处 */}
+                    {/40[13]|API Key|鉴权|凭据|Key 未/.test(message) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void openSettings('asr').catch(() => {});
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-sky-500/90 to-indigo-500/90 px-3 py-1 text-[11.5px] font-medium text-white shadow-lg shadow-sky-500/20 transition hover:brightness-110 active:scale-[0.97]"
+                      >
+                        ⚙ 打开设置去填 Key
+                      </button>
+                    )}
                   </div>
                   {message.includes('管理员') && (
                     <div className="mt-2.5">

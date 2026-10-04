@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
@@ -26,6 +26,15 @@ pub(crate) fn delta_payload(scope: &str, kind: &str, delta: &str, text: Option<&
         }
         None => serde_json::json!({ "scope": scope, "kind": kind, "delta": delta }),
     }
+}
+
+/// LLM 环节是否真正可用：已启用 + 地址非空 +（云端须有 Key / 本机端点免 Key）。
+/// 云端没填 Key 时每次调用都注定 401——与其每句听写白发一次失败请求、等
+/// 重试提示再回退原文，不如判未就绪直接跳过 AI 环节
+pub fn llm_ready(cfg: &LlmConfig) -> bool {
+    cfg.enabled
+        && !cfg.base_url.trim().is_empty()
+        && (!cfg.api_key.trim().is_empty() || crate::http::is_local_base(&cfg.base_url))
 }
 
 /// 术语表条目：规范写法 + 常见误识形式。

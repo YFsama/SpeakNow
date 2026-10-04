@@ -19,3 +19,14 @@ pub static CLIENT_BLOCKING: LazyLock<reqwest::blocking::Client> =
             .build()
             .expect("构建阻塞 HTTP 客户端失败")
     });
+
+/// 是否本机自建服务（whisper.cpp server / Ollama / LM Studio / llama.cpp，
+/// 无需 API Key）。ASR 的「是否可本地回退」与 LLM 的「空 Key 是否跳过」
+/// 共用同一口径，避免两处判定漂移
+pub fn is_local_base(base: &str) -> bool {
+    let b = base.trim().to_lowercase();
+    b.contains("localhost")
+        || b.contains("127.0.0.1")
+        || b.contains("0.0.0.0")
+        || b.contains("[::1]")
+}

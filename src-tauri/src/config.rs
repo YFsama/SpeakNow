@@ -394,6 +394,9 @@ pub struct OutputConfig {
     pub paste_key: String,
     pub auto_paste: bool,
     pub auto_submit: bool,
+    /// 粘贴输入后把用户原来的剪贴板内容还原回去（README 宣传的行为，故
+    /// 默认开启；还原有三重守卫：2s 延迟 + 序号未变 + 内容仍匹配，不会
+    /// 覆盖期间用户主动复制的新内容。存量配置已序列化 false 的不受影响）
     pub restore_clipboard: bool,
     /// 输入前在悬浮窗中确认（可编辑后再输入）
     pub review: bool,
@@ -406,7 +409,7 @@ impl Default for OutputConfig {
             paste_key: "auto".into(),
             auto_paste: true,
             auto_submit: false,
-            restore_clipboard: false,
+            restore_clipboard: true,
             review: false,
         }
     }

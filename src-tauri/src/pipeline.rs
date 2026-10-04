@@ -27,6 +27,63 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/* ---------- 热键 / 托盘入口的串行执行通道 ---------- */
+
+/// 全局快捷键与托盘菜单回调跑在主线程（tao 事件循环）上，而 start() 含
+/// UIA 光标探测（慢目标上百 ms）与 WASAPI 开流等待（无线麦可达秒级），
+/// 同步执行会冻结主窗与托盘——设置页 start_recording 命令早已用
+/// spawn_blocking 规避，本通道让热键路径对齐。专用单线程消费还保证
+/// hold 模式「按下→松开」的 FIFO 顺序：多线程池下 stop 可能抢在 start
+/// 落锁前执行，快速点按会把录音漏停到最长时长兜底。
+enum Cmd {
+    Start { app: AppHandle, quick: bool, translate: bool },
+    Stop { app: AppHandle },
+    Toggle { app: AppHandle, quick: bool, translate: bool },
+}
+
+static CMD_TX: std::sync::LazyLock<std::sync::mpsc::Sender<Cmd>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        std::thread::Builder::new()
+            .name("speaknow-pipeline-cmd".into())
+            .spawn(move || {
+                for cmd in rx {
+                    match cmd {
+                        Cmd::Start { app, quick, translate } => {
+                            // 失败的用户可见上报（error 状态 + 延迟隐藏）已收口在
+                            // start() 内部 audio::start 失败处，这里只留日志
+                            if let Err(e) = start(&app, quick, translate, false) {
+                                eprintln!("[speaknow] 开始录音失败: {e}");
+                            }
+                        }
+                        Cmd::Stop { app } => {
+                            if let Err(e) = stop(&app) {
+                                eprintln!("[speaknow] 结束录音失败: {e}");
+                            }
+                        }
+                        Cmd::Toggle { app, quick, translate } => toggle(&app, quick, translate),
+                    }
+                }
+            })
+            .expect("pipeline 命令线程启动失败");
+        tx
+    });
+
+/// toggle 模式主快捷键 / 托盘「开始 / 停止录音」：投递执行，不占主线程
+pub fn post_toggle(app: &AppHandle, quick: bool, translate: bool) {
+    let _ = CMD_TX.send(Cmd::Toggle { app: app.clone(), quick, translate });
+}
+
+/// hold 模式按下
+pub fn post_start(app: &AppHandle, quick: bool, translate: bool) {
+    let _ = CMD_TX.send(Cmd::Start { app: app.clone(), quick, translate });
+}
+
+/// hold 模式松开
+pub fn post_stop(app: &AppHandle) {
+    let _ = CMD_TX.send(Cmd::Stop { app: app.clone() });
+}
+
 /// 托盘 / 切换模式：正在录音则停止，否则开始。
 /// `skip_llm`：快速模式（跳过 AI 优化）；`translate`：本次听写强制翻译模式
 pub fn toggle(app: &AppHandle, skip_llm: bool, translate: bool) {
@@ -105,10 +162,7 @@ pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) ->
     let sound = cfg.general.sound_feedback;
     // 翻译提示只在 LLM 真正可用时显示（凭据组解析后判定；LLM 未配置时
     // run() 会静默退回默认模式，提前剧透「翻译为 X」只会误导）
-    let llm_ready = {
-        let rl = cfg.resolved_llm();
-        rl.enabled && !rl.base_url.trim().is_empty()
-    };
+    let llm_ready = llm::llm_ready(&cfg.resolved_llm());
     let force_translate = !skip_llm && translate && llm_ready;
     let hold = cfg.hotkey.mode == "hold";
     let hint = if skip_llm {
@@ -264,12 +318,21 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig, sess: Arc<Session>) 
                     }
                 };
                 if !text.trim().is_empty() {
-                    let joined = {
+                    // 段边界信息：segs=已定稿段数；last=最后一段原文。取 trim 后
+                    // 的文本——join_transcripts 以 trim 段落收尾，joined 恒以
+                    // last 结尾，前端据此从 text 尾部安全切出「暂存段」
+                    let last = text.trim().to_string();
+                    let (joined, segs) = {
                         let mut texts = sess.stream_texts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         texts.push(text);
-                        asr::join_transcripts(&texts)
+                        (asr::join_transcripts(&texts), texts.len())
                     };
-                    events::emit(&app, "sn-partial", serde_json::json!({ "text": joined }));
+                    // text 保持旧语义不变，旧前端忽略 segs/last 天然兼容
+                    events::emit(
+                        &app,
+                        "sn-partial",
+                        serde_json::json!({ "text": joined, "segs": segs, "last": last }),
+                    );
                 }
             }
             None => {
@@ -400,6 +463,8 @@ fn watch(
 ) {
     let mut agc = Agc::new(base_gain_db, auto_gain);
     let streaming = sess.streaming;
+    // 临近最长时长提示（每会话一次）
+    let mut near_max_hinted = false;
     loop {
         thread::sleep(Duration::from_millis(100));
         if sess.cancel.load(Ordering::SeqCst) {
@@ -454,6 +519,23 @@ fn watch(
             crate::trace_pipeline(&app, "VAD 静音自动结束");
             let _ = stop(&app);
             break;
+        }
+        // 临近最长录音时长（进入最后 5s 窗口）提示一次：达上限静默自动收尾
+        // 会让说到一半的用户毫无预警。max_sec ≤ 5s 时提示窗口不存在，跳过。
+        // hint 型 sn-status 前端只刷新提示文案、不做阶段清场（不闪断流式字幕）
+        if !near_max_hinted && max_sec > 5 && elapsed_ms + 5_000 >= max_sec * 1_000 {
+            near_max_hinted = true;
+            crate::trace_pipeline(&app, "临近最长录音时长，已提示用户");
+            events::emit(
+                &app,
+                "sn-status",
+                serde_json::json!({
+                    "stage": "recording",
+                    "message": "即将达到最长录音时长，自动结束",
+                    "sound": false,
+                    "hint": true,
+                }),
+            );
         }
         if elapsed_ms > max_sec * 1000 {
             crate::trace_pipeline(&app, "达到最长时长自动结束");
@@ -517,7 +599,9 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, sess: Arc<Sessi
     let mut cfg = cfg;
     cfg.asr = asr_resolved;
     cfg.llm = llm_resolved;
-    let llm_active = cfg.llm.enabled && !skip_llm && !cfg.llm.base_url.trim().is_empty();
+    // 空 Key 的云端端点每次调用都注定 401：与其白发一次失败请求、等重试
+    // 提示再回退原文，不如判未就绪直接跳过 AI 环节（本地端点免 Key 不受影响）
+    let llm_active = !skip_llm && llm::llm_ready(&cfg.llm);
     // 翻译快捷键强制翻译模式；LLM 未启用/未配置时静默退回默认行为
     let translating = force_translate && llm_active;
     if translating {
@@ -599,7 +683,9 @@ pub async fn process_audio(
     stop_info: Option<(u64, Instant)>,
 ) {
     let streaming = stream.is_some();
-    let llm_active = cfg.llm.enabled && !skip_llm && !cfg.llm.base_url.trim().is_empty();
+    // 空 Key 的云端端点每次调用都注定 401：与其白发一次失败请求、等重试
+    // 提示再回退原文，不如判未就绪直接跳过 AI 环节（本地端点免 Key 不受影响）
+    let llm_active = !skip_llm && llm::llm_ready(&cfg.llm);
     // 本代会话标识：若处理期间用户开始了新录音，本代结果作废，不再输入。
     // 重试无会话：以当前代数为准（重试期间新录音开始同样作废）
     let gen = stream
@@ -740,6 +826,19 @@ pub async fn process_audio(
     } else {
         String::new()
     };
+    // AI 优化开启却未就绪（缺 Key / 缺地址）被跳过时说明缘由：否则用户看到
+    // 原文直出，只会以为 AI 优化坏了。快速模式（skip_llm）与主动关闭是用户
+    // 本意，不打扰
+    let llm_skip_note = if !skip_llm && cfg.llm.enabled && !llm_active {
+        if cfg.llm.base_url.trim().is_empty() {
+            " · AI 优化未配置地址，本次输出原文".to_string()
+        } else {
+            " · AI 优化未配置 API Key，本次输出原文".to_string()
+        }
+    } else {
+        String::new()
+    };
+    let done_note = format!("{seg_fail_note}{llm_skip_note}");
 
     // 会话已过期：新录音已开始，本代结果不再上屏、不再输入（防止旧文本
     // 晚到覆盖新输入；先于 sn-raw，过期转写连悬浮窗都不闪现）
@@ -845,7 +944,7 @@ pub async fn process_audio(
                 finish_status(
                     &app,
                     "done",
-                    &format!("已复制到剪贴板（测试模式）{seg_fail_note}"),
+                    &format!("已复制到剪贴板（测试模式）{done_note}"),
                     3200,
                     cfg.general.sound_feedback,
                 );
@@ -876,7 +975,15 @@ pub async fn process_audio(
         events::emit(
             &app,
             "sn-review",
-            serde_json::json!({ "text": final_text, "raw": raw, "llmUsed": llm_ms > 0 }),
+            // asrMs/llmMs 供审阅卡展示耗时徽标（与 done 卡的「识别 X · 优化 Y」
+            // 对齐；值为 0 时前端省略对应段）
+            serde_json::json!({
+                "text": final_text,
+                "raw": raw,
+                "llmUsed": llm_ms > 0,
+                "asrMs": asr_ms,
+                "llmMs": llm_ms,
+            }),
         );
         emit_status(&app, "review", "可编辑 · Enter 输入 · Esc 取消", false);
         overlay::show_review(&app);
@@ -894,14 +1001,14 @@ pub async fn process_audio(
         llm_first_ms,
         duration_secs,
         stop_info,
-        &seg_fail_note,
+        &done_note,
     )
     .await;
 }
 
 /// 直接输入路径（历史 + 事件 + 粘贴）。gen 为本代会话代数：粘贴前若已有
 /// 新录音开始（代数前移），放弃输入并提示「已跳过」，杜绝旧句子晚到落进光标。
-/// note：追加到 done 阶段消息末尾的附加提示（流式分段失败警示；空 = 无）。
+/// note：追加到 done 阶段消息末尾的附加提示（流式分段失败 / AI 优化跳过说明；空 = 无）。
 /// 只挂在 done 消息上——error 阶段消息已自带失败原因，再追加缺句警示只会冲淡重点
 #[allow(clippy::too_many_arguments)]
 pub async fn finish_and_input(

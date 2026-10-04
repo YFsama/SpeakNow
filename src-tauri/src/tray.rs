@@ -116,7 +116,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id().as_ref().to_string();
     match id.as_str() {
-        "record" => pipeline::toggle(app, false, false),
+        "record" => pipeline::post_toggle(app, false, false),
         "translate_sel" => {
             // 取词含按键模拟与剪贴板轮询（阻塞），放独立线程；托盘菜单收起后
             // 焦点回到原窗口，选区仍在即可取词

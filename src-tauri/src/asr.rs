@@ -299,18 +299,23 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        // 401/403 多为未填 Key 或 Key 失效：原样透传服务商报文对用户毫无
+        // 信息量，给出可操作指引（悬浮窗错误卡会同时出现「打开设置」按钮）
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            bail!(
+                "ASR 鉴权失败（HTTP {}）：API Key 未配置或已失效。请到「设置 → 语音识别」填写 Key，或改用本地离线引擎（无需 Key）",
+                status.as_u16()
+            );
+        }
         bail!("ASR 服务返回 {}: {}", status, truncate(body.trim(), 300));
     }
     extract_text(&body)
 }
 
-/// 是否本机自建服务（whisper.cpp server 等，无需 Key，不做本地回退）
+/// 是否本机自建服务（whisper.cpp server 等，无需 Key，不做本地回退）。
+/// 判定口径统一收口在 http::is_local_base（与 LLM 空 Key 跳过共用）
 fn is_local_server(base: &str) -> bool {
-    let b = base.trim().to_lowercase();
-    b.contains("localhost")
-        || b.contains("127.0.0.1")
-        || b.contains("0.0.0.0")
-        || b.contains("[::1]")
+    crate::http::is_local_base(base)
 }
 
 /// 超长录音自动分段识别再拼接

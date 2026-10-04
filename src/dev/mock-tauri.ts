@@ -436,6 +436,14 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'is_elevated':
           resolve(false);
           return;
+        case 'hotkey_status':
+          resolve(null);
+          return;
+        case 'open_settings':
+          console.info('[mock-tauri] 打开设置页', args);
+          emit('sn-navigate', (args as { tab?: string }).tab ?? 'dash');
+          resolve('ok');
+          return;
         case 'export_text': {
           // 浏览器里真实落一个下载，截图导出流程可用
           const { filename, content } = args as { filename: string; content: string };
@@ -492,7 +500,7 @@ window.__mock = {
   emit,
   stage: (stage, message = '') => emit('sn-status', { stage, message }),
   toast: (msg) => emit('sn-toast', { message: msg }),
-  tab: (tab) => emit('sn-navigate', { tab }),
+  tab: (tab) => emit('sn-navigate', tab),
   config: mockConfig,
   /** 替换 mock 历史并广播刷新（视觉验证用，如测试上手清单需要 <3 条） */
   setHistory: (items: unknown[]) => {

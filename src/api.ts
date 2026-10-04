@@ -28,6 +28,11 @@ export const saveConfig = (config: Config) =>
   invoke<string>('save_config', { config });
 export const resetConfig = () => invoke<Config>('reset_config');
 export const openConfigDir = () => invoke('open_config_dir');
+/** 最近一次快捷键注册结果：null = 全部成功；否则为失败原因（组合键被占用等） */
+export const hotkeyStatus = () => invoke<string | null>('hotkey_status');
+/** 打开主设置窗口并切到指定页（悬浮窗错误卡「打开设置」用） */
+export const openSettings = (tab?: string) =>
+  invoke('open_settings', { tab: tab ?? null });
 export const listDevices = () => invoke<DeviceInfo[]>('list_devices');
 export const micTest = (
   device: string | null,

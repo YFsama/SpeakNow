@@ -44,6 +44,26 @@ fn capitalize_first(s: &str) -> String {
 /// 串行化重注册，避免后台任务竞态导致重复注册
 static APPLY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// 注册结果写入 Ctx.hotkey_error 并广播 sn-hotkey-status：注册失败曾被完全
+/// 静默（只落日志文件），用户以为改绑成功、实际快捷键被其他应用占用着——
+/// 设置页横幅与 App toast 都以此为准
+pub fn apply_tracked(app: &AppHandle, hk: &HotkeyConfig) -> Result<()> {
+    let r = apply(app, hk);
+    let ctx = app.state::<Ctx>();
+    let mut err = ctx
+        .hotkey_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *err = r.as_ref().err().map(|e| e.to_string());
+    drop(err);
+    crate::events::emit(
+        app,
+        "sn-hotkey-status",
+        serde_json::json!({ "error": r.as_ref().err().map(|e| e.to_string()) }),
+    );
+    r
+}
+
 /// 应用快捷键配置变更：注销旧的，注册主快捷键 + 快速模式/翻译模式快捷键
 pub fn apply(app: &AppHandle, hk: &HotkeyConfig) -> Result<()> {
     let _g = APPLY_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -144,19 +164,18 @@ fn handle_event(app: &AppHandle, sc: &Shortcut, event: ShortcutEvent) {
 
     match event.state() {
         ShortcutState::Pressed => {
+            // start/toggle 含 WASAPI 开流等待与 UIA 光标探测（阻塞可达秒级），
+            // 投递到 pipeline 专用线程执行，不冻结主线程（tao 事件循环）上的
+            // 托盘与主窗；单线程 FIFO 保证 hold「按下→松开」的先后顺序
             if hk.mode == "hold" {
-                if let Err(e) = pipeline::start(app, is_quick, is_translate, false) {
-                    eprintln!("[speaknow] 开始录音失败: {e}");
-                }
+                pipeline::post_start(app, is_quick, is_translate);
             } else {
-                pipeline::toggle(app, is_quick, is_translate);
+                pipeline::post_toggle(app, is_quick, is_translate);
             }
         }
         ShortcutState::Released => {
             if hk.mode == "hold" {
-                if let Err(e) = pipeline::stop(app) {
-                    eprintln!("[speaknow] 结束录音失败: {e}");
-                }
+                pipeline::post_stop(app);
             }
         }
     }
