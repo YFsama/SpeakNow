@@ -66,18 +66,18 @@ const AboutTab = lazy(() =>
   import('./components/tabs/AboutTab').then((m) => ({ default: m.AboutTab })),
 );
 
-const NAV: { id: TabId; label: string; group: string }[] = [
-  { id: 'dash', label: '总览', group: '使用' },
-  { id: 'hotkey', label: '快捷键', group: '使用' },
-  { id: 'mic', label: '麦克风', group: '输入与识别' },
-  { id: 'asr', label: '语音识别', group: '输入与识别' },
-  { id: 'ocr', label: '截图取词', group: '输入与识别' },
-  { id: 'llm', label: 'AI 优化', group: '增强' },
-  { id: 'translate', label: '翻译', group: '增强' },
-  { id: 'output', label: '输入方式', group: '输出与数据' },
-  { id: 'display', label: '外接显示', group: '输出与数据' },
-  { id: 'history', label: '历史', group: '数据与其他' },
-  { id: 'about', label: '关于', group: '数据与其他' },
+const NAV: { id: TabId; label: string; group: string; keys: string }[] = [
+  { id: 'dash', label: '总览', group: '使用', keys: '总览 概览 状态 统计 上手' },
+  { id: 'hotkey', label: '快捷键', group: '使用', keys: '热键 快捷键 hotkey 触发 误触 录音时长' },
+  { id: 'mic', label: '麦克风', group: '输入与识别', keys: '麦克风 设备 增益 音量 agc 测试' },
+  { id: 'asr', label: '语音识别', group: '输入与识别', keys: '识别 语音 asr whisper qwen 引擎 模型 热词' },
+  { id: 'ocr', label: '截图取词', group: '输入与识别', keys: '截图 取词 ocr 框选 屏幕 文字识别' },
+  { id: 'llm', label: 'AI 优化', group: '增强', keys: 'ai 优化 纠错 润色 llm key 凭据 提示词 术语' },
+  { id: 'translate', label: '翻译', group: '增强', keys: '翻译 translation 语言 划词 复制即翻译 双击' },
+  { id: 'output', label: '输入方式', group: '输出与数据', keys: '输出 粘贴 输入方式 回车 剪贴板 还原 键入' },
+  { id: 'display', label: '外接显示', group: '输出与数据', keys: '外接 显示 字幕屏 display 局域网' },
+  { id: 'history', label: '历史', group: '数据与其他', keys: '历史 记录 收藏 统计' },
+  { id: 'about', label: '关于', group: '数据与其他', keys: '关于 版本 更新' },
 ];
 
 /* 侧栏 16px 线性 stroke 图标：stroke=currentColor，激活态自动跟随 sky-300 */
@@ -242,6 +242,16 @@ function Toast({ item, onClose }: { item: ToastItem; onClose: (id: number) => vo
 export default function App() {
   const [tab, setTab] = useState<TabId>('dash');
   const [cfg, setCfg] = useState<Config | null>(null);
+  // 侧栏搜索：按 label/关键词过滤 NAV；空串显示全部
+  const [navQuery, setNavQuery] = useState('');
+  const navItems = useMemo(() => {
+    const q = navQuery.trim().toLowerCase();
+    if (!q) return NAV;
+    return NAV.filter(
+      (n) =>
+        n.label.toLowerCase().includes(q) || n.keys.toLowerCase().includes(q),
+    );
+  }, [navQuery]);
   const savedRef = useRef('');
   const cfgRef = useRef<Config | null>(null);
   cfgRef.current = cfg;
@@ -578,9 +588,20 @@ export default function App() {
         </div>
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-4">
-          {NAV.map((n, i) => {
+          {/* 设置项搜索：11 页设置靠翻找太慢，按名称/关键词过滤侧栏 */}
+          <div className="sticky top-0 z-10 -mt-1 mb-2 bg-[#0d0d14]/80 pb-1 pt-1 backdrop-blur">
+            <input
+              type="text"
+              value={navQuery}
+              onChange={(e) => setNavQuery(e.target.value)}
+              placeholder="搜索设置页…"
+              spellCheck={false}
+              className="w-full rounded-lg border border-white/[0.07] bg-black/30 px-2.5 py-1.5 text-[12px] text-slate-200 placeholder:text-slate-600 outline-none transition focus:border-sky-500/50"
+            />
+          </div>
+          {navItems.map((n, i) => {
             const active = tab === n.id;
-            const showGroup = n.group !== NAV[i - 1]?.group;
+            const showGroup = n.group !== navItems[i - 1]?.group;
             return (
               <Fragment key={n.id}>
                 {showGroup && (

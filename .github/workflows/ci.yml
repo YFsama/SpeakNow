@@ -72,6 +72,10 @@ jobs:
       - name: Frontend/backend contract check
         run: npm run contracts
 
+      # 前端纯逻辑单测（vitest）：键位徽章格式化、凭据组解析等
+      - name: Frontend unit tests
+        run: npm test
+
       - name: Rust compile check (incl. examples)
         shell: bash
         run: |

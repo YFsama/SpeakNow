@@ -10,7 +10,7 @@ import {
   shortcutChips,
   translateSelection,
 } from '../api';
-import { Button, Toggle } from './Controls';
+import { Button, Segmented, Toggle } from './Controls';
 
 const STAGE_INFO: Record<
   Stage,
@@ -812,6 +812,21 @@ export default function Dashboard({
                   </button>
                 );
               })}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1.5 text-[13px] font-medium text-slate-300/90">卡片驻留时长</div>
+            <Segmented
+              value={String(cfg.general.lingerMult ?? 1)}
+              onChange={(v) => set('general', { lingerMult: Number(v) })}
+              options={[
+                { value: '0.6', label: '短', desc: '快速连打' },
+                { value: '1', label: '标准', desc: '默认节奏' },
+                { value: '1.8', label: '长', desc: '从容阅读' },
+              ]}
+            />
+            <div className="mt-1 text-[11px] text-slate-500">
+              完成 / 翻译 / OCR 等悬浮卡的停留时间统一缩放（悬停可随时暂停计时）
             </div>
           </div>
           <div>

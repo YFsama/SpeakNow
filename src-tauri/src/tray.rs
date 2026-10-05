@@ -1,4 +1,4 @@
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
@@ -23,6 +23,9 @@ fn current_config(app: &AppHandle) -> crate::config::Config {
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let record = MenuItem::with_id(app, "record", "开始 / 停止录音", true, None::<&str>)?;
+    // 快速录音：显式入口跳过 AI 优化（不用先去设置页配第二快捷键）
+    let record_quick =
+        MenuItem::with_id(app, "record_quick", "快速录音（跳过 AI）", true, None::<&str>)?;
     let translate_sel =
         MenuItem::with_id(app, "translate_sel", "划词翻译选中文字", true, None::<&str>)?;
     let ocr_item = MenuItem::with_id(app, "ocr", "截图取词（框选识别）", true, None::<&str>)?;
@@ -79,11 +82,21 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             .collect::<Vec<_>>(),
     )?;
 
+    // 预览编辑快切：☑ 跟随配置勾选状态，与模式/语言同为持久配置项
+    let review = CheckMenuItem::with_id(
+        app,
+        "review",
+        "输入前确认（预览编辑）",
+        true,
+        cfg.output.review,
+        None::<&str>,
+    )?;
+
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     Menu::with_items(
         app,
-        &[&record, &translate_sel, &ocr_item, &show, &sep1, &mode_menu, &lang_menu, &sep2, &quit],
+        &[&record, &record_quick, &translate_sel, &ocr_item, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
     )
 }
 
@@ -117,6 +130,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id().as_ref().to_string();
     match id.as_str() {
         "record" => pipeline::post_toggle(app, false, false),
+        "record_quick" => pipeline::post_start(app, true, false),
         "translate_sel" => {
             // 取词含按键模拟与剪贴板轮询（阻塞），放独立线程；托盘菜单收起后
             // 焦点回到原窗口，选区仍在即可取词
@@ -126,6 +140,18 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "ocr" => crate::ocr::start_capture(app),
         "show" => open_main_window(app),
         "quit" => app.exit(0),
+        // 预览编辑快切：与模式/语言同为持久配置项，落盘 + 通知设置页刷新
+        "review" => {
+            let mut cfg = current_config(app);
+            cfg.output.review = !cfg.output.review;
+            if let Err(e) = crate::config::save(app, &cfg) {
+                eprintln!("[speaknow] 托盘保存配置失败: {e:#}");
+                return;
+            }
+            *app.state::<crate::Ctx>().config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg);
+            let _ = app.emit("sn-config-changed", ());
+            rebuild_menu(app);
+        }
         _ => {
             let Some((kind, value)) = id.split_once(':') else {
                 return;

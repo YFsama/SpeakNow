@@ -527,6 +527,10 @@ export default function Overlay() {
   const streamTextRef = useRef('');
   /* 界面缩放：body.zoom 放大卡片的同时窗口必须同步放大，否则卡片被窗口边缘裁切 */
   const zoomRef = useRef(1);
+  /* 悬浮窗本地缩放乘子（Ctrl+滚轮调整，与全局 fontScale 相乘） */
+  const overlayMultRef = useRef(1);
+  /* 卡片驻留时长乘子（general.lingerMult，进度条动画与后端 hide 同步缩放） */
+  const [lingerMult, setLingerMult] = useState(1);
   /* 双击复制豁免：双击的第二次 mousedown 会先摧毁已有手动选区并自动选中
      双击词，dblclick 时读 getSelection 恒非空、无法区分——只能在第一次
      mousedown（e.detail===1）记录「当时是否已有选区」，dblclick 按该标志判定 */
@@ -542,21 +546,50 @@ export default function Overlay() {
 
   /* 悬浮窗固定深色玻璃风（不随浅色主题变白）；仅缩放跟随配置 */
   useEffect(() => {
+    // 本地缩放乘子（Ctrl+滚轮调整，localStorage 持久）：与全局「界面缩放」
+    // 相乘——悬浮窗常需要比设置窗更大的字号（远处瞄一眼字幕/译文）
+    try {
+      overlayMultRef.current = Number(localStorage.getItem('sn:overlayZoom')) || 1;
+    } catch {
+      /* localStorage 不可用：仅本次会话生效 */
+    }
     const apply = (c: Config) => {
       zoomRef.current = c.general.fontScale || 1;
-      document.body.style.zoom = String(zoomRef.current);
+      document.body.style.zoom = String(zoomRef.current * overlayMultRef.current);
       soundRef.current = c.general.soundFeedback !== false;
       // 后端凭据组迁移会清空内联 llm.baseUrl，须按解析后的生效凭据判断
       // LLM 是否可用，否则迁移后审阅编辑器的「重新优化」会莫名消失
       setLlmEnabled(c.llm.enabled && !!resolvedLlmCreds(c).baseUrl.trim());
       setLlmMode(c.llm.mode);
       setTranslateTarget(c.llm.translateTarget || 'en');
+      // 卡片驻留乘子：进度条动画与后端 hide_later 同步缩放
+      setLingerMult(c.general.lingerMult || 1);
     };
     getConfig().then(apply);
     const un = listen('sn-config-changed', () => getConfig().then(apply));
     return () => {
       un.then((f) => f());
     };
+  }, []);
+
+  /* 悬浮窗 Ctrl+滚轮缩放：只改本地乘子（0.7~1.8），不动全局设置 */
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const cur = overlayMultRef.current;
+      const next = Math.min(1.8, Math.max(0.7, cur - Math.sign(e.deltaY) * 0.05));
+      if (next === cur) return;
+      overlayMultRef.current = next;
+      document.body.style.zoom = String((zoomRef.current || 1) * next);
+      try {
+        localStorage.setItem('sn:overlayZoom', String(next));
+      } catch {
+        /* 持久化失败不影响本次会话 */
+      }
+    };
+    window.addEventListener('wheel', onWheel, { passive: false });
+    return () => window.removeEventListener('wheel', onWheel);
   }, []);
 
   /* 审阅窗口「重新优化」的流式回填：增量不进 React 状态（逐 token setState 会
@@ -1392,7 +1425,7 @@ export default function Overlay() {
                   : 'bg-gradient-to-r from-red-400 to-amber-400'
               }`}
               style={{
-                animationDuration: `${COUNTDOWN_MS}ms`,
+                animationDuration: `${COUNTDOWN_MS * lingerMult}ms`,
                 animationPlayState: hovered ? 'paused' : 'running',
               }}
               aria-hidden
@@ -1402,7 +1435,7 @@ export default function Overlay() {
             <span
               className="countdown-bar absolute bottom-0 left-0 h-[2px] bg-gradient-to-r from-emerald-400 to-teal-300"
               style={{
-                animationDuration: `${TRANS_COUNTDOWN_MS}ms`,
+                animationDuration: `${TRANS_COUNTDOWN_MS * lingerMult}ms`,
                 animationPlayState: hovered ? 'paused' : 'running',
               }}
               aria-hidden
@@ -1413,7 +1446,7 @@ export default function Overlay() {
             <span
               className="countdown-bar absolute bottom-0 left-0 h-[2px] bg-gradient-to-r from-sky-400 to-cyan-300"
               style={{
-                animationDuration: '15s',
+                animationDuration: `${15000 * lingerMult}ms`,
                 animationPlayState: hovered ? 'paused' : 'running',
               }}
               aria-hidden

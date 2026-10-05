@@ -20,9 +20,10 @@ OCR、键盘/剪贴板注入、托盘与热键；**React 19 前端**（`src/`，
 ```bash
 npx tsc --noEmit            # 前端类型检查（strict，全库零 any，别开先例）
 npm run contracts           # 前后端契约对账（见下），CI 同款
+npm test                    # 前端纯逻辑单测（vitest：键位徽章/凭据组解析）
 cd src-tauri
 cargo check --lib --examples  # Rust 编译（含 5 个诊断 examples）
-cargo test                    # 87 个单测（纯逻辑层：提示词/结构化翻译/文本清洗/CCC 状态机…）
+cargo test                    # 96 个单测（纯逻辑层：提示词/结构化翻译/文本清洗/CCC 状态机…）
 ```
 
 前端 UI 可在纯浏览器迭代（无 Tauri、无 Rust）：`npm run dev` 后访问

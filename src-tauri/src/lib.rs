@@ -157,7 +157,10 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
     translate::apply_watch_flag(&config);
     // 托盘快切菜单展示当前模式/翻译目标：设置页改动后同步重建。
     // 经独立线程派发到主线程——不等待主线程空闲，避免保存被卡
-    if config.llm.mode != old.llm.mode || config.llm.translate_target != old.llm.translate_target {
+    if config.llm.mode != old.llm.mode
+        || config.llm.translate_target != old.llm.translate_target
+        || config.output.review != old.output.review
+    {
         let h = app.clone();
         std::thread::spawn(move || {
             let h2 = h.clone();

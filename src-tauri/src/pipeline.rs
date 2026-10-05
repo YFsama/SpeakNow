@@ -138,6 +138,10 @@ pub struct Session {
     pub stream_finished: AtomicBool,
     pub stream_queue: Mutex<VecDeque<Vec<i16>>>,
     pub stream_texts: Mutex<Vec<String>>,
+    /// 分段队列的唤醒信号：入队 / 收尾置位后 notify，worker 空转等待改事件
+    /// 驱动（此前 25ms 轮询，整场录音每秒 40 次空醒）。Notify 的 permit
+    /// 语义保证 notify 先于 await 到达也不丢唤醒
+    pub stream_notify: tokio::sync::Notify,
     /// 流式分段识别最终失败（含段级重试）的累计段数：拼接结果缺句时收尾
     /// 阶段据此在 done 消息里提示「可能不完整」，而不是静默给出残缺文本。
     /// 计数只在 worker 线程写、run() 收尾读，无重置需求（随会话消亡）
@@ -249,6 +253,7 @@ pub fn start(app: &AppHandle, skip_llm: bool, translate: bool, from_ui: bool) ->
         stream_finished: AtomicBool::new(!streaming),
         stream_queue: Mutex::new(VecDeque::new()),
         stream_texts: Mutex::new(Vec::new()),
+        stream_notify: tokio::sync::Notify::new(),
         stream_failed: AtomicUsize::new(0),
     });
     *slot = Some((rec, sess.clone()));
@@ -340,9 +345,15 @@ async fn segment_worker(app: AppHandle, asr_cfg: AsrConfig, sess: Arc<Session>) 
                     sess.stream_finished.store(true, Ordering::SeqCst);
                     return;
                 }
-                // 25ms 粒度：最后一个分段入队后最多等一拍就被消费
-                // （原 120ms 在流式收尾路径白等）
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                // 事件驱动等待：入队 / 收尾时生产侧 notify_one。构造 future 后
+                // 双检队列与标记，关死「pop 之后、注册等待之前」的入队窗口
+                let notified = sess.stream_notify.notified();
+                if sess.stream_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).front().is_some()
+                    || sess.stream_done.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                notified.await;
             }
         }
     }
@@ -509,6 +520,7 @@ fn watch(
                             sess.stream_queue
                                 .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push_back(seg16);
+                            sess.stream_notify.notify_one();
                         }
                         sess.stream_cut.store(len, Ordering::SeqCst);
                     }
@@ -648,6 +660,7 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, sess: Arc<Sessi
                     sess.stream_queue
                         .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push_back(seg16);
+                    sess.stream_notify.notify_one();
                 }
                 break;
             }
@@ -658,6 +671,8 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, sess: Arc<Sessi
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         sess.stream_done.store(true, Ordering::SeqCst);
+        // 收尾标记置位后唤醒 worker：它可能正挂在 notified() 上等新分段
+        sess.stream_notify.notify_one();
     }
 
     // 说话探测门控依据：录音以多长静音收尾 + 停录时刻（静音收尾且管线
@@ -1157,9 +1172,21 @@ fn finish_status(app: &AppHandle, stage: &str, msg: &str, hide_after_ms: u64, so
 static HIDE_REMAINING_MS: AtomicU64 = AtomicU64::new(0);
 static HIDE_REAPER: Once = Once::new();
 
-/// 延迟隐藏悬浮窗；期间若悬停（pinned）则计时暂停，若开始新录音则取消
+/// 延迟隐藏悬浮窗；期间若悬停（pinned）则计时暂停，若开始新录音则取消。
+/// 实际时长按 general.linger_mult 缩放（「卡片驻留时长」设置：短/标准/长
+/// 统一作用于所有收尾卡，后端侧的 hide 调用点无需逐个改）
 pub fn hide_later(app: &AppHandle, ms: u64) {
-    HIDE_REMAINING_MS.store(ms.max(100), Ordering::SeqCst);
+    let mult = app
+        .state::<Ctx>()
+        .config
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|c| c.general.linger_mult)
+        .unwrap_or(1.0)
+        .clamp(0.3, 3.0);
+    let scaled = ((ms.max(100) as f32) * mult).round() as u64;
+    HIDE_REMAINING_MS.store(scaled, Ordering::SeqCst);
     HIDE_REAPER.call_once(|| {
         let handle = app.clone();
         thread::spawn(move || loop {

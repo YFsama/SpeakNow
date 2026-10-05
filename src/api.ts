@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { shortcutChips as chipsFor } from './shortcuts';
 import { getVersion } from '@tauri-apps/api/app';
 import type {
   AsrConfig,
@@ -254,60 +255,7 @@ function cacheLight() {
   }
 }
 
-const CODE_LABELS: Record<string, string> = {
-  Space: 'Space',
-  Comma: ',',
-  Period: '.',
-  Slash: '/',
-  Semicolon: ';',
-  Quote: "'",
-  Backquote: '`',
-  Minus: '-',
-  Equal: '=',
-  BracketLeft: '[',
-  BracketRight: ']',
-  Backslash: '\\',
-  Up: '↑',
-  Down: '↓',
-  Left: '←',
-  Right: '→',
-  ArrowUp: '↑',
-  ArrowDown: '↓',
-  ArrowLeft: '←',
-  ArrowRight: '→',
-  Insert: 'Ins',
-  Delete: 'Del',
-  Home: 'Home',
-  End: 'End',
-  PageUp: 'PgUp',
-  PageDown: 'PgDn',
-  Return: 'Enter',
-  Enter: 'Enter',
-  Escape: 'Esc',
-  Tab: 'Tab',
-  CapsLock: 'Caps',
-};
-
-/** 把单个按键名格式化为用户可读形式 */
-function prettyPart(part: string): string {
-  const k = part.toLowerCase();
-  if (k === 'ctrl' || k === 'control') return isMac ? '⌃' : 'Ctrl';
-  if (k === 'alt' || k === 'option') return isMac ? '⌥' : 'Alt';
-  if (k === 'shift') return isMac ? '⇧' : 'Shift';
-  if (k === 'meta' || k === 'cmd' || k === 'super' || k === 'win')
-    return isMac ? '⌘' : 'Win';
-  if (/^Key[A-Z]$/.test(part)) return part.slice(3);
-  if (/^Digit\d$/.test(part)) return part.slice(5);
-  if (/^F\d{1,2}$/.test(part)) return part;
-  if (/^Numpad\d$/.test(part)) return 'Num' + part.slice(6);
-  return CODE_LABELS[part] ?? part;
-}
-
-/** 拆分为可渲染的键位徽章数组 */
+/** 拆分为可渲染的键位徽章数组（按运行平台选 mac/win 字形；纯逻辑见 shortcuts.ts） */
 export function shortcutChips(s: string): string[] {
-  if (!s) return [];
-  return s
-    .split('+')
-    .filter(Boolean)
-    .map(prettyPart);
+  return chipsFor(s, isMac);
 }

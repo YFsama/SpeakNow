@@ -465,6 +465,14 @@ pub struct GeneralConfig {
     /// （冷启动数秒）。0 = 常驻不释放（保持秒级响应，默认）
     #[serde(default)]
     pub local_idle_min: u32,
+    /// 悬浮卡驻留时长乘子（0.6 短 / 1.0 标准 / 1.8 长）：完成/翻译/OCR 等
+    /// 各卡的默认驻留时间统一缩放，一次设置全局生效
+    #[serde(default = "default_linger_mult")]
+    pub linger_mult: f32,
+}
+
+fn default_linger_mult() -> f32 {
+    1.0
 }
 
 fn default_history_limit() -> usize {
@@ -482,6 +490,7 @@ impl Default for GeneralConfig {
             font_scale: 1.0,
             history_limit: default_history_limit(),
             local_idle_min: 0,
+            linger_mult: default_linger_mult(),
         }
     }
 }

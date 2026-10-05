@@ -192,6 +192,8 @@ export interface GeneralConfig {
   historyLimit?: number;
   /** 本地引擎空闲自动释放（分钟，0=常驻不释放）：llama-server 常驻可达 ~10GB 提交内存 */
   localIdleMin?: number;
+  /** 悬浮卡驻留时长乘子（0.6 短 / 1 标准 / 1.8 长）：各卡默认驻留统一缩放 */
+  lingerMult?: number;
 }
 
 /** 外接显示（硬件字幕屏）API */

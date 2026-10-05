@@ -123,6 +123,7 @@ const mockConfig = {
     fontScale: 1,
     historyLimit: 50,
     localIdleMin: 0,
+    lingerMult: 1,
   },
   externalDisplay: {
     enabled: false,
