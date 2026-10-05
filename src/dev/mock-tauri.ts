@@ -122,6 +122,7 @@ const mockConfig = {
     theme: 'dark',
     fontScale: 1,
     historyLimit: 50,
+    localIdleMin: 0,
   },
   externalDisplay: {
     enabled: false,

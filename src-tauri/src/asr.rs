@@ -53,6 +53,63 @@ pub fn join_transcripts(parts: &[String]) -> String {
     out
 }
 
+/// 本地引擎解析缓存（配置签名 + 模型代数 → 解析结果）：流式分段每段都走
+/// 一遍本地模型解析（9 次文件 stat + backend.txt 读取），纯重复；模型
+/// 下载/删除时 lib::bump_models_gen 前移代数自动失效。any = 是否存在任一
+/// 已下载模型（云端无 Key 的智能回退用），pick = 本地模式下选用的模型 id
+static LOCAL_PICK: std::sync::LazyLock<
+    std::sync::Mutex<Option<(String, u64, bool, Option<String>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 解析「本地是否有可用模型 + 该用哪个」：命中缓存直接返回，否则跑一次
+/// 文件状态检查并回填
+fn resolve_local(
+    app: &AppHandle,
+    cfg: &AsrConfig,
+    cloud_keyless: bool,
+) -> (bool, Option<String>) {
+    let sig = format!(
+        "{}|{}|{}|{}",
+        cfg.provider,
+        cfg.api_key.trim().is_empty(),
+        cfg.base_url.trim_end_matches('/'),
+        cfg.local_model
+    );
+    let gen = crate::models_gen();
+    {
+        let g = LOCAL_PICK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((s, g_, any, pick)) = g.as_ref() {
+            if s == &sig && *g_ == gen {
+                return (*any, pick.clone());
+            }
+        }
+    }
+    let whisper = local_whisper::status(app);
+    // 与旧实现口径一致：回退判定只认 Whisper 模型（Qwen3-ASR 较重，不悄悄兜底）
+    let any = whisper.iter().any(|m| m.downloaded);
+    let mut statuses = whisper;
+    statuses.push(qwen_asr::status(app));
+    let pick = if cloud_keyless || cfg.provider == "local" {
+        statuses
+            .iter()
+            .find(|m| m.id == cfg.local_model && m.downloaded)
+            .or_else(|| {
+                statuses
+                    .iter()
+                    .find(|m| m.downloaded && m.kind.as_deref() != Some("qwen"))
+            })
+            .map(|m| m.id.clone())
+    } else {
+        None
+    };
+    *LOCAL_PICK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((sig, gen, any, pick.clone()));
+    (any, pick)
+}
+
 /// 统一入口：按 provider 分发到 本地内置 Whisper 或 OpenAI 兼容云端接口
 pub async fn transcribe(
     app: &AppHandle,
@@ -65,31 +122,23 @@ pub async fn transcribe(
 
     // 智能回退：选了云端但未填 API Key（且不是本机自建服务），而本地模型已就绪 → 自动改用本地识别
     let mut provider = cfg.provider.as_str();
-    if provider != "local"
+    let cloud_keyless = provider != "local"
         && cfg.api_key.trim().is_empty()
-        && !is_local_server(&cfg.base_url)
-        && local_whisper::status(app).iter().any(|m| m.downloaded)
-    {
-        eprintln!("[speaknow] 云端 ASR 未配置 Key，已自动回退到本地模型识别");
-        provider = "local";
+        && !is_local_server(&cfg.base_url);
+    if cloud_keyless {
+        let (any, _) = resolve_local(app, cfg, true);
+        if any {
+            eprintln!("[speaknow] 云端 ASR 未配置 Key，已自动回退到本地模型识别");
+            provider = "local";
+        }
     }
 
     if provider == "local" {
         // 优先用配置指定的模型；若它未下载则取任一已下载模型（Qwen3-ASR 较重，不参与自动兜底排序）
-        let mut statuses = local_whisper::status(app);
-        statuses.push(qwen_asr::status(app));
-        let id = statuses
-            .iter()
-            .find(|m| m.id == cfg.local_model && m.downloaded)
-            .or_else(|| {
-                statuses
-                    .iter()
-                    .find(|m| m.downloaded && m.kind.as_deref() != Some("qwen"))
-            })
-            .map(|m| m.id.clone())
-            .ok_or_else(|| {
-                anyhow!("本地模型尚未下载：请在「识别设置」下载本地模型，或填写云端 API Key")
-            })?;
+        let (_, pick) = resolve_local(app, cfg, true);
+        let id = pick.ok_or_else(|| {
+            anyhow!("本地模型尚未下载：请在「识别设置」下载本地模型，或填写云端 API Key")
+        })?;
         let lang = cfg.language.clone();
         let handle = app.clone();
         let samples = samples.to_vec();

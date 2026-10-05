@@ -193,6 +193,21 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/* ---------- 模型状态代数 ---------- */
+
+/// 模型文件状态代数：下载 / 删除 / 引擎切换时递增。asr 的「用哪个本地模型」
+/// 解析要跑 9 次文件 stat + backend.txt 读取，流式分段每段重复一次纯浪费——
+/// 按代数缓存，模型集变化时代数前移自动失效
+static MODELS_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn models_gen() -> u64 {
+    MODELS_GEN.load(Ordering::SeqCst)
+}
+
+pub fn bump_models_gen() {
+    MODELS_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
 fn apply_autostart(app: &AppHandle, want: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let al = app.autolaunch();
@@ -777,6 +792,9 @@ fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
     }
+    // 模型集变化：asr 的本地引擎解析缓存须失效（否则继续选用已删除的模型）
+    bump_models_gen();
+    let _ = app.emit("sn-models-changed", ());
     Ok(())
 }
 
@@ -1255,6 +1273,30 @@ pub fn run() {
             {
                 let ext = cfg.external_display.clone();
                 std::thread::spawn(move || display_api::apply(&ext));
+            }
+            // 本地引擎空闲自动释放（省内存模式，默认关闭）：llama-server 常驻
+            // 可达 ~10GB 提交内存；30s 一查，超过配置分钟数无使用即停掉，
+            // 下次使用按需重新拉起。idle_shutdown 与 ensure_server 同锁串行，
+            // 不会杀掉正在推理的引擎
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(30));
+                    let idle_min = h
+                        .state::<Ctx>()
+                        .config
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .map(|c| c.general.local_idle_min)
+                        .unwrap_or(0);
+                    if idle_min == 0 {
+                        continue;
+                    }
+                    let idle = Duration::from_secs(u64::from(idle_min) * 60);
+                    qwen_asr::idle_shutdown(&h, idle);
+                    local_llm::idle_shutdown(&h, idle);
+                });
             }
             Ok(())
         })

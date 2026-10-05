@@ -529,17 +529,11 @@ pub fn paste_text_checked(
     // quiet_stop 跳过：静音收尾 + 管线耗时短 → 正在说话概率极低
     if let Some(thr) = voice_gate {
         if !quiet_stop {
-            let t0 = std::time::Instant::now();
-            while t0.elapsed() < Duration::from_secs(6) {
-                if superseded() {
-                    skip!();
-                }
-                match crate::audio::mic_test(device, false, 0.0, 220, |_| {}) {
-                    Ok(r) if r.peak_level >= thr => {
-                        thread::sleep(Duration::from_millis(350));
-                    }
-                    _ => break, // 安静（或探测失败）→ 继续输入
-                }
+            // 单次开流持续探测：旧循环每轮 mic_test 都整建 WASAPI 流（无线麦
+            // 单次可达 1s），连续说话 6 秒要开流十几次且全程占着 PASTE_LOCK
+            crate::audio::mic_gate(device, thr, 6000, &*superseded);
+            if superseded() {
+                skip!();
             }
         }
     }

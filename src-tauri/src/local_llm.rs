@@ -127,6 +127,7 @@ pub async fn download(app: &AppHandle, id: &str) -> Result<()> {
     }
     let res = download_inner(app, id).await;
     DOWNLOADING.store(false, Ordering::SeqCst);
+    crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     res
 }
@@ -188,6 +189,10 @@ async fn download_inner(app: &AppHandle, id: &str) -> Result<()> {
 struct ServerState {
     child: Option<Child>,
     port: u16,
+    /// 最近一次使用（ensure_server 放行）时刻：空闲自动释放的判定依据
+    last_used: Instant,
+    /// 最近一次健康探测成功时刻：60s 内复用，免去逐次 HTTP /health
+    health_ok_at: Option<Instant>,
 }
 
 static SERVER: LazyLock<Mutex<Option<ServerState>>> = LazyLock::new(|| Mutex::new(None));
@@ -282,6 +287,24 @@ pub fn shutdown(app: &AppHandle) {
     kill_leftover_runtimes(app);
 }
 
+/// 空闲自动释放（省内存模式）：语义与 qwen_asr::idle_shutdown 一致，持
+/// SPAWN_LOCK 与 ensure_server 串行防「放行后即杀」竞态
+pub fn idle_shutdown(app: &AppHandle, idle: Duration) {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let idle_hit = SERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|st| st.last_used.elapsed() >= idle);
+    if idle_hit {
+        eprintln!(
+            "[speaknow] 本地翻译引擎空闲超过 {} 分钟，自动释放内存",
+            idle.as_secs() / 60
+        );
+        shutdown(app);
+    }
+}
+
 fn health(base: &str) -> bool {
     matches!(
         crate::http::CLIENT_BLOCKING.get(format!("{base}/health")).send(),
@@ -320,7 +343,14 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
                 .map(|c| c.try_wait().map(|o| o.is_none()).unwrap_or(false))
                 .unwrap_or(true);
             let base = format!("http://127.0.0.1:{}", st.port);
-            if alive && health(&base) {
+            // 健康探测 60s 内复用（同 qwen_asr：逐次 /health 在引擎忙时最坏
+            // 白等 2s，进程活着 + 近期探活成功即放行）
+            let recently_ok = st
+                .health_ok_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+            if alive && (recently_ok || health(&base)) {
+                st.last_used = Instant::now();
+                st.health_ok_at = Some(Instant::now());
                 return Ok(base);
             }
             *g = None;
@@ -416,7 +446,12 @@ pub fn ensure_server(app: &AppHandle) -> Result<String> {
             if health(&base) {
                 eprintln!("[speaknow] 本地翻译引擎就绪：{base}（{backend}，{}）", m.id);
                 *SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(ServerState { child: Some(child), port });
+                    Some(ServerState {
+                        child: Some(child),
+                        port,
+                        last_used: Instant::now(),
+                        health_ok_at: Some(Instant::now()),
+                    });
                 return Ok(base);
             }
             if start.elapsed() > BOOT_TIMEOUT {

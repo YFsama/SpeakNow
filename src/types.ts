@@ -190,6 +190,8 @@ export interface GeneralConfig {
   fontScale: number;
   /** 历史记录保留条数（后端默认 50） */
   historyLimit?: number;
+  /** 本地引擎空闲自动释放（分钟，0=常驻不释放）：llama-server 常驻可达 ~10GB 提交内存 */
+  localIdleMin?: number;
 }
 
 /** 外接显示（硬件字幕屏）API */

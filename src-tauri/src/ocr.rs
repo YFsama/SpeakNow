@@ -857,6 +857,7 @@ pub async fn ppocr_download(app: &AppHandle) -> anyhow::Result<()> {
     }
     // 模型文件集变化：丢弃旧引擎实例（下次识别按新文件重建）
     ppocr_unload();
+    crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     Ok(())
 }

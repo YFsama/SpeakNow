@@ -179,6 +179,7 @@ pub async fn download(app: &AppHandle, id: &str, mirror: &str) -> Result<()> {
         );
     })
     .await;
+    crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     result
 }

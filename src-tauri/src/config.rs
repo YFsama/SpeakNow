@@ -460,6 +460,11 @@ pub struct GeneralConfig {
     /// 历史记录保留条数
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
+    /// 本地引擎（llama-server）空闲自动释放：超过 N 分钟无识别/翻译则停掉
+    /// 引擎进程（Qwen3-ASR 常驻可达 ~10GB 提交内存），下次使用按需重新拉起
+    /// （冷启动数秒）。0 = 常驻不释放（保持秒级响应，默认）
+    #[serde(default)]
+    pub local_idle_min: u32,
 }
 
 fn default_history_limit() -> usize {
@@ -476,6 +481,7 @@ impl Default for GeneralConfig {
             theme: "dark".into(),
             font_scale: 1.0,
             history_limit: default_history_limit(),
+            local_idle_min: 0,
         }
     }
 }

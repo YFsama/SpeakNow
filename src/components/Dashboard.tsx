@@ -759,6 +759,12 @@ export default function Dashboard({
             desc="录音开始与结果就绪时播放短促音效"
           />
           <Toggle
+            checked={cfg.general.closeToTray !== false}
+            onChange={(closeToTray) => set('general', { closeToTray })}
+            label="关闭主窗口时驻留托盘"
+            desc="关闭后语音输入继续可用；取消则点 × 直接退出（托盘右键也随时可退出）"
+          />
+          <Toggle
             checked={cfg.general.autostart}
             onChange={(autostart) => set('general', { autostart })}
             label="开机自动启动"

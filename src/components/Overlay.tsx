@@ -1228,6 +1228,34 @@ export default function Overlay() {
       .catch(() => {});
   };
 
+  /* done/error 卡键盘可达：无焦点窗口够不到卡上的按钮（鼠标专属），补
+     C=复制 / R=重试 快捷键；带修饰键的组合不拦截（防误吞系统快捷键），
+     翻译 / OCR 卡在场时整体让位（与 Esc 兜底同一互斥条件） */
+  useEffect(() => {
+    if (stage !== 'done' && stage !== 'error') return;
+    if (trans || ocrBusy || ocrCard || ocrErr) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      const k = e.key.toLowerCase();
+      if (k === 'c') {
+        e.preventDefault();
+        if (stage === 'done') onDoneCopy();
+        else if (message) {
+          void copyText(message)
+            .then(() => setErrCopied(true))
+            .catch(() => {});
+        }
+      } else if (k === 'r' && stage === 'error' && retryable && !retrying) {
+        e.preventDefault();
+        setRetrying(true);
+        void retryLast().catch(() => setRetrying(false));
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // onDoneCopy 是闭包内稳定引用的普通函数（依赖 result），进依赖以读取最新值
+  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr, retryable, retrying, result, message]);
+
   /* done 卡「重新优化」：复用审阅卡的 optimize_text 通道（后端纯计算 + 流式
      sn-llm-delta，不改 stage、不动待确认项与历史），结果直接更新终稿显示；
      不经审阅编辑框，无需切换窗口形态，状态最短闭环 */
@@ -2030,7 +2058,7 @@ export default function Overlay() {
                       {doneReopt ? '✨ 优化中…' : '✨ 重新优化'}
                     </button>
                   )}
-                  <span>悬停可暂停 · 点击关闭</span>
+                  <span>悬停可暂停 · C 复制 · 点击关闭</span>
                 </span>
               </div>
               {notice && (

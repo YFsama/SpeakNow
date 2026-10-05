@@ -5,6 +5,7 @@ import {
   Field,
   RadioCard,
   Section,
+  Segmented,
   Select,
   Spinner,
   TextArea,
@@ -611,6 +612,20 @@ export function AsrTab({
           </Field>
           {/* 测试连接上移：本地模式下放在模型选择下方（引擎选择器之后） */}
           {testConnRow}
+          <Field
+            label="引擎空闲自动释放"
+            hint="llama-server 常驻可达 ~10GB 提交内存：超过设定时间无识别自动停掉释放（本地翻译引擎同受管），下次使用自动重新拉起（Qwen3-ASR 冷启动需十几秒）。常驻可保秒级响应"
+          >
+            <Segmented
+              value={String(cfg.general.localIdleMin ?? 0)}
+              onChange={(v) => set('general', { localIdleMin: Number(v) })}
+              options={[
+                { value: '0', label: '常驻', desc: '秒级响应 · 内存占用高' },
+                { value: '10', label: '10 分钟', desc: '省内存 · 冷启动慢' },
+                { value: '30', label: '30 分钟', desc: '折中' },
+              ]}
+            />
+          </Field>
           <Field
             label="下载镜像"
             hint="仅作用于 Whisper 系列模型；Qwen3-ASR 始终从 HuggingFace 官方源直连下载"

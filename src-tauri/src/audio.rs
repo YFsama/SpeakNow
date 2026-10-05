@@ -596,6 +596,43 @@ pub fn test_all_devices<F: Fn(&[(String, f32)])>(
     rows
 }
 
+/// 粘贴前说话探测（单次开流版）：开一条采集流持续监听电平，检测到持续安静
+/// （连续 quiet_ms 低于阈值，与旧实现「一个 220ms 探测窗峰值 < 阈值即放行」
+/// 同口径）或达到 max_ms 返回。开流失败视为安静放行（与旧实现一致，探测
+/// 故障不应阻塞输入）。此前 inject 的门限循环每轮 mic_test 都整建一次
+/// WASAPI 流（无线麦单次可达 1s），连续说话 6 秒要反复开流十几次
+pub fn mic_gate(
+    device: Option<&str>,
+    thr_percent: f32,
+    max_ms: u64,
+    superseded: &dyn Fn() -> bool,
+) {
+    let Ok(rec) = start(device, f32::MIN, 0.0) else {
+        return;
+    };
+    let begin = Instant::now();
+    let mut quiet_ms = 0u32;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        // 被新录音取代：立即退出（调用方随后复查 superseded 走跳过分支）
+        if superseded() {
+            return;
+        }
+        let lv = rec.shared.level() * 100.0;
+        if lv >= thr_percent {
+            quiet_ms = 0;
+        } else {
+            quiet_ms += 50;
+        }
+        if quiet_ms >= 200 {
+            return;
+        }
+        if begin.elapsed() >= Duration::from_millis(max_ms) {
+            return;
+        }
+    }
+}
+
 /// 短时录音测试：实时回调电平，结束后返回均值/峰值（及可选回放音频）
 pub fn mic_test<F: Fn(f32)>(
     device: Option<&str>,

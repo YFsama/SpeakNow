@@ -663,7 +663,15 @@ async fn run(app: AppHandle, cfg: Config, rec: audio::Recording, sess: Arc<Sessi
     // 说话探测门控依据：录音以多长静音收尾 + 停录时刻（静音收尾且管线
     // 耗时短 → 粘贴前跳过 ~300ms 的麦克风探测录音）
     let stop_info = Some((rec.shared.silence_ms(), Instant::now()));
-    let captured = audio::finish(rec);
+    // 整段重采样（120s@48k 约 50-100ms 纯 CPU）移到阻塞线程池，不占
+    // tokio 工作线程
+    let captured = match tauri::async_runtime::spawn_blocking(move || audio::finish(rec)).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[speaknow] 收尾音频处理异常: {e}");
+            return;
+        }
+    };
     let stream = if sess.streaming { Some(sess) } else { None };
     process_audio(app, cfg, captured.samples, from_ui, skip_llm, stream, stop_info).await;
 }
@@ -1093,10 +1101,19 @@ pub async fn finish_and_input(
             }
             Err(ref e) => {
                 crate::trace_pipeline(app, &format!("输入失败：{e:#}"));
+                // 模拟按键失败的高频场景补一句可自查的原因：UIPI 提权场景在
+                // inject 里有专属报错，这里覆盖其余三个（文案不追加给剪贴板
+                // 写入类失败——那是另一类问题，追加只会误导）
+                let et = format!("{e:#}");
+                let hint = if et.contains("模拟") || et.contains("键盘") || et.contains("按键") {
+                    "\n常见原因：目标在锁屏 / UAC 弹窗 / 远程会话中（系统会拦截模拟按键），或目标窗口未真正获得焦点"
+                } else {
+                    ""
+                };
                 finish_status(
                     app,
                     "error",
-                    &format!("输入失败：{e:#}"),
+                    &format!("输入失败：{et}{hint}"),
                     4000,
                     cfg.general.sound_feedback,
                 );

@@ -39,7 +39,7 @@ devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
 
 | 路径 | 职责 |
 |---|---|
-| `src-tauri/src/lib.rs` | 40 个 `#[tauri::command]` 注册、`Ctx` 全局状态、窗口/单实例/提权重启接线 |
+| `src-tauri/src/lib.rs` | 近 60 个 `#[tauri::command]` 注册、`Ctx` 全局状态、窗口/单实例/提权重启接线、模型代数计数（`bump_models_gen`）、本地引擎空闲释放 reaper |
 | `src-tauri/src/pipeline.rs` | 听写会话状态机：start/stop/run/finish_and_input、流式分段、热键串行执行线程（`post_*`） |
 | `src-tauri/src/inject.rs` | 输出注入：剪贴板粘贴（含占用重试/还原/说话探测）、模拟键盘、UIPI 提权检测 |
 | `src-tauri/src/caret.rs` | UIA COM 定位输入光标（悬浮窗跟随）+ 前台窗口信息 |
