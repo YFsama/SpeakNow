@@ -535,6 +535,7 @@ fn capture_region(
 /// 应用的悬浮层也是屏幕内容）；放大镜底图必须**不带**——选区窗自身就是
 /// 透明分层窗，带着截会把遮罩/十字准线/提示横幅烤进底图（本窗口自己的
 /// 140ms 残影等待就是同一问题的自证），像素级对准会被自家准线遮蔽
+#[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
 fn capture_region_opts(
     x: i32,
