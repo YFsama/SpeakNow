@@ -6,9 +6,15 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// 异步客户端（云端 ASR / LLM 流式）。不设客户端级超时，逐请求 `.timeout()`
-pub static CLIENT: LazyLock<reqwest::Client> =
-    LazyLock::new(|| reqwest::Client::builder().build().expect("构建 HTTP 客户端失败"));
+/// 异步客户端（云端 ASR / LLM 流式）。兜底超时 120s：现有调用点全部逐请求
+/// `.timeout()` 覆盖，这里防的是未来新调用点忘写——无兜底时慢网关会让
+/// 请求无限挂起并占住会话
+pub static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("构建 HTTP 客户端失败")
+});
 
 /// 阻塞客户端（llama-server 健康探测 / 本地转写）。默认 2s 探测超时，
 /// 长请求逐请求 `.timeout()` 覆盖

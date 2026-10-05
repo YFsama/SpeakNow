@@ -153,6 +153,8 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
     }
     // Ctrl+C+C 双击复制即翻译：钩子首次开启后常驻，这里只同步开关
     ccc::apply(&app, &config);
+    // 剪贴板监听开关快照：监视线程每 tick 只读原子量，不再深拷整个 Config
+    translate::apply_watch_flag(&config);
     // 托盘快切菜单展示当前模式/翻译目标：设置页改动后同步重建。
     // 经独立线程派发到主线程——不等待主线程空闲，避免保存被卡
     if config.llm.mode != old.llm.mode || config.llm.translate_target != old.llm.translate_target {
@@ -1236,8 +1238,9 @@ pub fn run() {
             if let Err(e) = hotkey::apply_tracked(app.handle(), &cfg.hotkey) {
                 eprintln!("[speaknow] {e:#}");
             }
-            // 剪贴板监听（复制即翻译）：常驻轮询线程，开关由配置每 tick 判定
+            // 剪贴板监听（复制即翻译）：常驻轮询线程，开关由原子量快照判定
             translate::ensure_clipboard_watcher(app.handle());
+            translate::apply_watch_flag(&cfg);
             // Ctrl+C+C 双击复制即翻译：低级键盘钩子（开关由原子量实时判定）
             ccc::apply(app.handle(), &cfg);
             if cfg.general.autostart {
@@ -1274,14 +1277,17 @@ pub fn run() {
                 let ext = cfg.external_display.clone();
                 std::thread::spawn(move || display_api::apply(&ext));
             }
-            // 本地引擎空闲自动释放（省内存模式，默认关闭）：llama-server 常驻
-            // 可达 ~10GB 提交内存；30s 一查，超过配置分钟数无使用即停掉，
-            // 下次使用按需重新拉起。idle_shutdown 与 ensure_server 同锁串行，
-            // 不会杀掉正在推理的引擎
+            // 常驻后台维护线程（30s 一拍）：
+            // ① 截图选区窗闲置回收——隐藏保活的 WebView2 每屏 50~150MB，
+            //    5 分钟不用即销毁，下次框选走重建分支（几百 ms）
+            // ② 本地引擎空闲自动释放（默认关闭）：llama-server 常驻可达
+            //    ~10GB 提交内存，超过配置分钟数无使用即停掉，下次按需拉起。
+            //    idle_shutdown 与 ensure_server 同锁串行，不会杀推理中的引擎
             {
                 let h = app.handle().clone();
                 std::thread::spawn(move || loop {
                     std::thread::sleep(Duration::from_secs(30));
+                    ocr::idle_recycle(&h, Duration::from_secs(300));
                     let idle_min = h
                         .state::<Ctx>()
                         .config

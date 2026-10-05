@@ -273,8 +273,9 @@ async fn with_retry(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<String
 
 #[derive(Clone)]
 enum RequestKind {
-    /// OpenAI multipart /audio/transcriptions
-    Multipart(Vec<u8>),
+    /// OpenAI multipart /audio/transcriptions。Arc 包裹：重试路径 clone
+    /// kind 时不再深拷整段 WAV（28s 段约 1.2MB），拷贝延迟到真正发送时
+    Multipart(std::sync::Arc<Vec<u8>>),
     /// MiMo chat/completions JSON
     Mimo(serde_json::Value),
 }
@@ -312,7 +313,7 @@ async fn send_request(cfg: &AsrConfig, kind: RequestKind) -> anyhow::Result<Stri
                 format!("/{}", cfg.endpoint_path)
             };
             let url = format!("{base}{path}");
-            let file_part = reqwest::multipart::Part::bytes(wav.clone())
+            let file_part = reqwest::multipart::Part::bytes(wav.as_ref().clone())
                 .file_name("audio.wav")
                 .mime_str("audio/wav")?;
             let mut form = reqwest::multipart::Form::new()
@@ -381,7 +382,7 @@ async fn transcribe_http_chunked(cfg: &AsrConfig, samples: &[i16]) -> anyhow::Re
             eprintln!("[speaknow] ASR 分段 {}/{}", i + 1, chunks.len());
         }
         let wav_bytes = wav::encode(c, 16_000);
-        let t = with_retry(cfg, RequestKind::Multipart(wav_bytes)).await?;
+        let t = with_retry(cfg, RequestKind::Multipart(std::sync::Arc::new(wav_bytes))).await?;
         if !t.trim().is_empty() {
             parts.push(t);
         }

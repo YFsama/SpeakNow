@@ -11,7 +11,7 @@
 //! 前端拖拽出逻辑像素矩形回调 ocr_region_selected；此刻隐藏全部选区窗后用 GDI
 //! 按物理像素重截选区——用户确认瞬间看到什么就识别什么，无需冻结帧传递大图。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -23,6 +23,18 @@ static SELECTING: AtomicBool = AtomicBool::new(false);
 
 /// 选区窗标签前缀，每屏一窗：ocr-sel-0 / ocr-sel-1 …（首次创建后常驻隐藏复用）
 const SEL_PREFIX: &str = "ocr-sel-";
+
+/// 选区窗最近一次使用（unix ms）：隐藏保活换来下次秒开，但每个隐藏
+/// WebView2 实例常驻 50~150MB——双屏用户首次截图后主进程内存多占一两百
+/// MB。闲置超过 5 分钟销毁重建（重建本身只要几百 ms，见 idle_recycle）
+static SEL_LAST_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn current_config(app: &AppHandle) -> Config {
     app.state::<crate::Ctx>()
@@ -107,13 +119,47 @@ fn open_selection_windows(app: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 隐藏全部选区窗（保留实例，下次秒开）
+/// 隐藏全部选区窗（保留实例，下次秒开）；记录闲置回收的计时起点
 fn hide_selection_windows(app: &AppHandle) {
+    SEL_LAST_ACTIVE.store(now_ms(), Ordering::SeqCst);
     for (label, w) in app.webview_windows() {
         if label.starts_with(SEL_PREFIX) {
             let _ = w.hide();
         }
     }
+}
+
+/// 闲置回收选区窗（lib.rs 的省内存 reaper 每 30s 调一次）：超过 idle 无
+/// 使用则销毁全部选区窗，释放隐藏 WebView2 的 50~150MB/屏；下次截图取词
+/// 走 open_selection_windows 的重建分支。销毁经主线程派发（与创建同约束）
+pub fn idle_recycle(app: &AppHandle, idle: Duration) {
+    if SELECTING.load(Ordering::SeqCst) {
+        return; // 正在框选
+    }
+    let last = SEL_LAST_ACTIVE.load(Ordering::SeqCst);
+    if last == 0 {
+        return; // 从未用过 / 刚回收过：无窗可收
+    }
+    if now_ms().saturating_sub(last) < idle.as_millis() as u64 {
+        return;
+    }
+    SEL_LAST_ACTIVE.store(0, Ordering::SeqCst);
+    let labels: Vec<String> = app
+        .webview_windows()
+        .into_keys()
+        .filter(|l| l.starts_with(SEL_PREFIX))
+        .collect();
+    if labels.is_empty() {
+        return;
+    }
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        for label in labels {
+            if let Some(w) = h.get_webview_window(&label) {
+                let _ = w.destroy();
+            }
+        }
+    });
 }
 
 fn emit_error(app: &AppHandle, message: &str) {

@@ -95,11 +95,16 @@ impl Shared {
     }
 }
 
-/// 原始采样率 f32 → 16kHz i16（流式分段用）
+/// 原始采样率 f32 → 16kHz i16（流式分段用）。采样率一致时同样跳过
+/// 恒等重采样的整段拷贝
 pub fn to_16k_i16(samples: &[f32], from_rate: u32) -> Vec<i16> {
-    let r = resample_linear(samples, from_rate, TARGET_RATE);
-    r.iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+    let cvt = |s: &f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+    if from_rate == TARGET_RATE {
+        return samples.iter().map(cvt).collect();
+    }
+    resample_linear(samples, from_rate, TARGET_RATE)
+        .iter()
+        .map(cvt)
         .collect()
 }
 
@@ -424,11 +429,18 @@ pub fn finish(rec: Recording) -> Captured {
     };
     let rate = shared.sample_rate.load(Ordering::Relaxed);
 
-    let resampled = resample_linear(&samples, rate, TARGET_RATE);
-    let pcm: Vec<i16> = resampled
-        .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-        .collect();
+    // 采样率已一致时跳过恒等重采样的整段 f32 拷贝，直接转 16bit
+    let pcm: Vec<i16> = if rate == TARGET_RATE {
+        samples
+            .iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect()
+    } else {
+        resample_linear(&samples, rate, TARGET_RATE)
+            .iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect()
+    };
 
     Captured { samples: pcm }
 }

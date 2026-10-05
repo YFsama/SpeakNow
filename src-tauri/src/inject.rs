@@ -98,6 +98,12 @@ pub fn foreground_is_terminal() -> bool {
     win::foreground_is_terminal()
 }
 
+/// 非 Windows：无终端探测（返回 false，行为与 selection 的非 Windows 路径一致）
+#[cfg(not(target_os = "windows"))]
+pub fn foreground_is_terminal() -> bool {
+    false
+}
+
 /// 前台窗口提权而本应用没有（UIPI 会拦截模拟按键）：返回阻断者进程名
 #[cfg(target_os = "windows")]
 pub fn foreground_uipi_blocker() -> Option<String> {

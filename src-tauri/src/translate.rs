@@ -786,6 +786,18 @@ pub fn ensure_clipboard_watcher(app: &AppHandle) {
     });
 }
 
+/// 剪贴板监听开关快照：save / 启动时同步，监视线程每 tick 只读原子量——
+/// 此前每 600ms 深拷整个 Config（含凭据组 / 术语表 / 模板库），空闲时纯浪费
+static WATCH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 配置变化时同步监听开关（save_config / setup 调用，与 ensure_clipboard_watcher 配套）
+pub fn apply_watch_flag(cfg: &Config) {
+    WATCH_ON.store(
+        cfg.translate.clipboard_watch,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
 /// 剪贴板守卫链：给定刚复制/剪贴板里的原文，判定是否应触发翻译并清洗。
 /// 复制即翻译（轮询）与 Ctrl+C+C（钩子）共用，None = 静默跳过
 fn guard_copied_text(app: &AppHandle, cfg: &Config, raw: &str) -> Option<String> {
@@ -858,8 +870,9 @@ fn clipboard_watch_loop(app: AppHandle) {
     let mut prev_enabled = false;
     loop {
         thread::sleep(Duration::from_millis(TICK_MS));
-        let cfg = current_config(&app);
-        let on = cfg.translate.clipboard_watch;
+        // 开关读原子快照（save 时同步）：每 tick 深拷整个 Config 纯浪费，
+        // 完整配置只在真正检测到剪贴板变化时取一次
+        let on = WATCH_ON.load(std::sync::atomic::Ordering::SeqCst);
         // 开关刚切换（或关闭期间）：重置变更基准，避免一开启就翻译存量剪贴板内容
         #[cfg(target_os = "windows")]
         if !on || !prev_enabled {
@@ -901,6 +914,13 @@ fn clipboard_watch_loop(app: AppHandle) {
         if raw == last_handled {
             continue;
         }
+        // 终端里复制命令输出很常见，但终端场景弹翻译卡多为打扰（且 Ctrl+C
+        // 语义特殊）：前台是终端时静默跳过。Ctrl+C+C 双击不受此限——那是
+        // 用户的显式手势，selection 热键路径另有自己的终端保护
+        if crate::inject::foreground_is_terminal() {
+            continue;
+        }
+        let cfg = current_config(&app);
         if let Some(text) = guard_copied_text(&app, &cfg, &raw) {
             last_handled = raw;
             crate::trace_pipeline(
