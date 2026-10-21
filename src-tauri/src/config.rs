@@ -18,6 +18,8 @@ pub struct Config {
     pub translate: TranslateConfig,
     /// 截图取词（OCR）：框选屏幕区域 → 本地识别 → 悬浮窗卡片 → 复制/翻译/输入
     pub ocr: OcrConfig,
+    /// 文本模拟输入（Typist）：整段文本模拟键盘逐字敲进目标窗口
+    pub typist: TypistConfig,
     pub output: OutputConfig,
     pub general: GeneralConfig,
     pub external_display: ExternalDisplayConfig,
@@ -99,6 +101,8 @@ pub struct HotkeyConfig {
     pub key_translate_sel: String,
     /// 截图取词快捷键（可选）：框选屏幕区域 OCR 识别（弹悬浮窗，可复制/翻译/输入）
     pub key_ocr: String,
+    /// 文本模拟输入快捷键（可选）：打开独立小窗，粘贴大段文本后模拟键盘逐字敲进目标窗口
+    pub key_typist: String,
     /// hold（按住说话）/ toggle（按一下开始/结束）
     pub mode: String,
     pub enabled: bool,
@@ -115,6 +119,7 @@ impl Default for HotkeyConfig {
             key_translate: String::new(),
             key_translate_sel: String::new(),
             key_ocr: String::new(),
+            key_typist: String::new(),
             mode: "toggle".into(),
             enabled: true,
             min_duration_ms: 800,
@@ -383,6 +388,34 @@ impl Default for OcrConfig {
     }
 }
 
+/// 文本模拟输入（Typist）配置：节奏参数。目标应用对连发按键的承受力
+/// 差异很大（网页表单常丢字），慢一点换稳一点
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TypistConfig {
+    /// 每个按键之间的间隔（ms）。5 = 快手速，15 = 常规，40 = 慢速防丢字
+    pub char_delay_ms: u32,
+    /// 每次回车后的额外停顿（ms）：目标应用对回车的响应多为异步，
+    /// 行尾立刻跟下一行首字符容易丢
+    pub line_delay_ms: u32,
+    /// 点击开始后到落下第一个字符的倒计时（ms）：留时间确认焦点已回到目标输入框
+    pub start_delay_ms: u32,
+    /// 小窗置顶（对照原文抄录时目标页面要滚动查看，小窗不能被盖住）
+    #[serde(default)]
+    pub always_on_top: bool,
+}
+
+impl Default for TypistConfig {
+    fn default() -> Self {
+        Self {
+            char_delay_ms: 15,
+            line_delay_ms: 120,
+            start_delay_ms: 800,
+            always_on_top: false,
+        }
+    }
+}
+
 impl Config {
     /// ASR 配置展开凭据组后的快照（识别链路入口使用）
     pub fn resolved_asr(&self) -> AsrConfig {
@@ -469,6 +502,12 @@ pub struct GeneralConfig {
     /// 各卡的默认驻留时间统一缩放，一次设置全局生效
     #[serde(default = "default_linger_mult")]
     pub linger_mult: f32,
+    /// 启动时自动检查 GitHub Release 更新（只提示有新版本，绝不自动安装）
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
+    /// 用户选择「跳过此版本」的版本号：该版本不再提示更新（清空即恢复提示）
+    #[serde(default)]
+    pub skip_version: String,
 }
 
 fn default_linger_mult() -> f32 {
@@ -491,6 +530,8 @@ impl Default for GeneralConfig {
             history_limit: default_history_limit(),
             local_idle_min: 0,
             linger_mult: default_linger_mult(),
+            auto_check_update: true,
+            skip_version: String::new(),
         }
     }
 }

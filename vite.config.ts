@@ -28,6 +28,7 @@ export default defineConfig({
       input: {
         main: new URL('./index.html', import.meta.url).pathname,
         overlay: new URL('./overlay.html', import.meta.url).pathname,
+        typist: new URL('./typist.html', import.meta.url).pathname,
       },
       output: {
         // 共享依赖（主窗口与悬浮窗都用）单独成块，并命名为 vendor——

@@ -12,18 +12,24 @@ import {
   TextInput,
   Toggle,
 } from '../Controls';
-import { deleteBuiltin, downloadBuiltin, isMac, testAsr } from '../../api';
+import { deleteBuiltin, downloadBuiltin, isMac, listLlmModels, testAsr } from '../../api';
 import type { ProviderProfile, TabProps } from '../../types';
 import { resolvedAsrCreds } from '../../types';
-import { NumberInput, newProviderId, providerOptions } from './shared';
+import {
+  cacheModelList,
+  cachedModelList,
+  ModelInput,
+  matchPreset,
+  NumberInput,
+  newProviderId,
+  providerOptions,
+  type ModelPreset,
+} from './shared';
 
 /* ============ ASR ============ */
-interface AsrPreset {
-  value: string;
-  label: string;
+/** 语音识别预设：models 为推荐模型（首个 = 选预设默认值），2026-10 校准 */
+interface AsrPreset extends ModelPreset {
   provider: 'http' | 'local' | 'mimo';
-  baseUrl: string;
-  model: string;
   endpointPath: string;
 }
 
@@ -33,7 +39,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: '小米 MiMo-V2.5-ASR（OpenAI Chat 兼容）',
     provider: 'mimo',
     baseUrl: 'https://api.xiaomimimo.com/v1',
-    model: 'mimo-v2.5-asr',
+    models: ['mimo-v2.5-asr'],
     endpointPath: '/chat/completions',
   },
   {
@@ -41,7 +47,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: '智谱 GLM-ASR（推荐，支持热词）',
     provider: 'http',
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-asr-2512',
+    models: ['glm-asr-2512'],
     endpointPath: '/audio/transcriptions',
   },
   {
@@ -49,7 +55,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: 'Groq Whisper Large v3（海外，速度快）',
     provider: 'http',
     baseUrl: 'https://api.groq.com/openai/v1',
-    model: 'whisper-large-v3',
+    models: ['whisper-large-v3', 'whisper-large-v3-turbo'],
     endpointPath: '/audio/transcriptions',
   },
   {
@@ -57,7 +63,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: 'OpenAI 官方',
     provider: 'http',
     baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o-transcribe',
+    models: ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'],
     endpointPath: '/audio/transcriptions',
   },
   {
@@ -65,7 +71,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: 'SiliconFlow（国内）',
     provider: 'http',
     baseUrl: 'https://api.siliconflow.cn/v1',
-    model: 'FunAudioLLM/SenseVoiceSmall',
+    models: ['FunAudioLLM/SenseVoiceSmall'],
     endpointPath: '/audio/transcriptions',
   },
   {
@@ -73,7 +79,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: '本地 whisper.cpp / Speaches 服务',
     provider: 'http',
     baseUrl: 'http://127.0.0.1:8080',
-    model: 'whisper-1',
+    models: ['whisper-1'],
     endpointPath: '/inference',
   },
   {
@@ -81,7 +87,7 @@ const ASR_PRESETS: AsrPreset[] = [
     label: '自定义 / 其他兼容接口',
     provider: 'http',
     baseUrl: '',
-    model: '',
+    models: [],
     endpointPath: '/audio/transcriptions',
   },
 ];
@@ -116,6 +122,9 @@ export function AsrTab({
   >({});
   const [downloading, setDownloading] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  /* 云端模型列表：⟳ 从 /v1/models 拉取（与 AI 优化页同一命令），与预设候选合并 */
+  const [modelList, setModelList] = useState<string[] | null>(null);
+  const [fetchingModels, setFetchingModels] = useState(false);
 
   useEffect(() => {
     const un = listen<{ model: string; file: string; downloaded: number; total: number }>(
@@ -149,6 +158,27 @@ export function AsrTab({
         p.baseUrl === asrCreds.baseUrl &&
         p.endpointPath === cfg.asr.endpointPath,
     )?.value ?? 'custom';
+  /* 同厂商地址命中即给推荐模型 chips（端点路径不同不影响候选展示） */
+  const modelCandidates = matchPreset(ASR_PRESETS, asrCreds.baseUrl)?.models ?? [];
+
+  const fetchModels = async () => {
+    setFetchingModels(true);
+    try {
+      const list = await listLlmModels(asrCreds.baseUrl, asrCreds.apiKey);
+      setModelList(list);
+      cacheModelList(asrCreds.baseUrl, list);
+      toast(`发现 ${list.length} 个模型，可在「模型名称」下拉选择`);
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  /* 与「AI 优化」页共用会话级列表缓存：同地址切页回来 / 换预设切回不重拉 */
+  useEffect(() => {
+    setModelList(cachedModelList(asrCreds.baseUrl));
+  }, [asrCreds.baseUrl]);
 
   const run = async () => {
     setTest({ loading: true });
@@ -355,7 +385,7 @@ export function AsrTab({
                     providerId: np.id,
                     provider: p.provider,
                     baseUrl: p.baseUrl,
-                    model: p.model || cfg.asr.model,
+                    model: p.models[0] || cfg.asr.model,
                     endpointPath: p.endpointPath,
                   });
                   return;
@@ -371,7 +401,7 @@ export function AsrTab({
                 set('asr', {
                   provider: p.provider,
                   baseUrl: p.baseUrl || cfg.asr.baseUrl,
-                  model: p.model || cfg.asr.model,
+                  model: p.models[0] || cfg.asr.model,
                   endpointPath: p.endpointPath,
                 });
               }}
@@ -379,25 +409,36 @@ export function AsrTab({
             />
           </Field>
           {!(cfg.asr.providerId && cfg.providers.some((x) => x.id === cfg.asr.providerId)) && (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <Field label="接口地址 Base URL">
-                <TextInput
-                  mono
-                  value={cfg.asr.baseUrl}
-                  onChange={(baseUrl) => set('asr', { baseUrl })}
-                  placeholder="https://open.bigmodel.cn/api/paas/v4"
-                />
-              </Field>
-              <Field label="模型名称">
-                <TextInput
-                  mono
-                  value={cfg.asr.model}
-                  onChange={(model) => set('asr', { model })}
-                  placeholder="glm-asr-2512 / whisper-large-v3 / mimo-asr …"
-                />
-              </Field>
-            </div>
+            <Field label="接口地址 Base URL">
+              <TextInput
+                mono
+                value={cfg.asr.baseUrl}
+                onChange={(baseUrl) => set('asr', { baseUrl })}
+                placeholder="https://open.bigmodel.cn/api/paas/v4"
+              />
+            </Field>
           )}
+          {/* 模型名称无条件显示：此前仅「独立配置」时展示，引用凭据组期间
+              改模型名得先解除引用，其实模型名本就独立于凭据组 */}
+          <Field
+            label="模型名称"
+            hint={
+              modelList
+                ? `发现 ${modelList.length} 个模型，输入框可下拉选择`
+                : '下拉可选推荐模型，或点右侧按钮从接口获取完整列表'
+            }
+          >
+            <ModelInput
+              listId="asr-model-list"
+              value={cfg.asr.model}
+              onChange={(model) => set('asr', { model })}
+              candidates={modelCandidates}
+              modelList={modelList}
+              fetching={fetchingModels}
+              onFetch={fetchModels}
+              placeholder="glm-asr-2512 / whisper-large-v3 / mimo-v2.5-asr …"
+            />
+          </Field>
           {cfg.asr.providerId && cfg.providers.some((x) => x.id === cfg.asr.providerId) ? (
             <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] px-3.5 py-2.5 text-[11.5px] leading-5 text-emerald-200/80">
               🔑 正在使用凭据组「

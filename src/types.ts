@@ -36,6 +36,8 @@ export interface HotkeyConfig {
   keyTranslateSel: string;
   /** 截图取词快捷键（可选）：框选屏幕区域 OCR 识别（弹悬浮窗，可复制/翻译/输入） */
   keyOcr: string;
+  /** 文本模拟输入快捷键（可选）：打开 Typist 小窗，粘贴大段文本后模拟键盘逐字敲进目标窗口 */
+  keyTypist: string;
   mode: HotkeyMode;
   enabled: boolean;
   /** 短于该时长的录音视为误触忽略（ms，默认 800；hold 模式说短口令可调低） */
@@ -164,6 +166,18 @@ export interface OcrConfig {
   copyOnCapture: boolean;
 }
 
+/** 文本模拟输入（Typist）节奏配置：目标应用对连发按键的承受力差异很大 */
+export interface TypistConfig {
+  /** 每个按键之间的间隔（ms）。UI 为速度滑杆（档位见 typist-logic 的 SPEED_LEVELS） */
+  charDelayMs: number;
+  /** 每次回车后的额外停顿（ms）：目标应用对回车的响应多为异步，行尾立刻跟下一行容易丢字 */
+  lineDelayMs: number;
+  /** 点击开始后到落下第一个字符的倒计时（ms）：留时间确认焦点已回到目标输入框 */
+  startDelayMs: number;
+  /** 小窗置顶（对照原文抄录时目标页面要滚动查看，小窗不能被盖住） */
+  alwaysOnTop?: boolean;
+}
+
 export interface OutputConfig {
   method: PasteMethod;
   pasteKey: PasteKey;
@@ -194,6 +208,10 @@ export interface GeneralConfig {
   localIdleMin?: number;
   /** 悬浮卡驻留时长乘子（0.6 短 / 1 标准 / 1.8 长）：各卡默认驻留统一缩放 */
   lingerMult?: number;
+  /** 启动时自动检查 GitHub Release 更新（只提示，不自动安装） */
+  autoCheckUpdate?: boolean;
+  /** 已选择「跳过此版本」的版本号：该版本不再提示，清空恢复 */
+  skipVersion?: string;
 }
 
 /** 外接显示（硬件字幕屏）API */
@@ -219,6 +237,8 @@ export interface Config {
   translate: TranslateConfig;
   /** 截图取词（OCR）：框选识别 → 复制/翻译/输入 */
   ocr: OcrConfig;
+  /** 文本模拟输入（Typist）：整段文本模拟键盘逐字敲进目标窗口 */
+  typist: TypistConfig;
   output: OutputConfig;
   general: GeneralConfig;
   externalDisplay: ExternalDisplayConfig;
@@ -295,6 +315,22 @@ export interface MicTestResult {
   wavBase64?: string | null;
 }
 
+/** GitHub Release 检查结果（Rust update::UpdateInfo 的前端镜像） */
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  tag: string;
+  updateAvailable: boolean;
+  /** Release 说明（markdown 原文） */
+  notes: string;
+  /** 本平台安装包下载地址（空 = 无可用安装包） */
+  downloadUrl: string;
+  /** 安装包大小（字节，未知为 0） */
+  assetSize: number;
+  publishedAt: string;
+  htmlUrl: string;
+}
+
 export type TabId =
   | 'dash'
   | 'hotkey'
@@ -325,4 +361,6 @@ export interface TabProps {
   history: HistoryItem[];
   refreshHistory: () => void;
   onRecordToggle: () => void;
+  /** 启动时自动检查到的更新结果（null = 未检查或无新版本）；关于页复用展示 */
+  updateInfo?: UpdateInfo | null;
 }

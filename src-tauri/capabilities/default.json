@@ -1,6 +1,12 @@
 {
   "identifier": "default",
   "description": "SpeakNow 主窗口与悬浮窗的默认权限",
-  "windows": ["main", "overlay"],
-  "permissions": ["core:default", "core:window:allow-set-size"]
+  "windows": ["main", "overlay", "typist"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-size",
+    "core:window:allow-hide",
+    "dialog:allow-save",
+    "dialog:allow-open"
+  ]
 }

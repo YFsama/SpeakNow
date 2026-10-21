@@ -20,6 +20,8 @@ mod trans_struct;
 mod translate;
 mod tray;
 mod text_clean;
+mod typist;
+mod update;
 mod wav;
 
 #[cfg(target_os = "windows")]
@@ -1087,6 +1089,32 @@ fn export_text(app: AppHandle, filename: String, content: String) -> Result<Stri
     Ok(path.display().to_string())
 }
 
+/// 配置导入：读取用户在文件对话框里选中的备份 JSON。只放行 .json 且限
+/// 5MB——配置全量不过几十 KB，误选的大文件不该整串灌进前端状态
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
+    if p.extension().and_then(|x| x.to_str()) != Some("json") {
+        return Err("请选择 .json 备份文件".into());
+    }
+    let meta = std::fs::metadata(&p).map_err(|e| format!("读取失败：{e}"))?;
+    if meta.len() > 5 * 1024 * 1024 {
+        return Err("文件过大（>5MB），不像 SpeakNow 配置备份".into());
+    }
+    std::fs::read_to_string(&p).map_err(|e| format!("读取失败：{e}"))
+}
+
+/// 「另存为」导出：写入对话框选定的路径（同样只认 .json）
+#[tauri::command]
+fn export_text_to(path: String, content: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
+    if p.extension().and_then(|x| x.to_str()) != Some("json") {
+        return Err("保存路径应为 .json 文件".into());
+    }
+    std::fs::write(&p, content).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(p.display().to_string())
+}
+
 /* ---------- 外接显示（硬件字幕屏）API ---------- */
 
 /// 外接显示服务当前状态（运行中/端口/可访问 URL/最近错误）
@@ -1216,6 +1244,8 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // 原生保存/打开文件对话框：配置「另存为」导出与从文件导入
+        .plugin(tauri_plugin_dialog::init())
         .manage(Ctx {
             config: Mutex::new(None),
             recording: Mutex::new(None),
@@ -1328,6 +1358,10 @@ pub fn run() {
                     // 选区窗被 Alt+F4 等关闭：转为取消本轮截图取词（窗实例保留复用）
                     api.prevent_close();
                     crate::ocr::ocr_cancel(window.app_handle().clone());
+                } else if window.label() == "typist" {
+                    // 模拟输入窗关闭 = 停止进行中的注入并隐藏保活（草稿不丢）
+                    api.prevent_close();
+                    typist::on_window_closed(window.app_handle());
                 }
             }
             // 主窗口真正销毁（退出应用）前：把内存中的配置落盘，防止配置文件意外丢失
@@ -1401,10 +1435,26 @@ pub fn run() {
             ocr::ocr_paste,
             ocr::ocr_langs,
             ocr::open_language_settings,
+            typist::typing_start,
+            typist::typing_stop,
+            typist::typing_status,
+            typist::typing_set_speed,
+            typist::typing_start_clipboard,
+            typist::typing_clipboard_text,
+            typist::typist_read_draft,
+            typist::typist_save_draft,
+            typist::typist_set_top,
+            typist::open_typist,
             display_status,
             open_display_page,
             is_elevated,
-            restart_elevated
+            restart_elevated,
+            update::check_update,
+            update::download_update,
+            update::install_update,
+            update::open_release_page,
+            read_text_file,
+            export_text_to
         ])
         .build(tauri::generate_context!())
         .expect("SpeakNow 启动失败")

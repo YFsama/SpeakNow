@@ -13,63 +13,75 @@ import {
 import { listLlmModels, testLlm } from '../../api';
 import type { PromptTemplate, ProviderProfile, TabProps } from '../../types';
 import { TRANSLATE_LANGS, langName } from '../../types';
-import { newProviderId, providerOptions } from './shared';
+import {
+  cacheModelList,
+  cachedModelList,
+  isLocalBaseUrl,
+  matchPreset,
+  ModelInput,
+  newProviderId,
+  providerOptions,
+  type ModelPreset,
+} from './shared';
 
 /* ============ AI 优化 ============ */
-const LLM_PRESETS = [
+/* 服务商预设：models 为推荐模型档位（首个 = 选预设时的默认值）。
+   模型名随厂商迭代（2026-10 校准）：智谱 GLM-5.3 系、DeepSeek V4
+   （deepseek-chat 已于 2026-07 弃用）、Kimi K3、OpenAI GPT-5.2 系 */
+const LLM_PRESETS: ModelPreset[] = [
   {
     value: 'zhipu',
     label: '智谱 GLM',
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-4.6',
+    models: ['glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'glm-4.7', 'glm-4.6'],
   },
   {
     value: 'deepseek',
     label: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat',
+    models: ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
   },
   {
     value: 'kimi',
     label: 'Moonshot Kimi',
-    baseUrl: 'https://api.moonshot.cn/v1',
-    model: 'kimi-k2-0905-preview',
+    baseUrl: 'https://api.moonshot.ai/v1',
+    models: ['kimi-k3', 'kimi-k2.6', 'kimi-k2-0905-preview'],
   },
   {
     value: 'qwenmt',
     label: '阿里 Qwen-MT（翻译专用 API，需 DashScope Key）',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen-mt-turbo',
+    models: ['qwen-mt-turbo', 'qwen-mt-plus', 'qwen-mt-flash', 'qwen-mt-lite'],
   },
   {
     value: 'ollama',
     label: 'Ollama 本地（免 Key，推荐小模型 qwen3:4b）',
     baseUrl: 'http://localhost:11434/v1',
-    model: 'qwen3:4b',
+    models: ['qwen3:4b', 'qwen3:8b'],
   },
   {
     value: 'lmstudio',
     label: 'LM Studio 本地（免 Key）',
     baseUrl: 'http://localhost:1234/v1',
-    model: '',
+    models: [],
   },
   {
     value: 'llamacpp',
     label: 'llama.cpp server 本地（免 Key）',
     baseUrl: 'http://127.0.0.1:8080/v1',
-    model: '',
+    models: [],
   },
   {
     value: 'openai',
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
+    models: ['gpt-5.2', 'gpt-5.2-chat-latest', 'gpt-5-mini', 'gpt-4o-mini'],
   },
   {
     value: 'custom',
     label: '自定义（任意 OpenAI 兼容接口）',
     baseUrl: '',
-    model: '',
+    models: [],
   },
 ];
 
@@ -84,15 +96,25 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
   const [addingTpl, setAddingTpl] = useState(false);
   const [tplName, setTplName] = useState('');
   const [delTpl, setDelTpl] = useState<string | null>(null);
+  /* ---- 凭据组管理面板：默认收起，常用路径（改模型/切预设）不被迫先滚过一长串 Key 输入框 ---- */
+  const [providersOpen, setProvidersOpen] = useState(false);
+
   const providers = cfg.providers ?? [];
   const llmProfile = providers.find((x) => x.id === cfg.llm.providerId);
   const usingProfile = !!llmProfile;
   const creds = usingProfile
     ? { baseUrl: llmProfile!.baseUrl, apiKey: llmProfile!.apiKey }
     : { baseUrl: cfg.llm.baseUrl, apiKey: cfg.llm.apiKey };
-  const preset =
-    LLM_PRESETS.find((p) => p.baseUrl !== '' && p.baseUrl === creds.baseUrl)?.value ??
-    'custom';
+  const preset = matchPreset(LLM_PRESETS, creds.baseUrl)?.value ?? 'custom';
+  /* 命中预设时的推荐模型档位：模型框下方一键切换 chips（新版本随时插队到首位） */
+  const modelCandidates = matchPreset(LLM_PRESETS, creds.baseUrl)?.models ?? [];
+
+  /* 生效配置健康度：地址必填；Key 仅云端必填（本地 Ollama 等免 Key），
+     与后端 LLM 空-Key-跳过逻辑同口径 */
+  const localBase = isLocalBaseUrl(creds.baseUrl);
+  const missingUrl = !creds.baseUrl.trim();
+  const missingKey = !localBase && !creds.apiKey.trim();
+  const connReady = !missingUrl && !missingKey;
 
   /* ---- 凭据组管理 ---- */
   const addProvider = () => {
@@ -162,11 +184,23 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
     set('llm', { promptTemplates: templates.filter((t) => t.id !== id) });
   };
 
-  /* Key 未填写的「去填写」直达：滚动并聚焦到本页上方对应凭据组的 Key 输入框 */
-  const gotoProviderKey = (id: string) => {
-    const el = document.getElementById(`llm-key-${id}`);
-    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el?.querySelector('input')?.focus();
+  /* Key 未填写的「去填写」直达：引用凭据组 → 展开面板并聚焦组内 Key 框；
+     独立配置 → 聚焦本页 Key 输入框 */
+  const gotoKeyInput = () => {
+    const focus = () => {
+      const el = document.getElementById(
+        usingProfile ? `llm-key-${llmProfile!.id}` : 'llm-inline-key',
+      );
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el?.querySelector('input')?.focus();
+    };
+    if (usingProfile && !providersOpen) {
+      setProvidersOpen(true);
+      // 面板展开是异步渲染，等一帧再滚动
+      window.setTimeout(focus, 80);
+    } else {
+      focus();
+    }
   };
 
   const run = async () => {
@@ -187,6 +221,7 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
     try {
       const list = await listLlmModels(creds.baseUrl, creds.apiKey);
       setModelList(list);
+      cacheModelList(creds.baseUrl, list);
       toast(`发现 ${list.length} 个模型，可在「模型名称」中选择`);
     } catch (e) {
       toast(String(e));
@@ -195,28 +230,34 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
     }
   };
 
-  /* 测试连接行（按钮 + 结果反馈）：由 Section 尾部上移至凭据选择区之后，
-     改完凭据即可就近验证；原底部入口移除避免双入口，
-     loading / 成功 / 失败反馈复用同一 state，逻辑不变 */
-  const testConnRow = (
-    <div className="flex flex-wrap items-center gap-2">
-      <Button onClick={run} disabled={test.loading}>
-        {test.loading ? (
-          <>
-            <Spinner size={13} /> 测试中…
-          </>
-        ) : (
-          '测试连接'
-        )}
-      </Button>
-      {test.msg && (
-        <span
-          className={`text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
-        >
-          {test.msg}
-        </span>
-      )}
-    </div>
+  /* 切换地址（换预设/换凭据组）时尝试恢复该地址已拉取过的列表，
+     切页回来也不必重新 ⟳（会话级缓存在 shared） */
+  useEffect(() => {
+    setModelList(cachedModelList(creds.baseUrl));
+  }, [creds.baseUrl]);
+
+  /* 模型名称 + 获取列表 + 预设候选 chips：单一实现（此前凭据组/自定义两条分支
+     各一份，行为却完全相同）。候选与获取列表在 datalist 内合并去重 */
+  const modelField = (
+    <Field
+      label="模型名称"
+      hint={
+        modelList
+          ? `发现 ${modelList.length} 个模型，输入框可下拉选择`
+          : '下拉可选推荐模型，或点右侧按钮从接口获取完整列表'
+      }
+    >
+      <ModelInput
+        listId="llm-model-list"
+        value={cfg.llm.model}
+        onChange={(model) => set('llm', { model })}
+        candidates={modelCandidates}
+        modelList={modelList}
+        fetching={fetching}
+        onFetch={fetchModels}
+        placeholder="glm-5.3 / qwen3:4b / kimi-k3 …"
+      />
+    </Field>
   );
 
   return (
@@ -225,79 +266,94 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
       title="AI 纠错与优化"
       desc="转写结果先经大模型纠正错字、标点与术语（或翻译成目标语言），再输入目标输入框。"
     >
-      {/* ===== 统一凭据组 ===== */}
-      <div className="rounded-xl border border-white/[0.07] bg-black/20 p-4">
-        <div className="mb-3 flex flex-wrap items-center gap-2">
+      {/* ===== 凭据组管理（可折叠）：同一家服务商只填一次 Key，两页共用 ===== */}
+      <div className="rounded-xl border border-white/[0.07] bg-black/20">
+        <button
+          type="button"
+          onClick={() => setProvidersOpen((v) => !v)}
+          className="flex w-full flex-wrap items-center gap-2 px-4 py-3 text-left"
+        >
           <span className="text-[12.5px] font-medium text-slate-300">🔑 API 凭据组</span>
+          {providers.length > 0 && (
+            <span className="rounded-full border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
+              {providers.length} 个
+            </span>
+          )}
           <span className="text-[11px] leading-4 text-slate-500">
             同一家服务商只需填一次 Key，「语音识别」与「AI 优化」共用（如智谱一个 Key 同用 GLM-ASR + GLM 纠错）
           </span>
-          <Button onClick={addProvider}>＋ 添加</Button>
-        </div>
-        {providers.length === 0 && (
-          <div className="text-[11.5px] leading-5 text-slate-500">
-            尚无凭据组。添加后，两页的「API 凭据组」下拉即可引用；也可不建凭据组、在各页单独填写地址与 Key（行为与旧版一致）。
+          <span className="ml-auto text-[11px] text-slate-500">
+            {providersOpen ? '收起 ▴' : '管理 ▾'}
+          </span>
+        </button>
+        {providersOpen && (
+          <div className="space-y-3 border-t border-white/[0.06] px-4 py-3">
+            {providers.length === 0 && (
+              <div className="text-[11.5px] leading-5 text-slate-500">
+                尚无凭据组。添加后，两页的「凭据来源」下拉即可引用；也可不建凭据组、
+                在下方直接填写地址与 Key（行为与旧版一致）。
+              </div>
+            )}
+            {providers.map((p) => {
+              const refs = [
+                cfg.asr.providerId === p.id ? '语音识别' : null,
+                cfg.llm.providerId === p.id ? 'AI 优化' : null,
+              ].filter(Boolean);
+              return (
+                <div
+                  key={p.id}
+                  className="rounded-lg border border-white/[0.06] bg-black/25 p-3"
+                >
+                  <div className="mb-2 flex items-center gap-2">
+                    <div className="w-44">
+                      <TextInput
+                        value={p.name}
+                        onChange={(name) => updateProvider(p.id, { name })}
+                        placeholder="名称（如 智谱 / DeepSeek）"
+                      />
+                    </div>
+                    {refs.length > 0 && (
+                      <span className="rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">
+                        {refs.join(' + ')} 引用中
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => removeProvider(p.id)}
+                      title="删除该凭据组（引用它的页面会退回各自的内联配置）"
+                      className={`ml-auto rounded-md px-2 py-1 text-[11px] transition ${
+                        confirmDel === p.id
+                          ? 'bg-red-500/15 text-red-300'
+                          : 'text-slate-500 hover:bg-red-500/10 hover:text-red-300'
+                      }`}
+                    >
+                      {confirmDel === p.id ? '确认删除？' : '🗑 删除'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <TextInput
+                      mono
+                      value={p.baseUrl}
+                      onChange={(baseUrl) => updateProvider(p.id, { baseUrl })}
+                      placeholder="Base URL：https://open.bigmodel.cn/api/paas/v4"
+                    />
+                    {/* id 供摘要卡「Key 未填写 · 去填写」直达滚动聚焦 */}
+                    <div id={`llm-key-${p.id}`}>
+                      <TextInput
+                        type="password"
+                        mono
+                        value={p.apiKey}
+                        onChange={(apiKey) => updateProvider(p.id, { apiKey })}
+                        placeholder="API Key（sk-…）"
+                      />
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            <Button onClick={addProvider}>＋ 添加凭据组</Button>
           </div>
         )}
-        <div className="space-y-3">
-          {providers.map((p) => {
-            const refs = [
-              cfg.asr.providerId === p.id ? '语音识别' : null,
-              cfg.llm.providerId === p.id ? 'AI 优化' : null,
-            ].filter(Boolean);
-            return (
-              <div
-                key={p.id}
-                className="rounded-lg border border-white/[0.06] bg-black/25 p-3"
-              >
-                <div className="mb-2 flex items-center gap-2">
-                  <div className="w-44">
-                    <TextInput
-                      value={p.name}
-                      onChange={(name) => updateProvider(p.id, { name })}
-                      placeholder="名称（如 智谱 / DeepSeek）"
-                    />
-                  </div>
-                  {refs.length > 0 && (
-                    <span className="rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">
-                      {refs.join(' + ')} 引用中
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => removeProvider(p.id)}
-                    title="删除该凭据组（引用它的页面会退回各自的内联配置）"
-                    className={`ml-auto rounded-md px-2 py-1 text-[11px] transition ${
-                      confirmDel === p.id
-                        ? 'bg-red-500/15 text-red-300'
-                        : 'text-slate-500 hover:bg-red-500/10 hover:text-red-300'
-                    }`}
-                  >
-                    {confirmDel === p.id ? '确认删除？' : '🗑 删除'}
-                  </button>
-                </div>
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  <TextInput
-                    mono
-                    value={p.baseUrl}
-                    onChange={(baseUrl) => updateProvider(p.id, { baseUrl })}
-                    placeholder="Base URL：https://open.bigmodel.cn/api/paas/v4"
-                  />
-                  {/* id 供「Key 未填写 · 去填写」直达链接滚动聚焦 */}
-                  <div id={`llm-key-${p.id}`}>
-                    <TextInput
-                      type="password"
-                      mono
-                      value={p.apiKey}
-                      onChange={(apiKey) => updateProvider(p.id, { apiKey })}
-                      placeholder="API Key（sk-…）"
-                    />
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
       </div>
 
       <Toggle
@@ -308,10 +364,89 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
       />
       {cfg.llm.enabled && (
         <>
+          {/* ===== 生效配置总览：来源 / 地址 / Key / 模型 一屏看清，就近测试 ===== */}
+          <div
+            className={`rounded-xl border p-4 ${
+              connReady
+                ? 'border-emerald-500/20 bg-emerald-500/[0.04]'
+                : 'border-amber-500/25 bg-amber-500/[0.05]'
+            }`}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  connReady ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+                }`}
+                aria-hidden
+              />
+              <span className="text-[12.5px] font-medium text-slate-200">
+                当前生效配置
+              </span>
+              <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10.5px] text-slate-300">
+                {usingProfile ? `凭据组「${llmProfile!.name || '未命名'}」` : '本页独立配置'}
+              </span>
+              <span className="ml-auto">
+                <Button onClick={run} disabled={test.loading}>
+                  {test.loading ? (
+                    <>
+                      <Spinner size={13} /> 测试中…
+                    </>
+                  ) : (
+                    '测试连接'
+                  )}
+                </Button>
+              </span>
+            </div>
+            <div className="mt-2 space-y-0.5 text-[11.5px] leading-5">
+              <div className="text-slate-400">
+                接口地址{' '}
+                {creds.baseUrl.trim() ? (
+                  <span className="font-mono text-slate-200">{creds.baseUrl.trim()}</span>
+                ) : (
+                  <span className="text-amber-300">未填写 — 下方选择服务商预设</span>
+                )}
+              </div>
+              <div className="text-slate-400">
+                API Key{' '}
+                {localBase ? (
+                  <span className="text-emerald-300">本地服务 · 免 Key</span>
+                ) : creds.apiKey.trim() ? (
+                  <span className="text-emerald-300">已配置</span>
+                ) : (
+                  <span className="text-amber-300">
+                    未填写 ·{' '}
+                    <button
+                      type="button"
+                      onClick={gotoKeyInput}
+                      className="text-sky-400 underline decoration-sky-400/40 underline-offset-2 transition hover:text-sky-300"
+                    >
+                      {usingProfile ? '去凭据组填写 ›' : '去下方填写 ›'}
+                    </button>
+                  </span>
+                )}
+              </div>
+              <div className="text-slate-400">
+                模型{' '}
+                {cfg.llm.model.trim() ? (
+                  <span className="font-mono text-slate-200">{cfg.llm.model.trim()}</span>
+                ) : (
+                  <span className="text-amber-300">未填写 — 下方选择或输入</span>
+                )}
+              </div>
+            </div>
+            {test.msg && (
+              <div
+                className={`mt-2 text-xs leading-5 ${test.ok ? 'text-emerald-300' : 'text-red-300'}`}
+              >
+                {test.msg}
+              </div>
+            )}
+          </div>
+
           {providers.length > 0 && (
             <Field
-              label="本页使用的凭据"
-              hint="引用上方凭据组时，地址与 Key 以凭据组为准（Key 不再重复填写）"
+              label="凭据来源"
+              hint="引用凭据组时地址与 Key 以组为准；选「自定义」则在下方本页独立填写"
             >
               <Select
                 // 悬空 providerId（组已被删）回退显示「自定义」，避免下拉空白
@@ -329,9 +464,7 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
               />
             </Field>
           )}
-          {/* 测试连接上移：「启用 AI 优化」与凭据选择区之后，改完凭据即可就近验证 */}
-          {testConnRow}
-          <Field label="服务商预设">
+          <Field label="服务商预设" hint="选定后自动填入地址与推荐模型">
             <Select
               value={preset}
               onChange={(v) => {
@@ -356,7 +489,7 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
                     set('llm', {
                       providerId: np.id,
                       baseUrl: p.baseUrl,
-                      model: p.model || cfg.llm.model,
+                      model: p.models[0] || cfg.llm.model,
                     });
                     return;
                   }
@@ -366,7 +499,7 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
                 }
                 set('llm', {
                   baseUrl: p.baseUrl || cfg.llm.baseUrl,
-                  model: p.model || cfg.llm.model,
+                  model: p.models[0] || cfg.llm.model,
                 });
               }}
               options={LLM_PRESETS.map((p) => ({ value: p.value, label: p.label }))}
@@ -382,94 +515,21 @@ export function LlmTab({ cfg, set, toast }: TabProps) {
                   placeholder="https://open.bigmodel.cn/api/paas/v4"
                 />
               </Field>
-              <Field
-                label="模型名称"
-                hint={
-                  modelList
-                    ? `发现 ${modelList.length} 个模型，输入框可下拉选择`
-                    : '点右侧按钮可自动获取本机/云端模型列表'
-                }
-              >
-                <div className="flex gap-2">
-                  <input
-                    list="llm-model-list"
-                    value={cfg.llm.model}
-                    spellCheck={false}
-                    onChange={(e) => set('llm', { model: e.target.value })}
-                    placeholder="glm-4.6 / qwen3:4b / deepseek-chat …"
-                    className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-500/60 focus:ring-2 focus:ring-sky-500/15"
+              <Field label="API Key">
+                {/* id 供摘要卡「去下方填写」聚焦 */}
+                <div id="llm-inline-key">
+                  <TextInput
+                    type="password"
+                    mono
+                    value={cfg.llm.apiKey}
+                    onChange={(apiKey) => set('llm', { apiKey })}
+                    placeholder="sk-…（与 ASR 相同厂商时可建凭据组共用）"
                   />
-                  <Button onClick={fetchModels} disabled={fetching}>
-                    {fetching ? <Spinner size={13} /> : '⟳'}
-                  </Button>
                 </div>
-                <datalist id="llm-model-list">
-                  {(modelList ?? []).map((m) => (
-                    <option key={m} value={m} />
-                  ))}
-                </datalist>
               </Field>
             </div>
           )}
-          {usingProfile ? (
-            <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] px-3.5 py-2.5 text-[11.5px] leading-5 text-emerald-200/80">
-              🔑 正在使用凭据组「{llmProfile!.name || '未命名'}」· 地址{' '}
-              {llmProfile!.baseUrl || '（未填写）'} · Key{' '}
-              {llmProfile!.apiKey.trim() ? (
-                '已配置'
-              ) : (
-                <>
-                  未填写 ·{' '}
-                  <button
-                    type="button"
-                    onClick={() => gotoProviderKey(llmProfile!.id)}
-                    className="text-sky-400 underline decoration-sky-400/40 underline-offset-2 transition hover:text-sky-300"
-                  >
-                    去上方凭据组填写 ›
-                  </button>
-                </>
-              )}
-              <div className="mt-2 grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <Field
-                  label="模型名称"
-                  hint={
-                    modelList
-                      ? `发现 ${modelList.length} 个模型，输入框可下拉选择`
-                      : '点右侧按钮可自动获取本机/云端模型列表'
-                  }
-                >
-                  <div className="flex gap-2">
-                    <input
-                      list="llm-model-list"
-                      value={cfg.llm.model}
-                      spellCheck={false}
-                      onChange={(e) => set('llm', { model: e.target.value })}
-                      placeholder="glm-4.6 / qwen3:4b / deepseek-chat …"
-                      className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-500/60 focus:ring-2 focus:ring-sky-500/15"
-                    />
-                    <Button onClick={fetchModels} disabled={fetching}>
-                      {fetching ? <Spinner size={13} /> : '⟳'}
-                    </Button>
-                  </div>
-                  <datalist id="llm-model-list">
-                    {(modelList ?? []).map((m) => (
-                      <option key={m} value={m} />
-                    ))}
-                  </datalist>
-                </Field>
-              </div>
-            </div>
-          ) : (
-            <Field label="API Key">
-              <TextInput
-                type="password"
-                mono
-                value={cfg.llm.apiKey}
-                onChange={(apiKey) => set('llm', { apiKey })}
-                placeholder="sk-…（与 ASR 相同厂商时可建凭据组共用）"
-              />
-            </Field>
-          )}
+          {modelField}
           <Field label="优化模式">
             <Segmented
               value={cfg.llm.mode}

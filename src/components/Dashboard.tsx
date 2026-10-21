@@ -7,6 +7,7 @@ import {
   copyText,
   getStats,
   ocrCapture,
+  openTypist,
   shortcutChips,
   translateSelection,
 } from '../api';
@@ -391,6 +392,14 @@ export default function Dashboard({
                 📷 截图取词
               </Button>
             )}
+            <Button
+              onClick={() => {
+                void openTypist().catch(() => {});
+              }}
+              title="打开文本模拟输入窗口：粘贴大段文本后模拟键盘逐字敲进目标输入框"
+            >
+              ⌨️ 文本模拟输入
+            </Button>
             <Button kind="primary" onClick={onRecordToggle}>
               {recording ? '■ 结束并识别' : '🎤 试录一段'}
             </Button>

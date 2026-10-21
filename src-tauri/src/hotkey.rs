@@ -115,6 +115,16 @@ pub fn apply(app: &AppHandle, hk: &HotkeyConfig) -> Result<()> {
             )
         })?;
     }
+    // 文本模拟输入快捷键：打开 Typist 小窗（粘贴大段文本 → 模拟键盘逐字敲入）
+    if !hk.key_typist.trim().is_empty() {
+        let shortcut = parse_shortcut(&hk.key_typist)?;
+        gs.on_shortcut(shortcut, handle_event).map_err(|e| {
+            anyhow!(
+                "注册文本模拟输入快捷键 {} 失败（可能已被其他应用占用）: {e}",
+                hk.key_typist
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -147,6 +157,14 @@ fn handle_event(app: &AppHandle, sc: &Shortcut, event: ShortcutEvent) {
         && parse_shortcut(&hk.key_ocr)
             .map(|t| t == *sc)
             .unwrap_or(false);
+    let is_typist = !is_quick
+        && !is_translate
+        && !is_translate_sel
+        && !is_ocr
+        && !hk.key_typist.is_empty()
+        && parse_shortcut(&hk.key_typist)
+            .map(|t| t == *sc)
+            .unwrap_or(false);
 
     // 划词翻译独立于听写会话：取词含按键模拟与剪贴板轮询（阻塞可达秒级），
     // 放独立线程执行，不占住热键回调线程
@@ -159,6 +177,13 @@ fn handle_event(app: &AppHandle, sc: &Shortcut, event: ShortcutEvent) {
     // 截图取词同样独立：弹选区窗 + GDI 截屏 + OCR 全在后台完成
     if is_ocr && event.state() == ShortcutState::Pressed {
         crate::ocr::start_capture(app);
+        return;
+    }
+
+    // 文本模拟输入：热键为开关语义（可见即收起）；窗口创建须回主线程，
+    // toggle_window 内自理
+    if is_typist && event.state() == ShortcutState::Pressed {
+        crate::typist::toggle_window(app);
         return;
     }
 

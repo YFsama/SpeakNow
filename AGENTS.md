@@ -45,6 +45,7 @@ devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
 | `src-tauri/src/inject.rs` | 输出注入：剪贴板粘贴（含占用重试/还原/说话探测）、模拟键盘、UIPI 提权检测 |
 | `src-tauri/src/caret.rs` | UIA COM 定位输入光标（悬浮窗跟随）+ 前台窗口信息 |
 | `src-tauri/src/ccc.rs` | Ctrl+C+C 双击取词低级键盘钩子状态机 |
+| `src-tauri/src/typist.rs` | 文本模拟输入：独立小窗（按需创建）+ 逐字注入（Windows 直发 KEYEVENTF_UNICODE，不经 enigo 的 VK 映射；HIGH_RESOLUTION waitable timer 定节奏——thread::sleep 受 15.6ms 系统分辨率限制，快档会失真）+ 低级钩子「按任意物理键中止」+ 剪贴板直输 / 输入中实时调速 / 草稿落盘 |
 | `src-tauri/src/selection.rs` | 划词取词：UIA 无副作用通道 + 模拟 Ctrl+C 兜底 |
 | `src-tauri/src/translate.rs` / `trans_struct.rs` | 划词/复制即翻译 + 结构化（i18n 文件）翻译，见 docs/translation.md |
 | `src-tauri/src/ocr.rs` | 截图取词：每屏选区窗 + GDI 截屏 + Windows OCR / PP-OCR |

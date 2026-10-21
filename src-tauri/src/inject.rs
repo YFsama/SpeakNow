@@ -92,6 +92,19 @@ pub fn foreground_process_name() -> String {
     String::new()
 }
 
+/// 前台是否已是其他应用（typist 等模块复用：注入前等焦点回到目标窗口）
+#[cfg(target_os = "windows")]
+pub fn foreground_is_foreign() -> bool {
+    win::foreground_is_foreign()
+}
+
+/// 非 Windows 无前台进程探测：焦点判断无从谈起，恒视为「已回到目标」，
+/// 调用方的等待循环直接放行
+#[cfg(not(target_os = "windows"))]
+pub fn foreground_is_foreign() -> bool {
+    true
+}
+
 /// 前台是否终端类窗口（终端里模拟 Ctrl+C 是中断信号，划词翻译须避开）
 #[cfg(target_os = "windows")]
 pub fn foreground_is_terminal() -> bool {

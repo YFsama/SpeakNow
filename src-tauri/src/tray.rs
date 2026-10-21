@@ -29,6 +29,24 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let translate_sel =
         MenuItem::with_id(app, "translate_sel", "划词翻译选中文字", true, None::<&str>)?;
     let ocr_item = MenuItem::with_id(app, "ocr", "截图取词（框选识别）", true, None::<&str>)?;
+    // 文本模拟输入做成子菜单：小窗（编辑长文）与剪贴板直输（复制→点一下）
+    // 是同一功能的两个入口，平铺会让本就长的主菜单更难扫读
+    let typist_win =
+        MenuItem::with_id(app, "typist:win", "打开小窗…", true, None::<&str>)?;
+    let typist_clip = MenuItem::with_id(
+        app,
+        "typist:clip",
+        "直接输入剪贴板文本",
+        true,
+        None::<&str>,
+    )?;
+    let typist_menu = Submenu::with_id_and_items(
+        app,
+        "typist",
+        "文本模拟输入",
+        true,
+        &[&typist_win, &typist_clip],
+    )?;
     let show = MenuItem::with_id(app, "show", "打开设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 SpeakNow", true, None::<&str>)?;
 
@@ -96,7 +114,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let sep2 = PredefinedMenuItem::separator(app)?;
     Menu::with_items(
         app,
-        &[&record, &record_quick, &translate_sel, &ocr_item, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
+        &[&record, &record_quick, &translate_sel, &ocr_item, &typist_menu, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
     )
 }
 
@@ -138,6 +156,18 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             std::thread::spawn(move || crate::translate::translate_selection(&h));
         }
         "ocr" => crate::ocr::start_capture(app),
+        "typist:win" => crate::typist::open_window(app),
+        "typist:clip" => {
+            // 剪贴板读取可能因占用短暂阻塞，异步执行不冻结托盘；失败走悬浮窗
+            // 错误卡（此时小窗多半没开，行内错误无处显示）
+            let h = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::typist::start_clipboard(&h).await {
+                    eprintln!("[speaknow] 剪贴板直输启动失败: {e}");
+                    crate::typist::show_error_card(&h, &format!("剪贴板直输失败：{e}"));
+                }
+            });
+        }
         "show" => open_main_window(app),
         "quit" => app.exit(0),
         // 预览编辑快切：与模式/语言同为持久配置项，落盘 + 通知设置页刷新

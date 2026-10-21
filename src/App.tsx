@@ -13,6 +13,7 @@ import { listen } from '@tauri-apps/api/event';
 import {
   applyAppearance,
   builtinModels,
+  checkUpdate,
   getConfig,
   getHistory,
   listDevices,
@@ -28,6 +29,7 @@ import type {
   LocalModelStatus,
   Stage,
   TabId,
+  UpdateInfo,
 } from './types';
 import { DEFAULT_DEVICE_KEY } from './types';
 import Dashboard from './components/Dashboard';
@@ -273,11 +275,30 @@ export default function App() {
     setToasts((ts) => ts.filter((t) => t.id !== id));
   }, []);
   const [recording, setRecording] = useState(false);
+  // 启动时检查到的可用更新（null = 无/未检查）：侧栏红点提示 + 关于页复用展示
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  // dev StrictMode 双挂载会把下面的启动检查跑两次（两条 toast、两次请求）：
+  // 仅对这一副作用防重，effect 其余初始化保持原语义（挂载-清理-再挂载）
+  const updateCheckedRef = useRef(false);
 
   useEffect(() => {
+    const updateGuarded = updateCheckedRef.current;
+    updateCheckedRef.current = true;
     getConfig().then((c) => {
       setCfg(c);
       savedRef.current = JSON.stringify(c);
+      // 启动自动检查更新（可在关于页关闭）：只提示不下载安装；
+      // 已「跳过此版本」的不再打扰。失败静默——网络受限不该开屏报错
+      if (!updateGuarded && c.general.autoCheckUpdate !== false) {
+        checkUpdate()
+          .then((r) => {
+            if (r.updateAvailable && r.latest !== c.general.skipVersion) {
+              setUpdateInfo(r);
+              setToast(`发现新版本 v${r.latest}，前往「关于」页更新`, 'info');
+            }
+          })
+          .catch(() => {});
+      }
     });
     listDevices().then(setDevices);
     getHistory().then(setHistory);
@@ -567,6 +588,7 @@ export default function App() {
     history,
     refreshHistory,
     onRecordToggle,
+    updateInfo,
   };
 
   return (
@@ -641,6 +663,15 @@ export default function App() {
                     cfg.asr.provider === 'local' &&
                     !localModels.find((m) => m.id === cfg.asr.localModel)?.downloaded && (
                       <span className="ml-auto h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden />
+                    )}
+                  {n.id === 'about' &&
+                    updateInfo &&
+                    updateInfo.latest !== cfg.general.skipVersion && (
+                      <span
+                        className="ml-auto h-1.5 w-1.5 rounded-full bg-sky-400"
+                        title={`有新版本 v${updateInfo.latest}`}
+                        aria-label={`有新版本 v${updateInfo.latest}`}
+                      />
                     )}
                 </button>
               </Fragment>

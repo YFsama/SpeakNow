@@ -7,7 +7,13 @@ import type { TabProps } from '../../types';
 import { langName } from '../../types';
 
 /* ============ 快捷键 ============ */
-type HotkeyField = 'key' | 'keyQuick' | 'keyTranslate' | 'keyTranslateSel' | 'keyOcr';
+type HotkeyField =
+  | 'key'
+  | 'keyQuick'
+  | 'keyTranslate'
+  | 'keyTranslateSel'
+  | 'keyOcr'
+  | 'keyTypist';
 
 const HOTKEY_FIELD_LABELS: Record<HotkeyField, string> = {
   key: '主快捷键',
@@ -15,9 +21,17 @@ const HOTKEY_FIELD_LABELS: Record<HotkeyField, string> = {
   keyTranslate: '翻译模式',
   keyTranslateSel: '划词翻译',
   keyOcr: '截图取词',
+  keyTypist: '文本模拟输入',
 };
 
-const HOTKEY_FIELDS: HotkeyField[] = ['key', 'keyQuick', 'keyTranslate', 'keyTranslateSel', 'keyOcr'];
+const HOTKEY_FIELDS: HotkeyField[] = [
+  'key',
+  'keyQuick',
+  'keyTranslate',
+  'keyTranslateSel',
+  'keyOcr',
+  'keyTypist',
+];
 
 export function HotkeyTab({ cfg, set }: TabProps) {
   // 系统级注册状态：应用内查重只能拦本应用的组合冲突，被其他应用（输入法、
@@ -62,7 +76,8 @@ export function HotkeyTab({ cfg, set }: TabProps) {
     else if (field === 'keyQuick') set('hotkey', { keyQuick: v });
     else if (field === 'keyTranslate') set('hotkey', { keyTranslate: v });
     else if (field === 'keyTranslateSel') set('hotkey', { keyTranslateSel: v });
-    else set('hotkey', { keyOcr: v });
+    else if (field === 'keyOcr') set('hotkey', { keyOcr: v });
+    else set('hotkey', { keyTypist: v });
   };
 
   // 渲染时复核冲突是否仍在（另一字段改走后警告自动消失）
@@ -154,17 +169,30 @@ export function HotkeyTab({ cfg, set }: TabProps) {
           {clearBtn('keyTranslateSel')}
         </Field>
       </div>
-      <Field
-        label="截图取词（可选）"
-        hint="框选屏幕任意区域：本地 OCR 识别出文字（弹悬浮窗，可复制/翻译/输入到光标）；图片、扫描件、视频字幕里的文字都能取"
-      >
-        <HotkeyRecorder
-          value={cfg.hotkey.keyOcr}
-          onChange={(keyOcr) => applyKey('keyOcr', keyOcr)}
-        />
-        {dupWarning('keyOcr')}
-        {clearBtn('keyOcr')}
-      </Field>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Field
+          label="截图取词（可选）"
+          hint="框选屏幕任意区域：本地 OCR 识别出文字（弹悬浮窗，可复制/翻译/输入到光标）；图片、扫描件、视频字幕里的文字都能取"
+        >
+          <HotkeyRecorder
+            value={cfg.hotkey.keyOcr}
+            onChange={(keyOcr) => applyKey('keyOcr', keyOcr)}
+          />
+          {dupWarning('keyOcr')}
+          {clearBtn('keyOcr')}
+        </Field>
+        <Field
+          label="文本模拟输入（可选）"
+          hint="打开独立小窗：粘贴大段文本后模拟键盘逐字敲进目标输入框，专治禁用粘贴/屏蔽剪贴板的网站与软件"
+        >
+          <HotkeyRecorder
+            value={cfg.hotkey.keyTypist}
+            onChange={(keyTypist) => applyKey('keyTypist', keyTypist)}
+          />
+          {dupWarning('keyTypist')}
+          {clearBtn('keyTypist')}
+        </Field>
+      </div>
       <Field label="触发方式">
         <Segmented
           value={cfg.hotkey.mode}

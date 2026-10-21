@@ -10,6 +10,7 @@ import type {
   LocalModelStatus,
   MicTestResult,
   ProviderProfile,
+  UpdateInfo,
   UsageStats,
 } from './types';
 
@@ -148,6 +149,12 @@ export const overlaySetManual = (manual: boolean) =>
   invoke('overlay_set_manual', { manual });
 export const exportText = (filename: string, content: string) =>
   invoke<string>('export_text', { filename, content });
+/** 读取用户在文件对话框里选中的备份 JSON（仅 .json、≤5MB，后端校验） */
+export const readTextFile = (path: string) =>
+  invoke<string>('read_text_file', { path });
+/** 「另存为」导出：写入对话框选定的 .json 路径，返回完整路径 */
+export const exportTextTo = (path: string, content: string) =>
+  invoke<string>('export_text_to', { path, content });
 export const confirmEdit = (text: string) => invoke('confirm_edit', { text });
 export const cancelReview = () => invoke('cancel_review');
 /** 审阅窗口重新优化；mode 可覆盖本次模式（correct / polish / prompt / translate），结果流式逐字回填 */
@@ -188,6 +195,42 @@ export const ocrLangs = () => invoke<string[]>('ocr_langs');
 /** 打开系统语言设置页（安装 OCR 语言包） */
 export const openLanguageSettings = () => invoke('open_language_settings');
 
+/* ============ 文本模拟输入（Typist） ============ */
+
+/** 开始把整段文本逐字敲进当前焦点窗口（窗口自动隐藏，倒计时后开始；进度走 sn-typing-progress） */
+export const typingStart = (text: string) =>
+  invoke<string>('typing_start', { text });
+/** 请求中止当前模拟输入（下一按键边界生效） */
+export const typingStop = () => invoke('typing_stop');
+/** 输入进行中实时调速（下一字符即生效；空闲时调用则预置下一轮） */
+export const typingSetSpeed = (charDelayMs: number, lineDelayMs: number) =>
+  invoke('typing_set_speed', { charDelayMs, lineDelayMs });
+/** 托盘同款直输：把剪贴板文本直接开始模拟输入，不开窗 */
+export const typingStartClipboard = () =>
+  invoke<string>('typing_start_clipboard');
+/** 读一次剪贴板文本（小窗「从剪贴板开始」按钮用；只读不写） */
+export const typingClipboardText = () =>
+  invoke<string>('typing_clipboard_text');
+/** 上次留下的草稿（小窗挂载时恢复；无草稿返回 null） */
+export const typistReadDraft = () => invoke<string | null>('typist_read_draft');
+/** 保存草稿（编辑去抖后调用；空串即清除草稿文件） */
+export const typistSaveDraft = (text: string) =>
+  invoke('typist_save_draft', { text });
+/** 小窗置顶开关（即时生效；持久化走 save_config） */
+export const typistSetTop = (on: boolean) =>
+  invoke('typist_set_top', { on });
+/** 当前进度快照：{ active, done, total, target }（typist 窗口重开时恢复状态用；
+ *  target 为本轮目标窗口标题，倒计时结束前为空） */
+export interface TypingStatus {
+  active: boolean;
+  done: number;
+  total: number;
+  target: string;
+}
+export const typingStatus = () => invoke<TypingStatus>('typing_status');
+/** 打开（或首次创建）文本模拟输入独立窗口；托盘 / 热键 / 设置页共用 */
+export const openTypist = () => invoke('open_typist');
+
 /** 外接显示（硬件字幕屏）服务状态 */
 export interface DisplayStatus {
   running: boolean;
@@ -205,6 +248,41 @@ export const openDisplayPage = (url: string) =>
 export const isElevated = () => invoke<boolean>('is_elevated');
 /** 以管理员身份重启（UAC 确认后旧实例自动退出） */
 export const restartElevated = () => invoke('restart_elevated');
+
+/* ============ 应用更新（GitHub Release） ============ */
+
+/** 检查 GitHub 上的最新 Release（与当前版本比较由后端完成） */
+export const checkUpdate = () => invoke<UpdateInfo>('check_update');
+/** 下载更新包到临时目录，进度走 sn-update-progress 事件；返回本地路径 */
+export const downloadUpdate = (url: string) =>
+  invoke<string>('download_update', { url });
+/** 拉起安装器并退出应用（Windows 覆盖安装；macOS 打开 dmg 手动拖入） */
+export const installUpdate = (path: string) =>
+  invoke('install_update', { path });
+/** 在系统浏览器打开发布页（仅允许 github.com） */
+export const openReleasePage = (url: string) =>
+  invoke('open_release_page', { url });
+
+/* ============ 原生文件对话框（配置导出/导入） ============ */
+
+export async function saveJsonDialog(
+  defaultName: string,
+): Promise<string | null> {
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  return save({
+    defaultPath: defaultName,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  });
+}
+
+export async function openJsonDialog(): Promise<string | null> {
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  });
+  return typeof picked === 'string' ? picked : null;
+}
 
 /* ============ 主题外观 ============ */
 
