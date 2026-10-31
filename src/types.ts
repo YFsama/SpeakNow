@@ -303,6 +303,13 @@ export interface MemStorageStats {
   chars: number;
 }
 
+/** 导入进度（批量导入时后端逐文件广播；label 为当前文件/来源描述） */
+export interface MemImportProgress {
+  done: number;
+  total: number;
+  label: string;
+}
+
 /** mem_list 返回：条目 + 概览统计（统计不受查询过滤影响） */
 export interface MemListResult {
   items: MemEntry[];

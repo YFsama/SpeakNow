@@ -8,19 +8,23 @@
 //!   `X-SN-API-Key`，见下方「/mem/* 安全口径」）
 //! - `GET /mem/context.md` 工作记忆 markdown（只读，供外部工具拼接上下文，
 //!   鉴权口径同 /mem/search）
+//! - `POST /mem/add`     记忆写入：多设备/脚本推送记忆的**唯一写入口**
+//!   （text/kind/app/title JSON 体；与读端点同套鉴权 + 进程内限流）
 //!
 //! 事件信封：`{"v":1,"type":"status|partial|raw|result|delta|level|meta|target|review|retryable|gain-learned|hello","data":{...},"ts":...}`
 //! 客户端必须忽略未知 type 与未知字段（前向兼容），详见 docs/external-display-api.md。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{broadcast, watch};
 
@@ -226,6 +230,7 @@ fn router() -> axum::Router {
         .route("/api/status", get(api_status))
         .route("/mem/search", get(mem_search))
         .route("/mem/context.md", get(mem_context))
+        .route("/mem/add", post(mem_add))
 }
 
 async fn display_page() -> Html<&'static str> {
@@ -301,6 +306,11 @@ async fn client_socket(mut socket: WebSocket) {
 //   在路由误配等异常路径，误拒的代价远低于误放。
 // - **错钥不计节流**：v1 从简，重复错钥与正常请求同等待遇；后续可加指数
 //   退避的 429（令牌为长随机串，短窗口穷举本就不可行）。
+// - **/mem/add 是唯一写端点**：与读端点共用上面整套鉴权（loopback 免钥
+//   但受 Host 防 rebinding 保护；LAN 必须令牌）。读写不分权——多设备/
+//   脚本推送端只配置一个令牌；写入走 mem 模块公共入口（import_batch：
+//   STORE_LOCK + 近重复合并 + 滚动清理），绝无绕过存储锁直写文件的路径，
+//   另加进程内限流防脚本失控灌库。
 
 /// 401 文案：缺钥/错钥。不区分两种情况，避免给探测者「键存在与否」的反馈
 const UNAUTHORIZED_KEY_MSG: &str = "unauthorized: missing or invalid X-SN-API-Key";
@@ -449,6 +459,166 @@ async fn mem_context(
             .into_response(),
         Err(e) => mem_error(&format!("记忆上下文生成失败: {e}")),
     }
+}
+
+/* ---------- /mem/add 写入端点 ---------- */
+
+/// kind 白名单：与库内既有 kind 值逐字对齐（note=快记/手动，dictation/
+/// ocr/translate=自动采集三源，web/file=导入两源）。白名单外一律 400，
+/// 防脚本拼错字符串把脏 kind 灌进库——kind 是前端过滤器与检索字段
+const MEM_ADD_KINDS: &[&str] = &["note", "dictation", "ocr", "translate", "web", "file"];
+/// 单条 text 上限（码点）。REST 推送的定位是「一条笔记/一段摘录」，长文档
+/// 应走设置页文件导入（那边有编码校验与读取截断）；20k 码点按 800/块的
+/// 硬上限至多切 25 块，单次写盘成本可控
+const MEM_ADD_MAX_CHARS: usize = 20000;
+
+/// POST /mem/add 请求体。kind 缺省 note、app/title 缺省空串，与
+/// mem_import::mem_add_note 的「note + 空 app」语义对齐
+#[derive(serde::Deserialize)]
+struct MemAddBody {
+    text: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    title: String,
+}
+
+/// 限流状态打包进单个 AtomicU64：高 44 位 = 当前窗口起点（ms），低 20 位 =
+/// 窗口内已放行条数，一次 CAS 完成「窗口过期则重开 / 计数 +1」，无锁无
+/// 分配，多设备并发写共享同一个全局口径。窗口是请求驱动的（起点 = 本窗口
+/// 首个请求到达时刻），秒界突刺理论可达 2× 上限——目标是拦「失控循环
+/// 忘加延时」的事故灌库，不是精确 QPS，真滑动窗需要时间戳队列不值当
+static MEM_ADD_RATE: AtomicU64 = AtomicU64::new(0);
+/// 每窗口放行上限：手动推送/脚本的正常节律远低于此
+const MEM_ADD_RATE_MAX: u64 = 10;
+/// 窗口长度（毫秒）
+const MEM_ADD_RATE_WINDOW_MS: u64 = 1000;
+
+/// 取一个写入名额（true=放行）。为什么不做持久封禁：写路径已全部在鉴权
+/// 之后（LAN 须令牌、loopback 受 Host 防 rebinding），限流拦的是用户自己
+/// 脚本的失控而非攻击者；持久封禁需要落盘封禁清单，反而给攻击者留下
+/// 「刷封禁条目把合法设备锁死」的拒绝服务面。进程内窗口在应用重启后
+/// 归零，对失控脚本已足够
+fn mem_add_rate_take() -> bool {
+    let now = now_ms();
+    let mut cur = MEM_ADD_RATE.load(Ordering::Relaxed);
+    loop {
+        let start = cur >> 20;
+        let count = cur & 0xFFFFF;
+        let next = if now.saturating_sub(start) >= MEM_ADD_RATE_WINDOW_MS {
+            (now << 20) | 1
+        } else if count >= MEM_ADD_RATE_MAX {
+            return false;
+        } else {
+            cur + 1
+        };
+        match MEM_ADD_RATE
+            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 当前配置的记忆保留上限（滚动清理用）。mem_import::mem_limit 是模块
+/// 私有且不能为本次改动加 pub，在此复刻同一段读内存配置逻辑（微秒级）
+fn mem_store_limit(app: &AppHandle) -> usize {
+    app.state::<crate::Ctx>()
+        .config
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+        .mem
+        .limit
+        .max(1)
+}
+
+/// POST /mem/add，请求体 `{"text":"必填","kind":"缺省 note","app":"缺省空",
+/// "title":"可选"}`。
+///
+/// 写入路径选型：mem_import::mem_add_note 只吃 (AppHandle, String)、写死
+/// kind="note"/app=""，承载不了本端点的 kind/app 语义，因此复用它内部同款
+/// 组合——mem_import::chunk_text + compose_title（pub(crate) 纯函数，分块
+/// 与标题口径与设置页导入逐字一致）→ mem::import_batch（STORE_LOCK 锁内
+/// 近重复合并 + 滚动清理 + 落盘 + sn-mem-changed 广播）。与快记/导入同属
+/// 用户（设备）主动行为：不走采集开关与采集黑名单（黑名单防的是被动采集
+/// 撞上密码管理器，见 mem.rs import_batch 注释）。
+///
+/// 错误形态：400 JSON `{"error":"..."}`（脚本消费方好程序化解析）；429 纯
+/// 文本 "rate limited"（与 401 同风格）；写库内部失败 500 走 mem_error
+async fn mem_add(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(msg) = mem_authorized(APP.get(), Some(addr), &headers) {
+        return (StatusCode::UNAUTHORIZED, msg).into_response();
+    }
+    // 鉴权通过才占限流名额：错钥/无钥请求不计入（同上方「错钥不计节流」
+    // 口径），否则 LAN 攻击者可用垃圾请求刷满窗口，把合法设备的写入饿死
+    if !mem_add_rate_take() {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+    let Some(app) = APP.get().cloned() else {
+        return mem_error("AppHandle 尚未就绪（服务早于应用初始化完成）");
+    };
+    let req: MemAddBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return mem_add_bad_request("invalid JSON body"),
+    };
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return mem_add_bad_request("text required");
+    }
+    if text.chars().count() > MEM_ADD_MAX_CHARS {
+        return mem_add_bad_request(
+            "text too long (max 20000 codepoints); use file import in SpeakNow settings instead",
+        );
+    }
+    let kind = if req.kind.is_empty() { "note" } else { req.kind.as_str() };
+    if !MEM_ADD_KINDS.contains(&kind) {
+        return mem_add_bad_request("invalid kind; allowed: note, dictation, ocr, translate, web, file");
+    }
+    let src_app = req.app.trim().to_string();
+    let title = req.title.trim().to_string();
+    let kind = kind.to_string();
+    // import_batch 是同步文件 IO（load/write mem.json），与读端点同走阻塞
+    // 线程池，不占 axum/tokio worker。20000 码点至多 25 块，远低于单次导入
+    // 400 块上限，无需 mem_import 的 cap_chunks 截断
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let pairs: Vec<(String, String)> = crate::mem_import::chunk_text(&text)
+            .into_iter()
+            .map(|c| (crate::mem_import::compose_title(&title, &c.title, &c.text), c.text))
+            .collect();
+        let limit = mem_store_limit(&app);
+        crate::mem::import_batch(&app, &kind, &src_app, &pairs, limit)
+    })
+    .await;
+    match joined {
+        Ok((added, merged, evicted)) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "summary": { "added": added, "merged": merged, "skipped": evicted }
+            })),
+        )
+            .into_response(),
+        Err(e) => mem_error(&format!("记忆写入任务执行失败: {e}")),
+    }
+}
+
+/// /mem/add 的 400 出口：JSON 错误体（区别于既有端点的纯文本风格——本端点
+/// 消费方是脚本，结构化错误更好处理）
+fn mem_add_bad_request(msg: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 /// /mem/* 统一错误出口：500 + 纯文本

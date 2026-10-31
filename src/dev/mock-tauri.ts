@@ -434,6 +434,9 @@ const mockMem: {
 
 /** 与后端 mem_list 同口径的检索：空格分词 AND 匹配（关键词>标题>正文加权）；
  *  无查询时置顶优先 + 时间倒序，有查询时按命中分排序 */
+let mockMemBak: (typeof mockMem) | null = null;
+let mockMemPreRestore: (typeof mockMem) | null = null;
+void mockMemPreRestore;
 function mockMemSearch(
   query: string,
   kind: string | null,
@@ -743,20 +746,27 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'mem_import_folder': {
           const { paths } = args as { paths?: string[]; path?: string };
           const list = paths ?? (args.path ? [String(args.path)] : []);
-          for (const p of list.slice(0, 3)) {
-            const name = String(p).split(/[\\/]/).pop() ?? 'file';
-            mockMem.unshift({
-              ts: Date.now(),
-              kind: 'file',
-              app: '导入',
-              title: name,
-              text: `（mock）${name} 的文本内容示例。`,
-              keywords: [],
-              distilled: false,
-              pinned: false,
-              chars: 30,
-            });
+          // 与真机同款逐文件进度广播（含收尾帧），进度条可在浏览器预览演练
+          emit('sn-mem-import-progress', { done: 0, total: list.length, label: '' });
+          for (let i = 0; i < list.length; i++) {
+            const p = String(list[i]);
+            const name = p.split(/[\\/]/).pop() ?? 'file';
+            emit('sn-mem-import-progress', { done: i + 1, total: list.length, label: name });
+            if (i < 3) {
+              mockMem.unshift({
+                ts: Date.now(),
+                kind: 'file',
+                app: '导入',
+                title: name,
+                text: `（mock）${name} 的文本内容示例。`,
+                keywords: [],
+                distilled: false,
+                pinned: false,
+                chars: 30,
+              });
+            }
           }
+          emit('sn-mem-import-progress', { done: list.length, total: list.length, label: '' });
           emit('sn-mem-changed');
           resolve({ added: Math.min(list.length, 3), merged: 0, skipped: Math.max(list.length - 3, 0) });
           return;
@@ -768,7 +778,8 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
             pinned: mockMem.filter((m) => m.pinned).length,
             superseded: mockMem.filter((m) => (m.supersededBy ?? 0) > 0).length,
             bytes: JSON.stringify(mockMem).length,
-            bakBytes: 0,
+            // mock 备份语义：曾点过「从备份恢复」后视为有备份，恢复按钮可演练
+            bakBytes: mockMemBak ? JSON.stringify(mockMemBak).length : 0,
             chars,
           });
           return;
@@ -776,6 +787,56 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'mem_gen_token': {
           mockConfig.mem.apiToken = `sn-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
           resolve(mockConfig.mem.apiToken);
+          return;
+        }
+        case 'mem_restore': {
+          const { ts } = args as { ts: number };
+          const item = mockMem.find((m) => m.ts === ts);
+          if (item) item.supersededBy = 0;
+          emit('sn-mem-changed');
+          resolve(undefined);
+          return;
+        }
+        case 'mem_purge_superseded': {
+          // mock 无 bak 语义：直接过滤软作废条目
+          const before = mockMem.length;
+          for (let i = mockMem.length - 1; i >= 0; i--) {
+            if ((mockMem[i].supersededBy ?? 0) > 0) mockMem.splice(i, 1);
+          }
+          emit('sn-mem-changed');
+          resolve(before - mockMem.length);
+          return;
+        }
+        case 'mem_restore_backup': {
+          // mock：模拟从备份恢复——当前库存为 pre-restore，用备份快照顶替（首次数一份）
+          if (!mockMemBak) {
+            mockMemBak = mockMem.map((m) => ({ ...m }));
+            resolve(mockMem.length);
+            return;
+          }
+          mockMemPreRestore = mockMem.map((m) => ({ ...m }));
+          mockMem.length = 0;
+          mockMem.push(...mockMemBak.map((m) => ({ ...m })));
+          emit('sn-mem-changed');
+          resolve(mockMem.length);
+          return;
+        }
+        case 'mem_import_backup': {
+          // mock：合并导入两条示例（真机读 JSON 文件走 near-dup 合并）
+          const sample: (typeof mockMem)[number] = {
+            ts: Date.now(),
+            kind: 'note',
+            app: '',
+            title: '备份合并示例条目',
+            text: '从另一台设备备份合并进来的记忆示例。',
+            keywords: [],
+            distilled: false,
+            pinned: false,
+            chars: 18,
+          };
+          mockMem.unshift(sample);
+          emit('sn-mem-changed');
+          resolve({ added: 1, merged: 0, skipped: 0 });
           return;
         }
         case 'ocr_screen_source':

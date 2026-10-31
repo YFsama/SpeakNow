@@ -7,10 +7,14 @@ import {
   memAddNote,
   memClear,
   memDeleteBatch,
+  memImportBackup,
   memImportFiles,
   memImportFolder,
   memImportUrl,
   memList,
+  memPurgeSuperseded,
+  memRestore,
+  memRestoreBackup,
   memSetPinned,
   memStorageStats,
   memUsed,
@@ -20,6 +24,7 @@ import { NumberInput, isLocalBaseUrl } from './shared';
 import { fmtBytes } from '../../release-notes';
 import type {
   MemEntry,
+  MemImportProgress,
   MemImportSummary,
   MemListResult,
   MemStorageStats,
@@ -177,14 +182,18 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
   const [exporting, setExporting] = useState(false);
   /* 软作废过滤（本地开关，默认关 = 与召回同口径隐藏被取代条目） */
   const [showSuperseded, setShowSuperseded] = useState(false);
-  /* 导入中心：快记输入 / 网址输入 / 各通道忙碌态（防重复提交） */
+  /* 导入中心：快记输入 / 网址输入 / 各通道忙碌态（防重复提交）。
+     'bak' = 备份合并导入（v4），与文件/目录导入共用互斥的忙碌态 */
   const [note, setNote] = useState('');
   const [noteBusy, setNoteBusy] = useState(false);
   const [url, setUrl] = useState('');
   const [urlBusy, setUrlBusy] = useState(false);
-  const [dlgBusy, setDlgBusy] = useState<'' | 'files' | 'folder'>('');
+  const [dlgBusy, setDlgBusy] = useState<'' | 'files' | 'folder' | 'bak'>('');
   /* 存储卡统计：与列表分开口径（含字节数），随 sn-mem-changed 刷新 */
   const [stats, setStats] = useState<MemStorageStats | null>(null);
+  /* 批量导入进度（v4）：只承载 sn-mem-import-progress 的最后一帧；
+     null = 无进行中的批次（结束帧停留 600ms 后归位） */
+  const [importProg, setImportProg] = useState<MemImportProgress | null>(null);
   /* 检索防抖句柄 + 请求序号：250ms 内合并键击；序号守卫防慢的旧响应覆盖新响应 */
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const seqRef = useRef(0);
@@ -239,19 +248,42 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
   }, [confirmDelTs]);
 
   /* 存储卡统计：挂载拉取 + sn-mem-changed（采集/导入/删除/清理）后刷新。
-     独立订阅而非并入上方列表刷新：列表有防抖与序号守卫，字节数不需要跟着走 */
+     提为 useCallback 让事件订阅与治理按钮回调共用同一份口径——清理/整库
+     回滚后即便后端漏发事件，按钮路径也保证数字即时对齐 */
+  const pullStats = useCallback(() => {
+    memStorageStats()
+      .then(setStats)
+      .catch(() => {
+        /* 旧后端无此命令：存储卡静默不显示，不打扰既有功能 */
+      });
+  }, []);
+
   useEffect(() => {
-    const pull = () => {
-      memStorageStats()
-        .then(setStats)
-        .catch(() => {
-          /* 旧后端无此命令：存储卡静默不显示，不打扰既有功能 */
-        });
-    };
-    pull();
-    const un = listen('sn-mem-changed', pull);
+    pullStats();
+    const un = listen('sn-mem-changed', pullStats);
     return () => {
       un.then((f) => f());
+    };
+  }, [pullStats]);
+
+  /* 批量导入进度（v4）：后端逐文件广播 sn-mem-import-progress，挂载订阅一次。
+     与列表刷新解耦——进度只是瞬时反馈，不应牵动防抖检索。
+     单文件批次（total<=1）不出条：完成走既有 summary toast 即可；
+     结束帧（done==total 且 label 空）延迟 600ms 收起，让 100% 被看见 */
+  const progHideRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => {
+    const un = listen<MemImportProgress>('sn-mem-import-progress', (e) => {
+      const p = e.payload;
+      if (!p || p.total <= 1) return;
+      if (progHideRef.current) clearTimeout(progHideRef.current);
+      setImportProg(p);
+      if (p.done >= p.total && p.label === '') {
+        progHideRef.current = setTimeout(() => setImportProg(null), 600);
+      }
+    });
+    return () => {
+      un.then((f) => f());
+      if (progHideRef.current) clearTimeout(progHideRef.current);
     };
   }, []);
 
@@ -349,6 +381,84 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
       toast('记忆库已清空', 'ok');
     } catch (e) {
       toast(`清空失败：${String(e)}`, 'error');
+    }
+  };
+
+  /* ---- 软作废治理 / 备份（v4） ---- */
+
+  /* 恢复一条软作废：选乐观更新而非等 sn-mem-changed——软作废是本端过滤
+     口径，事件往返期间卡片会带着「已被取代」徽章滞留，先本地清零
+     supersededBy 让徽章即刻摘掉；失败时用 refresh 回滚到服务端真值。
+     不像置顶需要 override map：恢复是一锤子买卖，没有快速连点场景 */
+  const onRestore = async (ts: number) => {
+    setData((d) =>
+      d
+        ? {
+            ...d,
+            items: d.items.map((x) => (x.ts === ts ? { ...x, supersededBy: 0 } : x)),
+          }
+        : d,
+    );
+    try {
+      await memRestore(ts);
+      toast('已恢复', 'ok');
+    } catch (e) {
+      toast(`恢复失败：${String(e)}`, 'error');
+      refresh();
+    }
+  };
+
+  /* 物理清理全部软作废（不可恢复，ConfirmButton 已做两段确认）：
+     toast 用后端返回值——并发变动下实际清理数可能与存储卡显示不同 */
+  const onPurge = async () => {
+    try {
+      const n = await memPurgeSuperseded();
+      toast(`已清理 ${n} 条`, 'ok');
+      refresh();
+      pullStats();
+    } catch (e) {
+      toast(`清理失败：${String(e)}`, 'error');
+    }
+  };
+
+  /* 整库回滚：后端先把当前库另存 mem.pre-restore.json 再用备份顶替
+     （ConfirmButton 文案已点明后果）；Err 文案（如「没有可恢复的备份」）
+     由后端给出，这里原样透出 */
+  const onRestoreBackup = async () => {
+    try {
+      const n = await memRestoreBackup();
+      toast(`已恢复 ${n} 条`, 'ok');
+      refresh();
+      pullStats();
+    } catch (e) {
+      toast(`恢复失败：${String(e)}`, 'error');
+    }
+  };
+
+  /* 多设备迁移：选另一台设备「导出 JSON」得到的备份文件做合并导入。
+     只增不覆盖（近重复走既有合并）；与文件/目录导入共用 dlgBusy 互斥 */
+  const onImportBackup = async () => {
+    if (dlgBusy !== '') return;
+    let path: string | null = null;
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      path = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+    } catch {
+      toast('浏览器预览不支持选择文件', 'info');
+      return;
+    }
+    if (!path) return; // 对话框取消
+    setDlgBusy('bak');
+    try {
+      const s = await memImportBackup(path);
+      toast(`合并完成（${summaryText(s)}）`, 'ok');
+    } catch (e) {
+      toast(`合并导入失败：${String(e)}`, 'error');
+    } finally {
+      setDlgBusy('');
     }
   };
 
@@ -460,6 +570,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
       toast(`导入失败：${String(e)}`, 'error');
     } finally {
       setDlgBusy('');
+      // 兜底清进度条：结束帧事件若因异常丢失（emit 失败被后端吞掉），
+      // 600ms 收条定时器永远不会挂上，靠动作收尾强清
+      if (progHideRef.current) clearTimeout(progHideRef.current);
+      setImportProg(null);
     }
   };
 
@@ -482,6 +596,9 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
       toast(`导入失败：${String(e)}`, 'error');
     } finally {
       setDlgBusy('');
+      // 同文件导入：结束帧丢失时的进度条强清兜底
+      if (progHideRef.current) clearTimeout(progHideRef.current);
+      setImportProg(null);
     }
   };
 
@@ -508,6 +625,47 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
   } else if (visible.length > 0) {
     groups.push({ day: '', items: visible });
   }
+
+  /* ---- 安全态势（v4）：三条「记忆内容会不会离开本机」的通道 ----
+     纯展示无独立状态，全部由 cfg 现值推导；行文案即结论，用户不必自行
+     拼装「服务开没开 × 允不允许局域网 × 有没有令牌」的布尔矩阵 */
+  const ext = cfg.externalDisplay;
+  const token = m.apiToken.trim();
+  const lanOpen = ext.enabled && ext.allowLan;
+  const blLines = m.captureBlacklist.split('\n').filter((l) => l.trim() !== '').length;
+  /* 蒸馏的出网判定借用 llmReady：凭据不齐时后端本就静默跳过蒸馏，
+     此时标「将发送」是吓唬用户；真正的修复引导由上方 LLM 未就绪横幅承担 */
+  const llmBase = resolvedLlmCreds(cfg).baseUrl;
+  const distillActive = m.distill && llmReady(cfg);
+  const posture: { label: string; text: string; warn: boolean }[] = [
+    {
+      label: 'REST 暴露面',
+      text: !ext.enabled
+        ? '未启用（记忆仅本机）'
+        : !lanOpen
+          ? '仅本机'
+          : token !== ''
+            ? '局域网 · 令牌保护'
+            : '局域网 · ⚠ 未生成令牌（远程将被拒绝）',
+      warn: lanOpen && token === '',
+    },
+    {
+      label: '采集黑名单',
+      text: blLines > 0 ? `内置名单 + 自定义 ${blLines} 行` : '仅内置名单',
+      warn: false,
+    },
+    {
+      label: 'AI 蒸馏',
+      text: !m.distill
+        ? '关闭（内容不出本机）'
+        : !distillActive
+          ? '开启 · LLM 未就绪（蒸馏跳过，内容不出本机）'
+          : isLocalBaseUrl(llmBase)
+            ? '开启 · 本地推理'
+            : '开启 · 内容将发送至配置的 LLM 接口',
+      warn: distillActive && !isLocalBaseUrl(llmBase),
+    },
+  ];
 
   return (
     <>
@@ -559,6 +717,51 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             <span className="text-slate-700">·</span>
             <span className="tabular-nums font-medium text-slate-200">
               {stats.chars.toLocaleString()} 字
+            </span>
+          </div>
+        )}
+
+        {/* 治理与备份（v4）：软作废物理清理 / 整库回滚 / 多设备合并导入。
+            与存储条同一卡片语言成对出现（「看存储 → 管存储」动线），可见性
+            跟随 stats——旧后端无统计时整块隐藏。ConfirmButton 无 disabled
+            通道，空态退化为同款样式的禁用 Button 提示原因 */}
+        {stats && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-2.5">
+            <span className="shrink-0 text-[11.5px] leading-5 text-slate-500">🧹 治理</span>
+            {stats.superseded > 0 ? (
+              <ConfirmButton
+                label="清理已作废"
+                confirmLabel={`确认清理 ${stats.superseded} 条？`}
+                onConfirm={() => void onPurge()}
+                title="物理删除全部已作废条目（不可恢复）；已作废条目即使置顶也会一并清理，在世记忆不受影响"
+              />
+            ) : (
+              <Button disabled title="暂无已作废条目">
+                清理已作废
+              </Button>
+            )}
+            <span className="text-slate-700">·</span>
+            {stats.bakBytes > 0 ? (
+              <ConfirmButton
+                label="从备份恢复"
+                confirmLabel="确认整库回滚？"
+                onConfirm={() => void onRestoreBackup()}
+                title="当前库会先另存 mem.pre-restore.json，然后整库回滚到最近一次自动备份"
+              />
+            ) : (
+              <Button disabled title="暂无备份">
+                从备份恢复
+              </Button>
+            )}
+            <Button
+              onClick={() => void onImportBackup()}
+              disabled={dlgBusy !== ''}
+              title="选择另一台设备「导出 JSON」的备份文件合并进本机：只增不覆盖，近重复走既有合并"
+            >
+              {dlgBusy === 'bak' ? <Spinner size={14} /> : '从备份合并导入'}
+            </Button>
+            <span className="min-w-[240px] flex-1 text-[11px] leading-5 text-slate-600">
+              合并导入是多设备迁移路径：另一台设备导出的 JSON 拿来合并，不覆盖本机记忆
             </span>
           </div>
         )}
@@ -915,6 +1118,18 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             <span className="flex-1" />
                             {!selectMode && (
                               <span className="flex items-center gap-1 opacity-70 transition group-hover:opacity-100">
+                                {/* 恢复只出现在软作废卡上：软作废默认隐藏，能看到
+                                    本按钮即代表用户已开「⊘ 已作废」开关在治理视图中 */}
+                                {dead && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void onRestore(it.ts)}
+                                    title="撤销软作废：清空「被取代」标记，重新进入召回与检索"
+                                    className="rounded px-1.5 py-1 text-emerald-400 transition hover:bg-white/10 hover:text-emerald-300"
+                                  >
+                                    恢复
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -1073,6 +1288,34 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             </Field>
           </>
         )}
+
+        {/* 安全态势卡（v4）：放在采集设置末尾而不进 m.enabled 门内——
+            REST 暴露面与采集黑名单在关闭采集时依然生效，蒸馏在导入中心
+            手动导入时也可能触发；三行状态点给「内容出不出本机」一个直答 */}
+        <div className="space-y-2 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3">
+          <div className="flex items-center gap-2 text-[11px] text-slate-500">
+            <span>🛡</span>
+            <span>安全态势</span>
+            <span className="text-slate-600">记忆内容的暴露面，随上方配置即时更新</span>
+          </div>
+          {posture.map((r) => (
+            <div key={r.label} className="flex items-center gap-2 text-[11.5px] leading-5">
+              {/* 状态点只分正常/提醒两档：这张卡没有红色级别风险（最重是
+                  amber 提醒），三色反而暗示存在「危险」档误导用户 */}
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  r.warn ? 'bg-amber-400' : 'bg-emerald-400'
+                }`}
+              />
+              <span className="w-[72px] shrink-0 text-slate-500">{r.label}</span>
+              <span
+                className={`min-w-0 flex-1 ${r.warn ? 'text-amber-200/90' : 'text-slate-300'}`}
+              >
+                {r.text}
+              </span>
+            </div>
+          ))}
+        </div>
       </Section>
 
       {/* 导入中心（v3）：手动把外部资料灌进记忆库；与自动采集同一套入库管线
@@ -1082,6 +1325,31 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         title="导入与快记"
         desc="把网页、文件与临时念头灌进记忆库。所有导入都会做近重复合并（重复内容不另立条目，只累计次数）；「AI 蒸馏」开启时自动提炼关键词与标题，便于日后检索。"
       >
+        {/* 批量导入细进度条（v4）：置于导入区顶部而非某个 Field 内——
+            文件/目录/备份合并任一通道的批次都在这里反馈；窄条不抢焦点，
+            完成仍以各通道的 summary toast 为准 */}
+        {importProg && (
+          <div className="rounded-xl border border-sky-400/20 bg-sky-500/[0.05] px-4 py-2.5">
+            <div className="flex items-center justify-between gap-3 text-[11px]">
+              <span className="truncate font-mono text-slate-400" title={importProg.label}>
+                {importProg.label || '正在导入…'}
+              </span>
+              <span className="tabular-nums shrink-0 text-slate-500">
+                {importProg.done} / {importProg.total}
+              </span>
+            </div>
+            {/* total<=1 的批次根本不会进这个状态，Math.max 只是防御畸形 payload */}
+            <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-sky-400 transition-[width] duration-300"
+                style={{
+                  width: `${Math.min(100, (importProg.done / Math.max(1, importProg.total)) * 100)}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
         <Field
           label="快速记一条"
           hint="临时信息一键入库（如「例会改到周二上午」），与听写 / 取词同库同检索"

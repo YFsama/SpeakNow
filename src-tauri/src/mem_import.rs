@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 导入结果摘要（网页 / 文件 / 项目 / 快记共用，字段与 types.ts 契约冻结）
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -705,15 +705,30 @@ fn import_one_file(
 }
 
 /// 本地文件导入（多选）：title=文件名（去扩展名），app="导入"，kind="file"。
-/// 单文件失败只计 skipped，不影响其余文件
+/// 单文件失败只计 skipped，不影响其余文件。每处理完一个文件广播一次
+/// sn-mem-import-progress（前端画进度条），收尾补 label="" 的完成事件
 #[tauri::command]
 pub async fn mem_import_files(app: AppHandle, paths: Vec<String>) -> MemImportSummary {
     let limit = mem_limit(&app);
     let res = tauri::async_runtime::spawn_blocking(move || {
         let mut summary = MemImportSummary::default();
-        for p in &paths {
+        let total = paths.len() as u32;
+        for (i, p) in paths.iter().enumerate() {
             import_one_file(&app, Path::new(p), "导入", limit, &mut summary);
+            // done 用 i+1：本文件已处理完毕（含计 skipped 的失败文件——
+            // 对进度条而言「处理了但没入库」也是进度）。Emitter 线程安全，
+            // spawn_blocking 线程直接 emit
+            let label = Path::new(p)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let _ = app.emit(
+                "sn-mem-import-progress",
+                import_progress_event(i as u32 + 1, total, &label),
+            );
         }
+        // 收尾事件：label 置空是前端的「全部完成、收起进度条」信号
+        let _ = app.emit("sn-mem-import-progress", import_progress_event(total, total, ""));
         summary
     })
     .await;
@@ -797,7 +812,8 @@ pub async fn mem_import_folder(app: AppHandle, path: String) -> Result<MemImport
             skipped: overflow,
             ..Default::default()
         };
-        for f in &files {
+        let total = files.len() as u32;
+        for (i, f) in files.iter().enumerate() {
             // 越界断言：canonicalize 解析 junction/符号链接的最终目标，
             // 目标不在根目录树内即拒（TOCTOU 窗口内被替换同理）
             let canon = match f.canonicalize() {
@@ -812,8 +828,100 @@ pub async fn mem_import_folder(app: AppHandle, path: String) -> Result<MemImport
                 continue;
             }
             import_one_file(&app, &canon, &app_name, limit, &mut summary);
+            // 越界/解析失败跳过的文件也占一个 done：进度条按「已处理文件」
+            // 推进，否则 done 永远到不了 total
+            let label = f
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let _ = app.emit(
+                "sn-mem-import-progress",
+                import_progress_event(i as u32 + 1, total, &label),
+            );
         }
+        // 收尾事件：label 置空是前端的「全部完成、收起进度条」信号。Err
+        // 路径（路径不可访问/枚举失败）都发生在循环前，不会留半截进度条
+        let _ = app.emit("sn-mem-import-progress", import_progress_event(total, total, ""));
         Ok(summary)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    res
+}
+
+/* ---------- v4：备份合并导入 / 进度事件 ---------- */
+
+/// 备份 JSON 的大小上限：保留上限 500 条 × 单条 2 万码点的理论极值约
+/// 10MB，20MB 覆盖富余。超限整体拒绝而非像 read_capped 那样截断读——
+/// 截出来的半个 JSON 必然解析失败，明确的超限提示远比莫名的语法错误
+/// 更能指导用户
+const BACKUP_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 读备份文件（read_capped 同款 take 兜底，防 metadata 谎报与读取中途
+/// 文件变大）。备份导出必为 UTF-8 JSON：非 UTF-8 直接判「不是备份文件」
+fn read_backup_capped(path: &Path) -> Result<String, String> {
+    let f = fs::File::open(path).map_err(|e| format!("备份文件无法访问：{e}"))?;
+    let mut buf = Vec::new();
+    f.take(BACKUP_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("备份文件读取失败：{e}"))?;
+    if buf.len() as u64 > BACKUP_MAX_BYTES {
+        return Err("备份文件超过 20MB 上限".into());
+    }
+    String::from_utf8(buf).map_err(|_| "备份文件不是 UTF-8 文本".into())
+}
+
+/// 备份文档解析（纯函数）：兼容两种导出格式——顶层数组 [MemEntry,...] 与
+/// {items:[...]}。整体不是合法 JSON → Err（文件级失败，前端 toast）；合法
+/// JSON 但两种格式都不符，或单条缺必填字段 → 逐条计 skipped——一条坏数据
+/// 不拖垮整份备份。返回 (可入库条目, skipped 数)
+fn parse_backup_doc(text: &str) -> Result<(Vec<crate::mem::MemEntry>, u32), String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("备份文件不是有效 JSON：{e}"))?;
+    let arr: &[serde_json::Value] = match &doc {
+        serde_json::Value::Array(v) => v,
+        serde_json::Value::Object(m) => match m.get("items") {
+            Some(serde_json::Value::Array(v)) => v,
+            // 对象形态必须有 items 数组，其余（含 items 非数组）一律格式非法
+            _ => return Ok((Vec::new(), 1)),
+        },
+        _ => return Ok((Vec::new(), 1)),
+    };
+    let mut entries = Vec::new();
+    let mut skipped = 0u32;
+    for v in arr {
+        match serde_json::from_value::<crate::mem::MemEntry>(v.clone()) {
+            Ok(e) => entries.push(e),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((entries, skipped))
+}
+
+/// 进度事件载荷构造（纯函数）：字段名与冻结契约逐字对齐（done/total/
+/// label）。单文件与目录导入每处理完一个文件发一次，收尾发 label="" 的
+/// 完成事件；Emitter 线程安全，spawn_blocking 线程直接 emit 即可
+fn import_progress_event(done: u32, total: u32, label: &str) -> serde_json::Value {
+    serde_json::json!({ "done": done, "total": total, "label": label })
+}
+
+/// v4 备份合并导入（多设备迁移）：前端用系统对话框选定导出的 JSON，这里
+/// 读文件 + 解析 + 合并入库。合并语义（同 ts 就地更新、计数取大、近重复
+/// 只加 hits）见 mem::merge_backup_core 注释——多设备间不丢任何一侧的
+/// 使用记录。文件 IO 与解析全在阻塞线程，锁内只有 mem::import_backup_batch
+/// 的快照与合并
+#[tauri::command]
+pub async fn mem_import_backup(app: AppHandle, path: String) -> Result<MemImportSummary, String> {
+    let limit = mem_limit(&app);
+    let res = tauri::async_runtime::spawn_blocking(move || -> Result<MemImportSummary, String> {
+        let text = read_backup_capped(Path::new(&path))?;
+        let (entries, skipped) = parse_backup_doc(&text)?;
+        let (added, merged, evicted) = crate::mem::import_backup_batch(&app, entries, limit);
+        Ok(MemImportSummary {
+            added,
+            merged,
+            skipped: skipped + evicted,
+        })
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1391,5 +1499,92 @@ mod tests {
         assert_eq!(j, "{\"added\":3,\"merged\":2,\"skipped\":1}", "字段名与冻结契约一致");
         let back: MemImportSummary = serde_json::from_str(&j).unwrap();
         assert_eq!(back, s);
+    }
+
+    /* ---- v4：备份解析 / 大小上限 / 进度事件 ---- */
+
+    #[test]
+    fn parse_backup_doc_accepts_both_formats() {
+        // 顶层数组（直接导出 mem.json 的形态）
+        let arr = r#"[{"ts":1,"kind":"note","app":"","title":"a","text":"内容","chars":2},
+                      {"ts":2,"kind":"ocr","app":"chrome","title":"b","text":"y","chars":1}]"#;
+        let (es, sk) = parse_backup_doc(arr).unwrap();
+        assert_eq!((es.len(), sk), (2, 0));
+        assert_eq!(es[0].ts, 1);
+        // {items:[...]} 形态（工具包装导出）
+        let obj = r#"{"items":[{"ts":3,"kind":"note","app":"","title":"c","text":"z","chars":1}]}"#;
+        let (es, sk) = parse_backup_doc(obj).unwrap();
+        assert_eq!((es.len(), sk), (1, 0));
+        assert_eq!(es[0].ts, 3);
+        // v1/v2 老备份缺 v3 字段：#[serde(default)] 缺省容错照常入库
+        let legacy = r#"[{"ts":4,"kind":"dictation","app":"","title":"t","text":"x","chars":1}]"#;
+        let (es, sk) = parse_backup_doc(legacy).unwrap();
+        assert_eq!((es.len(), sk), (1, 0));
+        assert_eq!(es[0].superseded_by, 0);
+    }
+
+    #[test]
+    fn parse_backup_doc_counts_bad_entries_and_formats() {
+        // 单条缺必填字段（无 ts）→ 该条 skipped，其余照常入库
+        let mixed = r#"[{"ts":1,"kind":"note","app":"","title":"a","text":"x","chars":1},
+                        {"kind":"note"}]"#;
+        let (es, sk) = parse_backup_doc(mixed).unwrap();
+        assert_eq!((es.len(), sk), (1, 1));
+        // 数组里混非对象元素 → 逐条 skipped
+        let mixed = r#"[1,"x",null]"#;
+        let (es, sk) = parse_backup_doc(mixed).unwrap();
+        assert_eq!((es.len(), sk), (0, 3));
+        // 合法 JSON 但格式非法（对象无 items / items 非数组 / 标量）→ skipped 1
+        for bad in [r#"{"foo":1}"#, r#"{"items":{"a":1}}"#, "123", "\"x\""] {
+            let (es, sk) = parse_backup_doc(bad).unwrap();
+            assert_eq!((es.len(), sk), (0, 1), "格式非法计 skipped：{bad}");
+        }
+        // 整体语法非法 → Err（文件级失败，前端 toast）
+        assert!(parse_backup_doc("不是 JSON").is_err());
+        assert!(parse_backup_doc("").is_err());
+        assert!(parse_backup_doc("{\"ts\":1,").is_err());
+    }
+
+    #[test]
+    fn read_backup_capped_limit_and_utf8() {
+        let root = temp_root("bakcap");
+        // 超限拒：截断读出的半个 JSON 必然解析失败，拒绝比截断更有指导性
+        let p = root.join("big.json");
+        let mut data = Vec::with_capacity(BACKUP_MAX_BYTES as usize + 17);
+        data.push(b'[');
+        data.extend(std::iter::repeat_n(b'x', BACKUP_MAX_BYTES as usize + 16));
+        fs::write(&p, &data).unwrap();
+        let err = read_backup_capped(&p).unwrap_err();
+        assert!(err.contains("20MB"), "{err}");
+        // 恰好等限：放行（take 多读 1 字元只是超限探针）
+        let edge = root.join("edge.json");
+        fs::write(&edge, std::iter::repeat_n(b'a', BACKUP_MAX_BYTES as usize).collect::<Vec<u8>>()).unwrap();
+        assert_eq!(read_backup_capped(&edge).unwrap().len(), BACKUP_MAX_BYTES as usize);
+        // 非 UTF-8 → 判不是备份文件
+        let bin = root.join("bin.json");
+        fs::write(&bin, [0xffu8, 0xfe, 0x00, 0x42]).unwrap();
+        let err = read_backup_capped(&bin).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+        // 不存在 → Err
+        assert!(read_backup_capped(&root.join("none.json")).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_progress_event_contract_fields() {
+        let v = import_progress_event(2, 5, "笔记.md");
+        assert_eq!(v["done"], 2);
+        assert_eq!(v["total"], 5);
+        assert_eq!(v["label"], "笔记.md");
+        // 键集与冻结契约一致（done/total/label 三键，无多余字段；serde_json
+        // 默认按字典序存键，比较前排序）
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["done", "label", "total"]);
+        // 收尾事件：done=total 且 label 空串（前端收进度条的信号）
+        let end = import_progress_event(5, 5, "");
+        assert_eq!(end["done"], 5);
+        assert_eq!(end["total"], 5);
+        assert_eq!(end["label"], "");
     }
 }

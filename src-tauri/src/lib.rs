@@ -1437,6 +1437,11 @@ pub fn run() {
             mem_import::mem_import_url,
             mem_import::mem_import_files,
             mem_import::mem_import_folder,
+            // v4：软作废治理 / 备份恢复 / 备份合并导入
+            mem::mem_restore,
+            mem::mem_purge_superseded,
+            mem::mem_restore_backup,
+            mem_import::mem_import_backup,
             ocr_screen_source,
             copy_text,
             dismiss_overlay,

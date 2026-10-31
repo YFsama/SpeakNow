@@ -185,6 +185,18 @@ export const memStorageStats = () =>
   invoke<MemStorageStats>('mem_storage_stats');
 /** 生成（或轮换）记忆 REST 令牌并保存，返回新令牌 */
 export const memGenToken = () => invoke<string>('mem_gen_token');
+
+/* ============ 记忆库 v4：治理 / 备份 / 多设备 ============ */
+
+/** 恢复一条软作废记忆（supersededBy 清零，重新进入召回与 context） */
+export const memRestore = (ts: number) => invoke('mem_restore', { ts });
+/** 物理清理全部软作废条目，返回清除条数（不可恢复，前端负责二次确认） */
+export const memPurgeSuperseded = () => invoke<number>('mem_purge_superseded');
+/** 从 mem.bak 恢复整个记忆库：当前库先另存 mem.pre-restore.json 防手滑，返回恢复条数 */
+export const memRestoreBackup = () => invoke<number>('mem_restore_backup');
+/** 从导出的 JSON 备份合并导入（多设备迁移）：同 ts 条目合并计数，近重复走既有合并 */
+export const memImportBackup = (path: string) =>
+  invoke<MemImportSummary>('mem_import_backup', { path });
 /** 截取选区窗自身物理区域为 PNG base64（截图框选放大镜数据源） */
 export const ocrScreenSource = (x: number, y: number, w: number, h: number) =>
   invoke<{ png: string; width: number; height: number }>('ocr_screen_source', { x, y, w, h });

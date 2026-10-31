@@ -1020,6 +1020,187 @@ pub async fn mem_gen_token(app: AppHandle) -> Result<String, String> {
     Ok(token)
 }
 
+/* ---------- v4：软作废治理 / 备份恢复 / 备份合并导入 ---------- */
+
+/// 恢复软作废的纯逻辑：命中且已作废 → 清零返回 true；未命中 / 本就在世 →
+/// false（命令层只在 true 时落盘，false 仍广播一次让前端乐观清零被真实
+/// 库状态纠正——与 mock 的无条件 emit 同口径）
+fn apply_restore(items: &mut [MemEntry], ts: i64) -> bool {
+    match items.iter_mut().find(|e| e.ts == ts) {
+        Some(e) if e.superseded_by != 0 => {
+            e.superseded_by = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// v4 恢复一条软作废记忆（superseded_by 清零即重回召回与 context）。
+/// 条目不存在时静默（并发删除不是错误，前端无需 toast）
+#[tauri::command]
+pub fn mem_restore(app: AppHandle, ts: i64) {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut items = load(&app);
+    if apply_restore(&mut items, ts) {
+        write(&app, &items);
+    } else {
+        // 未命中也广播：前端点按钮时已乐观清零徽章，这次广播把列表拉回
+        // 真实状态（条目确实不存在时刷新一次也无害）
+        let _ = app.emit("sn-mem-changed", ());
+    }
+}
+
+/// 物理清理的纯逻辑：删除全部软作废条目，返回删除数。置顶不作豁免——
+/// v3 起置顶只是展示权重，作废条目本就不进召回与 context，留着只占空间
+fn apply_purge(items: &mut Vec<MemEntry>) -> u32 {
+    let before = items.len();
+    items.retain(|e| e.superseded_by == 0);
+    (before - items.len()) as u32
+}
+
+/// v4 物理清理全部软作废条目，返回清除条数（不可恢复，二次确认在前端）。
+/// v3 的「作废优先于删除」让裁决误判可逆，本命令是用户腾空间的显式最终
+/// 一步——删掉的是确认无用的过时记忆
+#[tauri::command]
+pub fn mem_purge_superseded(app: AppHandle) -> u32 {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut items = load(&app);
+    let removed = apply_purge(&mut items);
+    if removed > 0 {
+        write(&app, &items);
+    }
+    removed
+}
+
+/// 整库恢复的路径版（命令层补锁与广播；单测直接驱动三步序）。三步顺序
+/// 是防手滑关键，不可调换：
+/// ① mem.bak 必须先在且可读——不存在 / 读失败直接 Err，主库分毫未动；
+/// ② 当前 mem.json 先复制为 mem.pre-restore.json——atomic_write 落盘那一刻
+///    bak 就被轮换成恢复前的主库内容，pre-restore 从此是事后唯一能回到
+///    恢复前状态的副本，必须先于一切写动作存在；
+/// ③ 解析 bak 放在覆盖主库之前——坏备份报 Err 时主库原封不动（此时最多
+///    多出一份与主库相同的 pre-restore 副本，无害）；
+/// ④ 才原子写 mem.json（write_at → config::atomic_write，自动再轮换 bak）
+fn restore_backup_at(p: &std::path::Path) -> Result<u32, String> {
+    let bak = p.with_extension("bak");
+    if !bak.exists() {
+        return Err("没有可恢复的备份".into());
+    }
+    let bak_text = fs::read_to_string(&bak).map_err(|e| format!("备份读取失败：{e}"))?;
+    if p.exists() {
+        fs::copy(p, p.with_extension("pre-restore.json"))
+            .map_err(|e| format!("恢复前备份失败：{e}"))?;
+    }
+    let items: Vec<MemEntry> =
+        serde_json::from_str(&bak_text).map_err(|e| format!("备份解析失败：{e}"))?;
+    let n = items.len() as u32;
+    write_at(p, &items);
+    Ok(n)
+}
+
+/// v4 从 mem.bak 整库恢复（存储卡的「恢复备份」）。文件 IO 走 spawn_blocking，
+/// STORE_LOCK 全程持有：整库替换若与采集/命令的读-改-写交错，并发 write 会
+/// 夹在 pre-restore 副本与覆盖之间——副本与实际被覆盖的内容不一致，手滑
+/// 保险就名存实亡
+#[tauri::command]
+pub async fn mem_restore_backup(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<u32, String> {
+        let p = path(&app).map_err(|e| e.to_string())?;
+        let n = {
+            let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            restore_backup_at(&p)?
+        };
+        let _ = app.emit("sn-mem-changed", ());
+        Ok(n)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 同 ts 双边合并（纯函数）。字段级语义是多设备迁移不丢使用记录的关键：
+/// - 计数类（pinned/hits/uses/lastUsedAt）取两边较大值：两台设备各自的
+///   真实使用都该保留，取小或取导入方都会伪造「没用过」
+/// - 内容类（title/text/keywords）取导入方非空值：导入是用户显式动作，
+///   备份里非空说明那台设备蒸馏/编辑出了更好版本；空则保留本地
+/// - distilled 任一侧为真即真：它守护的是「已有蒸馏成果，迟到任务别再
+///   覆盖标题」（apply_distill 的同一守卫）
+/// - kind/app/superseded_by 保留本地：来源进程与软作废裁决是本机事实，
+///   导入方无权改写；chars 随 text 重算，永远与正文同口径
+fn merge_entry(local: &mut MemEntry, imp: MemEntry) {
+    local.pinned = local.pinned || imp.pinned;
+    local.hits = local.hits.max(imp.hits);
+    local.uses = local.uses.max(imp.uses);
+    local.last_used_at = local.last_used_at.max(imp.last_used_at);
+    if !imp.title.is_empty() {
+        local.title = imp.title;
+    }
+    if !imp.text.is_empty() {
+        local.text = imp.text;
+    }
+    if !imp.keywords.is_empty() {
+        local.keywords = imp.keywords;
+    }
+    local.distilled = local.distilled || imp.distilled;
+    local.chars = local.text.chars().count() as u32;
+}
+
+/// v4 备份合并导入的核心（纯逻辑，调用方持锁完成 load）：逐条按 ts 寻址。
+/// 同 ts → 就地合并（见 merge_entry）而非重复插入——ts 在本库兼作主键，
+/// 两台设备对同一条记忆各自累积的使用记录必须汇成一条；新 ts → 先过
+/// bump_near_duplicate（同内容只加旧条 hits，不重复入库），否则原样保留
+/// 导入 ts 插入——ts 是跨设备的采集时刻，改写会伪造时间线。
+/// app 统一 normalize（手编备份可能带 "Chrome.exe" 原始串，不规整会让
+/// near-dup 的 kind+app 匹配失配）。返回 (新增, 合并, 本批新条 ts 清单)
+pub(crate) fn merge_backup_core(
+    items: &mut Vec<MemEntry>,
+    incoming: Vec<MemEntry>,
+) -> (u32, u32, Vec<i64>) {
+    let mut added = 0u32;
+    let mut merged = 0u32;
+    let mut new_ts: Vec<i64> = Vec::new();
+    for mut imp in incoming {
+        imp.app = normalize_app(&imp.app);
+        if let Some(local) = items.iter_mut().find(|e| e.ts == imp.ts) {
+            merge_entry(local, imp);
+            merged += 1;
+            continue;
+        }
+        if bump_near_duplicate(items, &imp.kind, &imp.app, &imp.text) {
+            merged += 1;
+            continue;
+        }
+        new_ts.push(imp.ts);
+        items.insert(0, imp);
+        added += 1;
+    }
+    // 备份里比本地旧得多的条目 insert(0) 会打乱降序，而滚动清理与 capture
+    // 的「保新弃旧」都假设新→旧有序，收尾整体重排
+    items.sort_by(|a, b| b.ts.cmp(&a.ts));
+    (added, merged, new_ts)
+}
+
+/// 备份合并的入库通道（mem_import::mem_import_backup 调用）：锁内一次
+/// load → 合并 → 滚动清理 → write（含广播）。文件读取与 JSON 解析在调用
+/// 方的阻塞线程完成，锁内只有内存操作
+/// 返回 (实际留存的新增数, 合并条数, 被滚动清理挤出的本批条数)
+pub(crate) fn import_backup_batch(
+    app: &AppHandle,
+    incoming: Vec<MemEntry>,
+    limit: usize,
+) -> (u32, u32, u32) {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut items = load(app);
+    let (added, merged, new_ts) = merge_backup_core(&mut items, incoming);
+    if added > 0 || merged > 0 {
+        items = truncate_keep_pinned(items, limit);
+        write(app, &items);
+    }
+    // 与 import_batch 同口径：added 以滚动清理后实际留存为准，被挤出的
+    // 并入第三个返回值——「合并完成（新增 N）」才不虚报迁移结果
+    let kept = new_ts.iter().filter(|t| items.iter().any(|e| e.ts == **t)).count() as u32;
+    (kept, merged, added - kept)
+}
+
 /* ---------- v2：召回 / 使用计数 / 工作记忆 ---------- */
 
 /// 实际使用计数的纯逻辑部分：找到 ts 对应条目则 uses+=1、last_used_at=now，
@@ -1945,5 +2126,160 @@ mod tests {
         assert_ne!(t1, t2, "两次生成不应碰撞（62^24 空间）");
         // 完整令牌形态在命令层拼 sn- 前缀，这里校验字母表覆盖假设
         assert_eq!(TOKEN_ALPHABET.len(), 62);
+    }
+
+    /* ---- v4：软作废治理 / 备份恢复 / 备份合并 ---- */
+
+    /// mem.rs 侧文件级测试的临时目录（mem_import.rs 的 temp_root 同款手法）
+    fn temp_dir_for(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("speaknow-mem-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn apply_restore_clears_superseded_only_when_needed() {
+        let mut items = vec![
+            entry(10, "dictation", "旧说法", "旧正文", &[]),
+            entry(20, "ocr", "新说法", "新正文", &[]),
+        ];
+        items[0].superseded_by = 99;
+        assert!(apply_restore(&mut items, 10), "已作废 → 清零");
+        assert_eq!(items[0].superseded_by, 0);
+        assert!(!apply_restore(&mut items, 10), "本就在世 → 无变更不落盘");
+        assert!(!apply_restore(&mut items, 404), "不存在 → 静默（不报错）");
+        assert_eq!(items.len(), 2, "恢复绝不删条");
+        assert_eq!(items[1].superseded_by, 0, "只动目标条");
+    }
+
+    #[test]
+    fn apply_purge_counts_and_leaves_only_alive() {
+        let mut items = vec![
+            entry(1, "dictation", "a", "aa", &[]),
+            entry(2, "ocr", "b", "bb", &[]),
+            entry(3, "dictation", "c", "cc", &[]),
+            entry(4, "translate", "d", "dd", &[]),
+        ];
+        items[0].superseded_by = 9;
+        items[2].superseded_by = 8;
+        items[2].pinned = true; // 置顶 + 作废：一并清理（置顶不作豁免）
+        let removed = apply_purge(&mut items);
+        assert_eq!(removed, 2, "计数 = 被删的作废条数");
+        let ts: Vec<i64> = items.iter().map(|e| e.ts).collect();
+        assert_eq!(ts, vec![2, 4], "只剩在世条目");
+        assert_eq!(apply_purge(&mut Vec::new()), 0, "空库删 0");
+    }
+
+    #[test]
+    fn restore_backup_at_three_step_sequence() {
+        let dir = temp_dir_for("restore");
+        let p = path_at(&dir);
+        // ① bak 缺席：Err 且不产生任何文件（连 pre-restore 都不该有）
+        assert_eq!(restore_backup_at(&p).unwrap_err(), "没有可恢复的备份");
+        assert!(!p.exists());
+        assert!(!p.with_extension("pre-restore.json").exists());
+
+        // 正常序列：主库两条，bak 是「上一份完好内容」一条
+        let a = entry(10, "dictation", "a", "aa", &[]);
+        let b = entry(20, "ocr", "b", "bb", &[]);
+        write_at(&p, &[a.clone(), b.clone()]);
+        let c = entry(5, "note", "c", "cc", &[]);
+        fs::write(
+            p.with_extension("bak"),
+            serde_json::to_string(&vec![c.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restore_backup_at(&p).unwrap(), 1, "返回恢复后的条数");
+        // ④ 主库 = bak 内容
+        assert_eq!(load_at(&p), vec![c]);
+        // ② pre-restore 保存的是恢复前主库（手滑保险，先于覆盖存在）
+        assert_eq!(
+            load_at(&p.with_extension("pre-restore.json")),
+            vec![a, b],
+            "恢复前主库必须先落 pre-restore"
+        );
+
+        // ③ 坏 bak：Err 且主库不动（仍是上一次恢复后的内容）
+        fs::write(p.with_extension("bak"), "{坏的备份").unwrap();
+        let err = restore_backup_at(&p).unwrap_err();
+        assert!(err.contains("解析失败"), "{err}");
+        assert_eq!(load_at(&p).len(), 1, "坏 bak 绝不动原库");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_backup_without_main_library_still_restores() {
+        // 极端情形：主库不存在（换机后手工放置 bak）。无 pre-restore 可存，
+        // 恢复仍要成功——bak 里就是全部家当
+        let dir = temp_dir_for("restore-empty");
+        let p = path_at(&dir);
+        let e = entry(7, "note", "t", "x", &[]);
+        fs::write(
+            p.with_extension("bak"),
+            serde_json::to_string(&vec![e.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restore_backup_at(&p).unwrap(), 1);
+        assert_eq!(load_at(&p), vec![e]);
+        assert!(!p.with_extension("pre-restore.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_backup_same_ts_takes_max_and_nonempty_imported() {
+        let mut local = entry(100, "dictation", "本地标题", "本地正文", &[]);
+        local.uses = 3;
+        local.hits = 2;
+        local.last_used_at = 500;
+        let mut imp = entry(100, "dictation", "远端标题", "远端正文", &["远端关键词"]);
+        imp.uses = 7;
+        imp.hits = 1;
+        imp.last_used_at = 900;
+        imp.pinned = true;
+        let mut items = vec![local];
+        let (added, merged, _) = merge_backup_core(&mut items, vec![imp]);
+        assert_eq!((added, merged), (0, 1), "同 ts 就地更新而非重复插入");
+        assert_eq!(items.len(), 1);
+        let e = &items[0];
+        assert_eq!((e.uses, e.hits, e.last_used_at), (7, 2, 900), "计数类取两边较大值");
+        assert!(e.pinned, "置顶取或");
+        assert_eq!(e.title, "远端标题");
+        assert_eq!(e.text, "远端正文");
+        assert_eq!(e.keywords, vec!["远端关键词".to_string()]);
+        assert!(e.distilled, "任一侧蒸馏过即视为已蒸馏");
+        assert_eq!(e.chars as usize, "远端正文".chars().count(), "chars 随 text 重算");
+
+        // 导入方内容为空 → 保留本地；计数仍取大（不回退）
+        let mut imp2 = entry(100, "dictation", "", "", &[]);
+        imp2.uses = 0;
+        imp2.hits = 9;
+        let (added, merged, _) = merge_backup_core(&mut items, vec![imp2]);
+        assert_eq!((added, merged), (0, 1));
+        assert_eq!(items[0].title, "远端标题");
+        assert_eq!(items[0].text, "远端正文");
+        assert_eq!((items[0].uses, items[0].hits), (7, 9));
+    }
+
+    #[test]
+    fn merge_backup_near_dup_bumps_and_new_ts_preserved() {
+        let mut items = vec![entry(50, "dictation", "t", "会议改到下午三点", &[])];
+        // 新 ts + 近重复内容（bigram Jaccard ≥0.75，同 kind+app）：旧条
+        // hits+1，不新建条目
+        let dup = entry(900, "dictation", "t2", "会议改到下午三点半", &[]);
+        let (added, merged, _) = merge_backup_core(&mut items, vec![dup]);
+        assert_eq!((added, merged), (0, 1));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].hits, 1);
+
+        // 新 ts + 全新内容：原样入库且保留导入 ts，整体按 ts 降序重排
+        let fresh = entry(800, "ocr", "t3", "完全不同的新记忆内容", &[]);
+        let (added, merged, _) = merge_backup_core(&mut items, vec![fresh]);
+        assert_eq!((added, merged), (1, 0));
+        assert_eq!(
+            items.iter().map(|e| e.ts).collect::<Vec<_>>(),
+            vec![800, 50],
+            "导入 ts 保留 + 降序重排"
+        );
     }
 }

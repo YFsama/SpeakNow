@@ -175,3 +175,21 @@ curl http://127.0.0.1:8866/mem/search?q=部署
 curl -H "X-SN-API-Key: sn-xxxxxxxx" "http://192.168.1.10:8866/mem/context.md"
 # 缺令牌/错令牌 → 401 unauthorized
 ```
+
+### `POST /mem/add`（v4 起，唯一写端点）
+
+向记忆库推送一条记忆（其他设备 / 脚本 / 自动化用）。鉴权与读端点同套
+（本机免钥，局域网须令牌）；进程内限流 10 次/秒。
+
+```bash
+curl -X POST http://127.0.0.1:8866/mem/add \
+  -H "Content-Type: application/json" \
+  -d '{"text":"服务器年费 3 月 15 日续期","kind":"note","app":"phone"}'
+# → {"ok":true,"summary":{"added":1,"merged":0,"skipped":0}}
+```
+
+- `text` 必填（≤20000 码点）；`kind` 可选（note/dictation/ocr/translate/web/file，默认 note）；`app`/`title` 可选
+- 同内容已存在时走近重复合并（hits +1），响应 `merged:1`
+- 局域网示例：`curl -H "X-SN-API-Key: sn-xxx" -X POST http://<LAN IP>:8866/mem/add ...`
+> `summary.skipped` 在本端点含「被滚动清理挤出的条数」（记忆库超出保留
+> 上限时的正常现象，非错误）。
