@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Button, ConfirmButton, Field, Section, Spinner, TextArea, TextInput, Toggle } from '../Controls';
+import { MemGraph } from './MemGraph';
+import { MemInsights } from './MemInsights';
 import {
   copyText,
   exportText,
@@ -194,6 +197,13 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
   /* 批量导入进度（v4）：只承载 sn-mem-import-progress 的最后一帧；
      null = 无进行中的批次（结束帧停留 600ms 后归位） */
   const [importProg, setImportProg] = useState<MemImportProgress | null>(null);
+  /* 视图切换（v5）：时间轴（默认）/ 知识图谱 / 洞察。纯前端 state，
+     切换不影响时间轴的检索/多选/导出等既有状态 */
+  const [view, setView] = useState<'timeline' | 'graph' | 'insights'>('timeline');
+  /* 图谱/洞察的全量数据（与时间轴的 500 条查询分开拉取，进入视图才拉） */
+  const [full, setFull] = useState<MemEntry[] | null>(null);
+  const [fullErr, setFullErr] = useState(false);
+  const fullSeq = useRef(0);
   /* 检索防抖句柄 + 请求序号：250ms 内合并键击；序号守卫防慢的旧响应覆盖新响应 */
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const seqRef = useRef(0);
@@ -286,6 +296,64 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
       if (progHideRef.current) clearTimeout(progHideRef.current);
     };
   }, []);
+
+  /* 图谱/洞察（v5）：进入视图时全量拉取一次（10000 上限兜底），视图内订阅
+     sn-mem-changed 保持同步；回到时间轴即退订——时间轴仍走上方 500 条防抖
+     链路，两条数据通道互不牵动 */
+  const pullFull = useCallback(() => {
+    const seq = ++fullSeq.current;
+    setFullErr(false);
+    memList('', null, 10000)
+      .then((r) => {
+        if (fullSeq.current === seq) setFull(r.items);
+      })
+      .catch(() => {
+        if (fullSeq.current === seq) setFullErr(true);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (view === 'timeline') return;
+    pullFull();
+    const un = listen('sn-mem-changed', pullFull);
+    return () => {
+      un.then((f) => f());
+    };
+  }, [view, pullFull]);
+
+  /* 软作废与时间轴默认口径一致地滤掉；useMemo 稳定引用是图谱物理不重启的
+     前提（items 引用变一次 = 整张图重新布局） */
+  const aliveFull = useMemo(
+    () => (full ?? []).filter((it) => !isSuperseded(it)),
+    [full],
+  );
+
+  /* 图谱/洞察能看到的关键词 → 回填搜索并切回时间轴：复用既有防抖检索链路 */
+  const pickKeyword = useCallback((kw: string) => {
+    setQuery(kw);
+    setView('timeline');
+  }, []);
+
+  /* 图谱/洞察共用加载门面：全量数据未就绪/失败时统一占位 */
+  const fullGate = (child: ReactNode): ReactNode =>
+    fullErr ? (
+      <div className="rounded-lg border border-dashed border-red-500/25 py-8 text-center text-xs leading-6 text-slate-500">
+        记忆加载失败
+        <button
+          type="button"
+          onClick={pullFull}
+          className="ml-2 text-sky-400 transition hover:text-sky-300"
+        >
+          重试
+        </button>
+      </div>
+    ) : full === null ? (
+      <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs text-slate-600">
+        加载中…
+      </div>
+    ) : (
+      child
+    );
 
   const m = cfg.mem;
   const items = data?.items ?? [];
@@ -766,8 +834,35 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
           </div>
         )}
 
+        {/* 视图切换（v5）：时间轴 / 图谱 / 洞察。图谱与洞察自带过滤
+            （时间档位/模式），切换后隐藏搜索与类型 chips 避免两套过滤器打架 */}
+        <div className="flex rounded-full border border-white/10 bg-black/20 p-0.5">
+          {(
+            [
+              { v: 'timeline', label: '📋 时间轴' },
+              { v: 'graph', label: '🕸 图谱' },
+              { v: 'insights', label: '📊 洞察' },
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.v}
+              type="button"
+              onClick={() => setView(o.v)}
+              aria-pressed={view === o.v}
+              className={`rounded-full px-3.5 py-1.5 text-[11.5px] transition ${
+                view === o.v
+                  ? 'bg-sky-500/15 text-sky-300'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+
         {/* 搜索 + 结果数 + 多选入口 */}
-        <div className="flex flex-wrap items-center gap-3">
+        {view === 'timeline' && (
+          <div className="flex flex-wrap items-center gap-3">
           <div className="relative min-w-[200px] flex-1">
             <TextInput
               value={query}
@@ -802,11 +897,14 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               {selectMode ? '退出选择' : '选择'}
             </Button>
           )}
-        </div>
+          </div>
+        )}
 
-        {/* 类型过滤 + 置顶过滤 + 导出/清空 */}
+        {/* 类型过滤 + 置顶过滤 + 导出/清空：类型 chips 仅时间轴可见（图谱/洞察
+            自带过滤）；导出/清空对全库操作，任何视图都保持可达 */}
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-1.5">
+          {view === 'timeline' && (
+            <div className="flex flex-wrap items-center gap-1.5">
             {/* 类型 chips 含 v3 导入来源（快记/网页/文件）：导入的内容也要能一键筛出 */}
             {(
               ['', 'dictation', 'ocr', 'translate', 'note', 'web', 'file'] as const
@@ -855,7 +953,8 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             >
               ⊘ 已作废
             </button>
-          </div>
+            </div>
+          )}
           {(data?.total ?? 0) > 0 && (
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] text-slate-500">导出</span>
@@ -893,7 +992,12 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
           </div>
         )}
 
-        {loadErr ? (
+        {/* 主体区按视图切换：图谱/洞察只换这一块，采集横幅与统计带全视图共享 */}
+        {view === 'graph'
+          ? fullGate(<MemGraph items={aliveFull} onPickKeyword={pickKeyword} />)
+          : view === 'insights'
+            ? fullGate(<MemInsights items={aliveFull} onPickKeyword={pickKeyword} />)
+            : loadErr ? (
           <div className="rounded-lg border border-dashed border-red-500/25 py-8 text-center text-xs leading-6 text-slate-500">
             记忆加载失败
             <button
