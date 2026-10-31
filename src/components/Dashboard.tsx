@@ -1,17 +1,59 @@
 import { useEffect, useMemo, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import type { Stage, TabProps, UsageStats } from '../types';
+import type { MemListResult, Stage, TabProps, UsageStats } from '../types';
 import { resolvedAsrCreds, resolvedLlmCreds } from '../types';
 import {
   isMac,
   copyText,
   getStats,
+  memList,
   ocrCapture,
   openTypist,
   shortcutChips,
   translateSelection,
 } from '../api';
 import { Button, Segmented, Toggle } from './Controls';
+
+/* Hero 徽章里的白色麦克风：与侧栏 Logo 同形（App.tsx 的 MicLogo 未导出，
+   刻意就地复制一份，避免 Dashboard ↔ App 相互 import 形成环） */
+function MicGlyph({ size = 22 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <rect x="9" y="3" width="6" height="11" rx="3" fill="white" />
+      <path
+        d="M5 11a7 7 0 0 0 14 0"
+        stroke="white"
+        strokeWidth="2"
+        strokeLinecap="round"
+        fill="none"
+      />
+      <path d="M12 18v3" stroke="white" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/* 记忆速览卡的大脑图标：与侧栏「记忆」导航同形（violet→sky 双色渐变着色） */
+function BrainGlyph({ size = 20 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 5.2a2.6 2.6 0 0 0-4.8 1.3A2.4 2.4 0 0 0 5 8.9c0 .7.3 1.3.8 1.7-.5.4-.8 1-.8 1.7a2.4 2.4 0 0 0 2.2 2.4A2.6 2.6 0 0 0 12 17z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M12 5.2a2.6 2.6 0 0 1 4.8 1.3 2.4 2.4 0 0 1 2.2 2.4c0 .7-.3 1.3-.8 1.7.5.4.8 1 .8 1.7a2.4 2.4 0 0 1-2.2 2.4A2.6 2.6 0 0 1 12 17z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M12 5.2V17" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 const STAGE_INFO: Record<
   Stage,
@@ -125,6 +167,31 @@ export default function Dashboard({
     };
     pull();
     void listen('sn-history-changed', pull).then((f) => {
+      un = f;
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
+
+  /* 记忆速览：只取统计（limit=1 不拉正文）。挂载拉一次 + sn-mem-changed 刷新；
+     旧后端无 mem_list 时保持 null，卡片以空态文案展示而不是白屏 */
+  const [mem, setMem] = useState<MemListResult | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    const pull = () => {
+      memList('', null, 1)
+        .then((r) => {
+          if (alive) setMem(r);
+        })
+        .catch(() => {
+          if (alive) setMem(null);
+        });
+    };
+    pull();
+    void listen('sn-mem-changed', pull).then((f) => {
       un = f;
     });
     return () => {
@@ -339,8 +406,9 @@ export default function Dashboard({
 
   return (
     <div className="space-y-5">
-      {/* 状态主卡片（极光背景） */}
-      <section className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-gradient-to-br from-sky-500/[0.08] via-indigo-500/[0.04] to-transparent p-5">
+      {/* 状态主卡片（hero）：sn-hero 网格纹理 + 双强调色渐变 + 品牌徽章，
+          状态点挪到徽章右下角——一眼同时读到「产品是谁」和「现在什么状态」 */}
+      <section className="sn-hero relative overflow-hidden rounded-[22px] border border-[var(--sn-border)] p-5">
         <span
           className="aurora pointer-events-none absolute -right-14 -top-20 h-52 w-52 rounded-full bg-sky-500/15 blur-3xl"
           aria-hidden
@@ -350,20 +418,27 @@ export default function Dashboard({
           aria-hidden
         />
         <div className="relative flex flex-wrap items-center gap-4">
-          <span className="relative flex h-12 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500/20 to-indigo-500/20">
-            <span className={`h-3.5 w-3.5 rounded-full ${info.dot}`} aria-hidden />
+          <span className="relative shrink-0">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shadow-sky-500/30">
+              <MicGlyph />
+            </span>
             {stage === 'recording' && (
               <span
-                className="absolute inset-0 animate-ping rounded-2xl border border-red-500/30"
+                className="absolute inset-0 animate-ping rounded-2xl border border-red-500/40"
                 aria-hidden
               />
             )}
           </span>
           <div className="min-w-0">
-            <div className={`text-lg font-semibold ${info.text}`}>{info.label}</div>
+            <div
+              className={`flex items-center gap-2.5 text-lg font-semibold ${info.text}`}
+            >
+              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${info.dot}`} aria-hidden />
+              {info.label}
+            </div>
             {/* 出错时完整展示错误信息（最多三行）；正常状态保持单行截断的提示 */}
             <div
-              className={`text-xs text-slate-400 ${
+              className={`mt-0.5 text-xs text-slate-400 ${
                 statusMsg && stage === 'error'
                   ? 'line-clamp-3 break-all'
                   : 'truncate'
@@ -467,9 +542,41 @@ export default function Dashboard({
         </button>
       </section>
 
+      {/* 记忆速览：产品从「输入工具」到「输入 + 记忆」的主线入口，
+          统计口径来自 memList（不受查询过滤影响）；点击整卡进记忆页 */}
+      <button
+        type="button"
+        onClick={() => navigate('mem')}
+        className="card-lift group flex w-full items-center gap-4 rounded-[20px] border border-[var(--sn-border)] bg-gradient-to-r from-violet-500/[0.08] via-sky-500/[0.05] to-transparent p-4 text-left transition-colors hover:border-violet-400/30"
+      >
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-violet-400/20 bg-gradient-to-br from-violet-500/[0.18] to-sky-500/[0.12] text-violet-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+          <BrainGlyph />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2 text-[14px] font-semibold text-slate-100">
+            记忆库
+            {mem && mem.todayCount > 0 && (
+              <span className="rounded-full border border-violet-400/25 bg-violet-400/10 px-1.5 py-0.5 text-[10px] font-normal text-violet-300">
+                今日 +{mem.todayCount}
+              </span>
+            )}
+          </span>
+          <span className="mt-0.5 block truncate text-xs text-slate-500">
+            {mem
+              ? mem.total > 0
+                ? `累计 ${mem.total} 条记忆 · 共 ${mem.totalChars.toLocaleString()} 字 · 说过 / 看过 / 译过皆可追索`
+                : '还没有记忆——完成一次听写、取词或翻译后自动沉淀'
+              : '听写、截图取词、翻译的产出自动沉淀为可检索的个人记忆'}
+          </span>
+        </span>
+        <span className="shrink-0 text-[12px] text-slate-500 transition-colors group-hover:text-violet-300">
+          查看记忆 ›
+        </span>
+      </button>
+
       {/* 上手清单：新用户第一眼即见；收起后 localStorage 记忆，不再展示 */}
       {!onboarded && (
-        <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+        <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
           <div className="mb-3 flex items-center justify-between">
             <div>
               <h2 className="text-[15px] font-semibold text-slate-100">🚀 上手清单</h2>
@@ -614,7 +721,7 @@ export default function Dashboard({
           <div
             key={s.label}
             title={s.tip}
-            className="card-lift rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3.5"
+            className="card-lift rounded-xl border border-[var(--sn-border)] bg-[var(--sn-surface)] px-4 py-3.5"
           >
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-500">{s.label}</span>
@@ -646,7 +753,7 @@ export default function Dashboard({
       </div>
 
       {/* 最近 7 天迷你柱图（纯 div，高度按当日条数归一） */}
-      <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] px-4 py-3">
+      <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] px-4 py-3">
         {(() => {
           const max = Math.max(...stats.week.map((d) => d.count));
           return (
@@ -696,7 +803,7 @@ export default function Dashboard({
       </section>
 
       {/* 配置自检 */}
-      <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+      <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
         <h2 className="mb-3 flex items-center gap-2 text-[15px] font-semibold text-slate-100">
           🔍 配置自检
           <span
@@ -740,7 +847,7 @@ export default function Dashboard({
       </section>
 
       {/* 快速开关 */}
-      <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+      <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
         <h2 className="mb-3 text-[15px] font-semibold text-slate-100">⚡ 快速开关</h2>
         <div className="space-y-2">
           <Toggle
@@ -783,7 +890,7 @@ export default function Dashboard({
       </section>
 
       {/* 外观 */}
-      <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+      <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
         <h2 className="mb-3 text-[15px] font-semibold text-slate-100">🎨 外观</h2>
         <div className="space-y-4">
           <div>
@@ -871,7 +978,7 @@ export default function Dashboard({
 
       {/* 最近记录 */}
       {history.length > 0 && (
-        <section className="rounded-2xl border border-white/[0.07] bg-white/[0.025] p-5">
+        <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-[15px] font-semibold text-slate-100">🕘 最近使用</h2>
             <button

@@ -37,6 +37,11 @@ candle-nn = "0.11"
 candle-transformers = "0.11"
 enigo = "0.6"
 rand = "0.9"
+# 记忆库 v3 导入：dom_smoothie（Mozilla Readability 移植，抽网页正文）、
+# encoding_rs + chardetng（WHATWG 编码探测，网页字节流 → UTF-8）——全纯 Rust
+dom_smoothie = "0.19"
+encoding_rs = "0.8"
+chardetng = "0.1"
 tokenizers = { version = "0.22", default-features = false }
 zhconv = "0.4.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }

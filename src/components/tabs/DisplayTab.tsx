@@ -1,13 +1,22 @@
 import { useEffect, useState } from 'react';
-import { Field, Section, Toggle } from '../Controls';
-import { copyText, displayStatus, openDisplayPage } from '../../api';
+import { Button, Field, Section, Spinner, Toggle } from '../Controls';
+import { copyText, displayStatus, memGenToken, openDisplayPage } from '../../api';
 import type { DisplayStatus } from '../../api';
 import type { TabProps } from '../../types';
 import { NumberInput } from './shared';
 
 /* ============ 外接显示 ============ */
+
+/** 令牌打码展示：保留「sn-」前缀与末 4 位（口头核对刚好够用），中间遮星号。
+ *  太短的异常值整体遮掉，不泄露任何片段 */
+function maskToken(t: string): string {
+  return t.length > 8 ? `${t.slice(0, 3)}****${t.slice(-4)}` : '****';
+}
+
 export function DisplayTab({ cfg, set, toast }: TabProps) {
   const [st, setSt] = useState<DisplayStatus | null>(null);
+  const [genBusy, setGenBusy] = useState(false);
+  const [copiedToken, setCopiedToken] = useState(false);
 
   // 服务状态轮询：配置保存后端口/启停会变化，3 秒刷新足够跟手；
   // 后端每次都返回新对象，浅比较关键字段无变化时跳过 setState，避免白白重渲染本页
@@ -31,6 +40,34 @@ export function DisplayTab({ cfg, set, toast }: TabProps) {
   }, [cfg.externalDisplay.enabled, cfg.externalDisplay.port, cfg.externalDisplay.allowLan]);
 
   const ext = cfg.externalDisplay;
+  const token = cfg.mem.apiToken;
+
+  /* 生成/轮换令牌：后端 mem_gen_token 已落盘并广播，这里拿到返回值必须同步
+     本地 cfg——否则页面上任何一处改动触发的自动保存会把旧（空）值写回 */
+  const onGenToken = async () => {
+    if (genBusy) return;
+    setGenBusy(true);
+    try {
+      const t = await memGenToken();
+      set('mem', { apiToken: t });
+      toast('已生成新令牌，旧令牌（若有）立即失效', 'ok');
+    } catch (e) {
+      toast(`生成令牌失败：${String(e)}`, 'error');
+    } finally {
+      setGenBusy(false);
+    }
+  };
+
+  /* 复制完整令牌（界面上只展示打码版，复制的是真值） */
+  const onCopyToken = () => {
+    copyText(token).then(
+      () => {
+        setCopiedToken(true);
+        window.setTimeout(() => setCopiedToken(false), 1500);
+      },
+      () => toast('复制失败', 'error'),
+    );
+  };
 
   return (
     <Section
@@ -148,6 +185,48 @@ export function DisplayTab({ cfg, set, toast }: TabProps) {
             <code className="mx-1 rounded bg-black/30 px-1 font-mono">
               docs/external-display-api.md
             </code>
+          </div>
+
+          {/* 记忆开放端点与本服务同生命周期，说明文案与上方 WS API 同一款式 */}
+          <div className="rounded-lg border border-sky-500/15 bg-sky-500/[0.05] px-3.5 py-2.5 text-[11.5px] leading-5 text-sky-200/70">
+            🧠 记忆开放 API：
+            <code className="mx-1 rounded bg-black/30 px-1 font-mono">
+              GET /mem/search?q=&amp;k=
+            </code>
+            与
+            <code className="mx-1 rounded bg-black/30 px-1 font-mono">
+              GET /mem/context.md
+            </code>
+            —— 把 SpeakNow 记忆暴露给本机其他 AI 工具（随本服务启停，默认仅本机可访问）
+          </div>
+
+          {/* REST 令牌管理：loopback 免钥、局域网必验，所以放在 mem API 说明旁 */}
+          <div className="rounded-lg border border-white/[0.08] bg-black/20 px-3.5 py-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[12px] font-medium text-slate-300">记忆 REST 令牌</span>
+              <code
+                className="rounded bg-black/30 px-2 py-1 font-mono text-[11.5px] text-sky-300"
+                title={token ? '出于安全只显示首尾，复制按钮取完整令牌' : '尚未生成令牌'}
+              >
+                {token ? maskToken(token) : '未生成'}
+              </code>
+              <Button kind="subtle" disabled={genBusy} onClick={() => void onGenToken()}>
+                {genBusy && <Spinner size={13} />}
+                {token ? '重新生成' : '生成'}
+              </Button>
+              {token && (
+                <Button kind="subtle" onClick={onCopyToken}>
+                  {copiedToken ? '已复制 ✓' : '复制'}
+                </Button>
+              )}
+            </div>
+            <div className="mt-1.5 text-[11px] leading-5 text-slate-500">
+              本机访问免令牌；开启局域网后 /mem/* 需携带请求头
+              <code className="mx-1 rounded bg-black/30 px-1 font-mono">
+                X-SN-API-Key: &lt;令牌&gt;
+              </code>
+              。重新生成后旧令牌立即失效
+            </div>
           </div>
         </>
       )}

@@ -23,6 +23,8 @@ pub struct Config {
     pub output: OutputConfig,
     pub general: GeneralConfig,
     pub external_display: ExternalDisplayConfig,
+    /// 记忆库（Mem）：听写 / 取词 / 翻译产出自动沉淀为可检索的个人记忆
+    pub mem: MemConfig,
 }
 
 
@@ -103,6 +105,12 @@ pub struct HotkeyConfig {
     pub key_ocr: String,
     /// 文本模拟输入快捷键（可选）：打开独立小窗，粘贴大段文本后模拟键盘逐字敲进目标窗口
     pub key_typist: String,
+    /// 输入框翻译快捷键（可选）：读取聚焦输入框的未发送草稿，翻译后替换回输入框
+    #[serde(default)]
+    pub key_translate_input: String,
+    /// 记忆召回快捷键（可选）：呼出悬浮搜索卡，检索记忆库并一键注入当前输入框
+    #[serde(default)]
+    pub key_mem_recall: String,
     /// hold（按住说话）/ toggle（按一下开始/结束）
     pub mode: String,
     pub enabled: bool,
@@ -120,6 +128,8 @@ impl Default for HotkeyConfig {
             key_translate_sel: String::new(),
             key_ocr: String::new(),
             key_typist: String::new(),
+            key_translate_input: String::new(),
+            key_mem_recall: String::new(),
             mode: "toggle".into(),
             enabled: true,
             min_duration_ms: 800,
@@ -516,6 +526,59 @@ fn default_linger_mult() -> f32 {
 
 fn default_history_limit() -> usize {
     50
+}
+
+fn default_mem_limit() -> usize {
+    500
+}
+
+/// 记忆库配置。采集开关独立于功能总开关（enabled=false 完全停采，
+/// 各 capture_* 控制单类来源），distill 失败不影响入库本身
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemConfig {
+    /// 功能总开关：关闭后不再采集，已有记忆仍可查看/检索
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 听写结果自动入库
+    #[serde(default = "default_true")]
+    pub capture_dictation: bool,
+    /// 截图取词结果自动入库
+    #[serde(default = "default_true")]
+    pub capture_ocr: bool,
+    /// 划词 / 输入框翻译结果自动入库
+    #[serde(default = "default_true")]
+    pub capture_translate: bool,
+    /// 入库时用已配置的 LLM 蒸馏关键词与一句话摘要（失败静默跳过）
+    #[serde(default)]
+    pub distill: bool,
+    /// 采集黑名单（每行一个关键字，大小写不敏感子串匹配进程名）：命中不入库。
+    /// 密码管理器类进程的内置名单始终生效（见 mem::BUILTIN_SENSITIVE_APPS），此项是补充
+    #[serde(default)]
+    pub capture_blacklist: String,
+    /// 记忆 REST 端点访问令牌：loopback 免钥；开启局域网后 /mem/* 必须
+    /// 携带 X-SN-API-Key。空 = 未生成（记忆页可一键生成）。与 LLM Key 同存
+    /// config.json，本机明文与既有凭据口径一致
+    #[serde(default)]
+    pub api_token: String,
+    /// 保留条数（滚动清理，置顶的不占名额）
+    #[serde(default = "default_mem_limit")]
+    pub limit: usize,
+}
+
+impl Default for MemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capture_dictation: true,
+            capture_ocr: true,
+            capture_translate: true,
+            distill: false,
+            capture_blacklist: String::new(),
+            api_token: String::new(),
+            limit: default_mem_limit(),
+        }
+    }
 }
 
 impl Default for GeneralConfig {

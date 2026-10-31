@@ -701,6 +701,166 @@ pub fn paste_text_checked(
     Ok(true)
 }
 
+/// 纯逻辑：替换前守卫判定（可单测）。origin/current 为读取时/替换时的前台
+/// 进程名（大小写不敏感比较）；reread 为替换前重读的草稿（None=复读不可用，
+/// 仅凭进程一致放行）。
+fn replacement_confirmed(origin: &str, current: &str, draft: &str, reread: Option<&str>) -> bool {
+    let o = origin.trim().to_lowercase();
+    // 读取时拿不到进程名就无法确认目标：无法确认目标就不动用户输入框
+    if o.is_empty() {
+        return false;
+    }
+    if o != current.trim().to_lowercase() {
+        return false;
+    }
+    match reread {
+        // 重读与原文不一致：用户在翻译期间又打了字，全选替换会吞掉新内容
+        Some(x) => x.trim() == draft.trim(),
+        None => true,
+    }
+}
+
+/// 输入框翻译的回填：全选聚焦输入框草稿 → 剪贴板粘贴覆盖。
+/// 与听写粘贴同持 PASTE_LOCK 互斥；比常规粘贴多两道守卫：
+/// ① 前台进程须与读取草稿时一致（防翻译期间用户切窗后把键发进无关应用）；
+/// ② 重读草稿与原文一致（防吞掉用户新输入）。永不自动回车。
+/// `bail` = 注入前检查点（等待后/发 Ctrl+A 前/发粘贴键前）的作废谓词，
+/// 命中返回 Ok(false)（未注入，用户已转向新操作，不算错误）。
+/// 刻意不走路由 method="typing" 的模拟键入支路：替换文本可能很长，且全选
+/// 状态下逐字注入中途失败无法回滚，剪贴板路径有备份/校验/还原三重保护。
+pub fn replace_focused_text(
+    cfg: &OutputConfig,
+    text: &str,
+    origin_process: &str,
+    draft: &str,
+    bail: &dyn Fn() -> bool,
+) -> Result<bool> {
+    let _lock = PASTE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    #[cfg(target_os = "windows")]
+    {
+        // 终端里 Ctrl+A 是「跳到行首」不是全选，全选替换语义不成立
+        if foreground_is_terminal() {
+            return Err(anyhow::anyhow!(
+                "终端窗口不支持全选替换：终端里 Ctrl+A 是移动光标而非全选，已取消回填"
+            ));
+        }
+        if let Some(exe) = foreground_uipi_blocker() {
+            return Err(anyhow::anyhow!(
+                "目标窗口 {exe} 以管理员身份运行，系统已阻止按键注入；点击下方「以管理员身份重启」即可解决，或手动 Ctrl+V 粘贴"
+            ));
+        }
+    }
+
+    // 1) 等用户物理松开热键修饰键（Ctrl 残留会让随后的 Ctrl+A 变成组合键）
+    // 2) 等前台窗口回到目标应用（悬浮窗翻译卡收回后焦点回归）
+    // 等待均可达秒级，等完必须复查作废状态（检查点布局对照 paste_text_checked）
+    #[cfg(target_os = "windows")]
+    {
+        wait_modifiers_released(1500, bail);
+        if bail() {
+            return Ok(false);
+        }
+        wait_foreground_foreign(800, bail);
+        if bail() {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        wait_modifiers_released(1500, bail);
+        if bail() {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    thread::sleep(Duration::from_millis(30));
+    if bail() {
+        return Ok(false);
+    }
+
+    // 双守卫（见函数头注释）：目标已切换或草稿被继续编辑就放弃，宁可让用户
+    // 手动粘贴也不能把全选按键发进无关应用/吞掉新输入
+    let cur = foreground_process_name();
+    let reread = crate::selection::capture_input_text().ok();
+    if !replacement_confirmed(origin_process, &cur, draft, reread.as_deref()) {
+        return Err(anyhow::anyhow!("目标窗口已切换或输入框内容有变化，已取消替换"));
+    }
+    if bail() {
+        return Ok(false);
+    }
+
+    send_select_all_key()?;
+    // 等选区生效再写剪贴板：粘贴过早可能落在光标处而没覆盖旧草稿
+    thread::sleep(Duration::from_millis(40));
+
+    let saved = if cfg.restore_clipboard {
+        save_clipboard_content()
+    } else {
+        None
+    };
+    // 此后的失败都发生在 Ctrl+A 之后：草稿处于全选状态，用户下一个键击会
+    // 覆盖整份草稿——错误文案必须提示这一点
+    copy_verified(text).map_err(|e| {
+        anyhow::anyhow!("{e:#}；草稿当前处于全选状态，可 Ctrl+V 手动替换，或按方向键取消选区")
+    })?;
+    // 校验通过（读回一致 + 序号前移已证明写入生效）后留一小段传播余量
+    thread::sleep(Duration::from_millis(30));
+
+    // 终端已在开头守卫拒绝，auto / terminal-typing 都落到标准 Ctrl+V
+    let key = match cfg.paste_key.as_str() {
+        "auto" | "terminal-typing" => "ctrl+v",
+        other => other,
+    };
+    // 发键前最后一道检查点（对照 paste_text_checked：等待/校验期间用户可能
+    // 已开始新听写/新翻译）。此刻译文已在剪贴板，放弃注入也算给用户留下了
+    // 手动粘贴的退路
+    if bail() {
+        return Ok(false);
+    }
+    let paste_gen = PASTE_GEN.fetch_add(1, Ordering::SeqCst);
+    if let Err(e) = send_paste_key(key) {
+        // 粘贴键失败也必须恢复用户原剪贴板：copy_verified 已把原内容覆盖掉
+        if let Some(prev) = saved.as_ref() {
+            restore_clipboard_content(prev);
+        }
+        return Err(anyhow::anyhow!(
+            "{e:#}；草稿当前处于全选状态，可再按一次粘贴键或按方向键取消选区"
+        ));
+    }
+
+    // 延迟恢复原剪贴板（与 paste_text_checked 保持语义同步：2s 后世代+序号+
+    // 内容三重守卫都满足才还原，杜绝「恢复过早 → 粘出旧内容」/覆盖新写入）
+    #[cfg(target_os = "windows")]
+    let seq_after_set = clipboard_seq();
+    if let Some(prev) = saved {
+        let mark = text.to_string();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(2000));
+            // 已有新一轮粘贴：本恢复过期，放弃
+            if PASTE_GEN.load(Ordering::SeqCst) != paste_gen {
+                return;
+            }
+            #[cfg(target_os = "windows")]
+            if clipboard_seq() != seq_after_set {
+                return;
+            }
+            let unchanged = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut c| c.get_text().ok())
+                .map(|cur| cur == mark)
+                .unwrap_or(false);
+            if unchanged {
+                restore_clipboard_content(&prev);
+            }
+        });
+    }
+
+    Ok(true)
+}
+
 fn new_enigo() -> Result<Enigo> {
     Enigo::new(&Settings::default()).context(
         "初始化键盘模拟失败（macOS 需在 系统设置 → 隐私与安全性 → 辅助功能 中授权本应用）",
@@ -725,6 +885,27 @@ fn auto_submit_blocked(cfg: &OutputConfig) -> Option<String> {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .find(|k| fg.contains(k.as_str()))
+}
+
+/// 全选当前焦点输入框内容（输入框翻译回填第一步）。修饰键三段式与
+/// selection::send_copy_key 同构；macOS 用 ⌘A（mac 在读草稿一步已被拦，
+/// 仅为跨平台习惯完整）
+fn send_select_all_key() -> Result<()> {
+    let mut e = new_enigo()?;
+    #[cfg(target_os = "macos")]
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+    let r = (|| -> Result<()> {
+        e.key(modifier, Direction::Press)?;
+        e.key(Key::Unicode('a'), Direction::Click)?;
+        Ok(())
+    })();
+    // Click 失败时 Ctrl 还按着：不补发 Release 的话用户后续每个键都变组合键
+    if r.is_err() {
+        let _ = e.key(modifier, Direction::Release);
+    }
+    r
 }
 
 fn send_paste_key(paste_key: &str) -> Result<()> {
@@ -759,4 +940,82 @@ fn send_paste_key(paste_key: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replacement_confirmed;
+
+    #[test]
+    fn confirmed_when_process_and_reread_match() {
+        assert!(replacement_confirmed(
+            "WeChat.exe",
+            "WeChat.exe",
+            "你好",
+            Some("你好")
+        ));
+    }
+
+    #[test]
+    fn process_compare_is_case_and_space_insensitive() {
+        // 进程名探测在不同时机可能返回大小写/空白有差异的同一进程名
+        assert!(replacement_confirmed(
+            "wechat.exe",
+            " WeChat.EXE ",
+            "draft",
+            Some("draft")
+        ));
+    }
+
+    #[test]
+    fn rejected_when_process_changed() {
+        // 翻译期间用户切了窗口：全选+粘贴会落进无关应用
+        assert!(!replacement_confirmed(
+            "WeChat.exe",
+            "Chrome.exe",
+            "你好",
+            Some("你好")
+        ));
+    }
+
+    #[test]
+    fn rejected_when_origin_unknown() {
+        // 读取时拿不到进程名：无法确认目标就不动用户输入框
+        assert!(!replacement_confirmed("", "Chrome.exe", "你好", Some("你好")));
+    }
+
+    #[test]
+    fn rejected_when_reread_differs() {
+        // 用户在翻译期间又打了字：全选替换会吞掉新内容
+        assert!(!replacement_confirmed(
+            "WeChat.exe",
+            "WeChat.exe",
+            "你好",
+            Some("你好世界")
+        ));
+    }
+
+    #[test]
+    fn allowed_when_reread_unavailable() {
+        // 复读不可用（UIA 拿不到）：仅凭进程一致放行
+        assert!(replacement_confirmed("WeChat.exe", "WeChat.exe", "你好", None));
+    }
+
+    #[test]
+    fn reread_compare_ignores_surrounding_whitespace() {
+        // 复读通道带回首尾空白（TextPattern 常见）不算内容变化
+        assert!(replacement_confirmed(
+            "WeChat.exe",
+            "WeChat.exe",
+            "  你好\n",
+            Some("\n你好  ")
+        ));
+        // 但 trim 后不同仍要拒绝
+        assert!(!replacement_confirmed(
+            "WeChat.exe",
+            "WeChat.exe",
+            "你好\n",
+            Some("\n你好\n世界")
+        ));
+    }
 }

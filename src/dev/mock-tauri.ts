@@ -37,6 +37,8 @@ const mockConfig = {
     keyTranslateSel: 'Alt+T',
     keyOcr: 'Alt+S',
     keyTypist: 'Alt+Y',
+    keyTranslateInput: '',
+    keyMemRecall: 'Alt+M',
     mode: 'toggle',
     enabled: true,
     minDurationMs: 800,
@@ -133,6 +135,16 @@ const mockConfig = {
     lingerMult: 1,
     autoCheckUpdate: true,
     skipVersion: '',
+  },
+  mem: {
+    enabled: true,
+    captureDictation: true,
+    captureOcr: true,
+    captureTranslate: true,
+    distill: false,
+    captureBlacklist: '',
+    apiToken: 'sn-demo-token-0000',
+    limit: 500,
   },
   externalDisplay: {
     enabled: false,
@@ -265,6 +277,205 @@ const mockHistory = [
   },
 ];
 
+/** 记忆库示例数据（覆盖三类来源/多天/置顶/已蒸馏，供记忆页与总览在浏览器验证） */
+const MIN = 1000 * 60;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+const mockMem: {
+  ts: number;
+  kind: 'dictation' | 'ocr' | 'translate' | 'note' | 'web' | 'file';
+  app: string;
+  title: string;
+  text: string;
+  keywords: string[];
+  distilled: boolean;
+  pinned: boolean;
+  chars: number;
+  /** 近重复再次出现次数 */
+  hits?: number;
+  /** 实际使用（注入/复制）次数 */
+  uses?: number;
+  /** 上次使用时间戳（0=从未） */
+  lastUsedAt?: number;
+  /** 被哪条记忆取代（软作废，0=在世） */
+  supersededBy?: number;
+}[] = [
+  {
+    ts: now - 3 * MIN,
+    kind: 'dictation',
+    app: 'cursor',
+    title: '关于记忆库检索的口述笔记',
+    text: '记忆库的检索按空格分词做 AND 匹配，关键词命中权重最高，标题次之，正文最低。中英文都支持，数字与路径原样匹配。',
+    keywords: ['记忆库', '检索'],
+    distilled: true,
+    pinned: false,
+    chars: 62,
+  },
+  {
+    ts: now - 26 * MIN,
+    kind: 'translate',
+    app: 'chrome',
+    title: 'Hybrid retrieval design note',
+    text: '混合检索设计说明：先向量召回再重排的方案延迟约 200ms，索引可全量重建。',
+    keywords: ['混合检索', '重排'],
+    distilled: true,
+    pinned: true,
+    // 刚用过一次：召回空查询里浮顶的示例
+    uses: 1,
+    lastUsedAt: now - 2 * MIN,
+    chars: 44,
+  },
+  {
+    ts: now - 2 * HOUR,
+    kind: 'ocr',
+    app: 'wechat',
+    title: '会议白板照片里的排期表',
+    text: 'v0.6 排期：蒸馏调度 10/30、图谱抽取 11/02、混合检索 11/05、灰度 11/08。',
+    keywords: [],
+    distilled: false,
+    pinned: false,
+    chars: 46,
+  },
+  {
+    ts: now - 5 * HOUR,
+    kind: 'dictation',
+    app: 'wechat',
+    title: '回复合作方的问题：数据存哪',
+    text: '数据全部保存在本机的应用配置目录，不上传任何服务器；导出功能可以随时带走全部内容。',
+    keywords: [],
+    distilled: false,
+    pinned: false,
+    chars: 47,
+  },
+  {
+    ts: now - 1 * DAY - 40 * MIN,
+    kind: 'dictation',
+    app: 'cursor',
+    title: 'spawn_blocking 与主线程阻塞的复盘',
+    text: '上次保存卡住的根因是 WASAPI 开流阻塞了主线程，重活必须走 spawn_blocking，热键回调里只做轻量调度。',
+    keywords: ['spawn_blocking', '线程模型'],
+    distilled: true,
+    pinned: false,
+    chars: 57,
+    // 同一内容反复口述过三次：近重复合并的示例
+    hits: 3,
+    uses: 2,
+    lastUsedAt: now - 4 * HOUR,
+  },
+  {
+    ts: now - 2 * DAY,
+    kind: 'translate',
+    app: 'word',
+    title: 'Local-first architecture translated',
+    text: '本地优先架构：数据默认留在设备上，云能力全部可选，断网时核心功能不受影响。',
+    keywords: [],
+    distilled: false,
+    pinned: false,
+    chars: 39,
+  },
+  {
+    ts: now - 3 * DAY,
+    kind: 'ocr',
+    app: 'chrome',
+    title: '剪贴板还原逻辑的注释片段',
+    text: '粘贴注入三重保障：PASTE_LOCK 串行化、写入后校验、延时还原原文；历史上出过串话事故，改动前先读头部注释。',
+    keywords: ['剪贴板', 'PASTE_LOCK'],
+    distilled: true,
+    pinned: false,
+    chars: 55,
+  },
+  {
+    ts: now - 4 * DAY,
+    kind: 'note',
+    app: '',
+    title: '快记：服务器年费续期日',
+    text: '服务器年费每年 3 月 15 日续期，记得提前一周比价。',
+    keywords: [],
+    distilled: false,
+    pinned: true,
+    chars: 24,
+  },
+  {
+    ts: now - 5 * DAY,
+    kind: 'web',
+    app: 'llvm.org',
+    title: 'LLVM getting started',
+    text: '从源码构建 LLVM：cmake 配置、Ninja 构建、运行测试套件的官方入门步骤。',
+    keywords: ['LLVM', '构建'],
+    distilled: true,
+    pinned: false,
+    chars: 39,
+  },
+  {
+    ts: now - 6 * DAY,
+    kind: 'file',
+    app: 'SpeakNow',
+    title: 'AGENTS.md — 危险区约定',
+    text: 'unsafe 集中地与线程模型：热键/托盘回调在主线程，重活必须走 pipeline::post_* 或 spawn_blocking。',
+    keywords: ['AGENTS.md', '线程模型'],
+    distilled: true,
+    pinned: false,
+    chars: 47,
+  },
+  {
+    ts: now - 7 * DAY,
+    kind: 'note',
+    app: '',
+    title: '旧口径：例会定在周一',
+    text: '团队例会定在每周一上午十点。',
+    keywords: [],
+    distilled: false,
+    pinned: false,
+    chars: 15,
+    // 软作废示例：已被新快记取代（召回/上下文默认过滤，设置页可见）
+    supersededBy: now - 4 * DAY,
+  },
+];
+
+/** 与后端 mem_list 同口径的检索：空格分词 AND 匹配（关键词>标题>正文加权）；
+ *  无查询时置顶优先 + 时间倒序，有查询时按命中分排序 */
+function mockMemSearch(
+  query: string,
+  kind: string | null,
+  limit: number,
+): {
+  items: typeof mockMem;
+  total: number;
+  todayCount: number;
+  totalChars: number;
+} {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const scoreOf = (m: (typeof mockMem)[number]) => {
+    if (kind && m.kind !== kind) return null;
+    let score = 0;
+    for (const t of terms) {
+      let s = 0;
+      if (m.keywords.some((k) => k.toLowerCase().includes(t))) s = 3;
+      else if (m.title.toLowerCase().includes(t)) s = 2;
+      else if (m.text.toLowerCase().includes(t)) s = 1;
+      if (s === 0) return null; // 任一词未命中即淘汰（AND）
+      score += s;
+    }
+    return score;
+  };
+  const scored = mockMem
+    .map((m) => ({ m, score: scoreOf(m) }))
+    .filter((x): x is { m: (typeof mockMem)[number]; score: number } => x.score !== null);
+  scored.sort((a, b) =>
+    terms.length === 0
+      ? Number(b.m.pinned) - Number(a.m.pinned) || b.m.ts - a.m.ts
+      : b.score - a.score || b.m.ts - a.m.ts,
+  );
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  return {
+    items: scored.slice(0, limit).map((x) => x.m),
+    total: mockMem.length,
+    todayCount: mockMem.filter((m) => m.ts >= todayStart.getTime()).length,
+    totalChars: mockMem.reduce((s, m) => s + m.chars, 0),
+  };
+}
+
 /** 模拟输入的进行中状态（typing_start/stop/status 三命令共享；真机由 Rust 原子量持有） */
 const mockTyping: {
   active: boolean;
@@ -274,6 +485,10 @@ const mockTyping: {
   target: string;
   timers: ReturnType<typeof setTimeout>[];
 } = { active: false, done: 0, total: 0, target: '', timers: [] };
+
+/** 翻译会话代数（translate_input_cmd 递增）：悬浮窗按 gen 丢弃迟到的旧会话结果，
+ *  固定值会被上一张卡片判为过期而丢弃，须像真机一样逐次 +1 */
+let mockTranslateGen = 0;
 
 function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -365,6 +580,204 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
           resolve(undefined);
           return;
         }
+        case 'mem_list': {
+          const { query, kind, limit } = args as {
+            query: string;
+            kind: string | null;
+            limit: number;
+          };
+          resolve(mockMemSearch(query ?? '', kind ?? null, limit ?? 50));
+          return;
+        }
+        case 'mem_delete_batch': {
+          const { ts } = args as { ts: number[] };
+          const dead = new Set(ts);
+          // 与后端同口径：返回实际删除数（含已不存在的 ts 时不计入）
+          let removed = 0;
+          for (let i = mockMem.length - 1; i >= 0; i--) {
+            if (dead.has(mockMem[i].ts)) {
+              mockMem.splice(i, 1);
+              removed++;
+            }
+          }
+          emit('sn-mem-changed');
+          resolve(removed);
+          return;
+        }
+        case 'mem_set_pinned': {
+          const { ts, pinned } = args as { ts: number; pinned: boolean };
+          const item = mockMem.find((m) => m.ts === ts);
+          if (item) item.pinned = pinned;
+          emit('sn-mem-changed');
+          resolve(undefined);
+          return;
+        }
+        case 'mem_clear':
+          mockMem.length = 0;
+          emit('sn-mem-changed');
+          resolve(undefined);
+          return;
+        case 'mem_recall': {
+          // 与后端 mem_recall 同口径：软作废条目不进召回；空查询 = 置顶 + max(lastUsed,ts) 倒序；
+          // 有查询 = 文本分(3/2/1) × 0.95^天数 × (1+log10(1+uses))
+          const { query, limit } = args as { query: string; limit: number };
+          const pool = mockMem.filter((m) => !(m.supersededBy ?? 0));
+          const terms = (query ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+          const nowMs = Date.now();
+          const dayMs = 86400000;
+          const ranked = pool
+            .map((m) => {
+              if (terms.length === 0) return { m, score: 0 };
+              let s = 0;
+              for (const t of terms) {
+                let hit = 0;
+                if (m.keywords.some((k) => k.toLowerCase().includes(t))) hit = 3;
+                else if (m.title.toLowerCase().includes(t)) hit = 2;
+                else if (m.text.toLowerCase().includes(t)) hit = 1;
+                if (hit === 0) return { m, score: -1 };
+                s += hit;
+              }
+              const base = m.lastUsedAt && m.lastUsedAt > 0 ? m.lastUsedAt : m.ts;
+              const recency = Math.pow(0.95, (nowMs - base) / dayMs);
+              return { m, score: s * recency * (1 + Math.log10(1 + (m.uses ?? 0))) };
+            })
+            .filter((x) => x.score >= 0)
+            .sort((a, b) =>
+              terms.length === 0
+                ? Number(b.m.pinned) - Number(a.m.pinned) ||
+                  Math.max(b.m.lastUsedAt ?? 0, b.m.ts) - Math.max(a.m.lastUsedAt ?? 0, a.m.ts) ||
+                  b.m.ts - a.m.ts
+                : b.score - a.score,
+            );
+          resolve(ranked.slice(0, limit ?? 12).map((x) => x.m));
+          return;
+        }
+        case 'mem_used': {
+          const { ts } = args as { ts: number };
+          const item = mockMem.find((m) => m.ts === ts);
+          if (item) {
+            item.uses = (item.uses ?? 0) + 1;
+            item.lastUsedAt = Date.now();
+          }
+          emit('sn-mem-changed');
+          resolve(undefined);
+          return;
+        }
+        case 'mem_recall_paste': {
+          const { ts } = args as { ts: number };
+          const item = mockMem.find((m) => m.ts === ts);
+          if (item) {
+            item.uses = (item.uses ?? 0) + 1;
+            item.lastUsedAt = Date.now();
+          }
+          emit('sn-mem-changed');
+          emit('sn-status', { stage: 'done', message: '已注入到光标处（mock）' });
+          resolve('ok');
+          return;
+        }
+        case 'mem_copy_used': {
+          const { ts } = args as { ts: number };
+          const item = mockMem.find((m) => m.ts === ts);
+          if (item) {
+            item.uses = (item.uses ?? 0) + 1;
+            item.lastUsedAt = Date.now();
+          }
+          emit('sn-mem-changed');
+          resolve(undefined);
+          return;
+        }
+        case 'mem_add_note': {
+          const { text } = args as { text: string };
+          const t = (text ?? '').trim();
+          if (!t) {
+            resolve({ added: 0, merged: 0, skipped: 1 });
+            return;
+          }
+          const dup = mockMem.find((m) => m.text === t);
+          if (dup) {
+            dup.hits = (dup.hits ?? 0) + 1;
+            emit('sn-mem-changed');
+            resolve({ added: 0, merged: 1, skipped: 0 });
+            return;
+          }
+          mockMem.unshift({
+            ts: Date.now(),
+            kind: 'note',
+            app: '',
+            title: t.slice(0, 40),
+            text: t,
+            keywords: [],
+            distilled: false,
+            pinned: false,
+            chars: [...t].length,
+          });
+          emit('sn-mem-changed');
+          resolve({ added: 1, merged: 0, skipped: 0 });
+          return;
+        }
+        case 'mem_import_url': {
+          const { url } = args as { url: string };
+          let host = '';
+          try {
+            host = new URL(url).hostname;
+          } catch {
+            resolve({ added: 0, merged: 0, skipped: 1 });
+            return;
+          }
+          mockMem.unshift({
+            ts: Date.now(),
+            kind: 'web',
+            app: host,
+            title: `网页导入：${host}`,
+            text: `（mock 模拟抓取）${url} 的正文内容示例，真机由后端抓取并抽取正文。`,
+            keywords: [],
+            distilled: false,
+            pinned: false,
+            chars: 60,
+          });
+          emit('sn-mem-changed');
+          resolve({ added: 1, merged: 0, skipped: 0 });
+          return;
+        }
+        case 'mem_import_files':
+        case 'mem_import_folder': {
+          const { paths } = args as { paths?: string[]; path?: string };
+          const list = paths ?? (args.path ? [String(args.path)] : []);
+          for (const p of list.slice(0, 3)) {
+            const name = String(p).split(/[\\/]/).pop() ?? 'file';
+            mockMem.unshift({
+              ts: Date.now(),
+              kind: 'file',
+              app: '导入',
+              title: name,
+              text: `（mock）${name} 的文本内容示例。`,
+              keywords: [],
+              distilled: false,
+              pinned: false,
+              chars: 30,
+            });
+          }
+          emit('sn-mem-changed');
+          resolve({ added: Math.min(list.length, 3), merged: 0, skipped: Math.max(list.length - 3, 0) });
+          return;
+        }
+        case 'mem_storage_stats': {
+          const chars = mockMem.reduce((s, m) => s + m.chars, 0);
+          resolve({
+            items: mockMem.length,
+            pinned: mockMem.filter((m) => m.pinned).length,
+            superseded: mockMem.filter((m) => (m.supersededBy ?? 0) > 0).length,
+            bytes: JSON.stringify(mockMem).length,
+            bakBytes: 0,
+            chars,
+          });
+          return;
+        }
+        case 'mem_gen_token': {
+          mockConfig.mem.apiToken = `sn-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
+          resolve(mockConfig.mem.apiToken);
+          return;
+        }
         case 'ocr_screen_source':
           // 浏览器无截屏能力：空图返回，前端放大镜据此自然禁用（真机才有）
           resolve({ png: '', width: 0, height: 0 });
@@ -441,6 +854,30 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'translate_selection_cmd':
           resolve('（mock 译文）');
           return;
+        case 'translate_input_cmd': {
+          // 真机读草稿→弹既有翻译卡→替换回输入框；mock 推一轮 start→result
+          // 事件供悬浮窗走查（600ms 模拟流式耗时）
+          const gen = ++mockTranslateGen;
+          emit('sn-translate-start', {
+            gen,
+            text: '输入框草稿示例文本',
+            target: mockConfig.llm.translateTarget,
+            second: mockConfig.llm.translateSecondTarget,
+            input: true, // 契约：仅输入框翻译路径携带，悬浮窗据此显示「将替换回输入框」徽标
+          });
+          setTimeout(() => {
+            emit('sn-translate-result', {
+              gen,
+              final: 'Translated draft text',
+              ms: 620,
+              firstMs: 180,
+              autoCopied: false,
+              copyFailed: false,
+            });
+          }, 600);
+          resolve('ok');
+          return;
+        }
         case 'ocr_capture_cmd':
           resolve('ok');
           return;
@@ -679,6 +1116,7 @@ declare global {
       tab: (tab: string) => void;
       config: typeof mockConfig;
       setHistory: (items: unknown[]) => void;
+      setMem: (items: unknown[]) => void;
     };
   }
 }
@@ -702,6 +1140,12 @@ window.__mock = {
     mockHistory.length = 0;
     mockHistory.push(...(items as (typeof mockHistory)[number][]));
     emit('sn-history-changed');
+  },
+  /** 替换 mock 记忆并广播刷新（记忆页视觉验证用） */
+  setMem: (items: unknown[]) => {
+    mockMem.length = 0;
+    mockMem.push(...(items as (typeof mockMem)[number][]));
+    emit('sn-mem-changed');
   },
 };
 

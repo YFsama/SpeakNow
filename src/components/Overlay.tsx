@@ -6,10 +6,11 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
-import type { Config, MetaPayload, Stage } from '../types';
+import type { Config, MemEntry, MetaPayload, Stage } from '../types';
 import { TRANSLATE_LANGS, langName, resolvedLlmCreds } from '../types';
 import {
   cancelReview,
@@ -17,6 +18,9 @@ import {
   copyText,
   dismissOverlay,
   getConfig,
+  memCopyUsed,
+  memRecall,
+  memRecallPaste,
   ocrCapture,
   ocrPaste,
   openSettings,
@@ -90,10 +94,62 @@ interface TransCard {
   copyFailed: boolean;
   /** 结构化翻译：结果事件携带的结构类型（JSON/YAML/键值），空 = 普通翻译 */
   structured: string;
+  /** 输入框翻译路径：start 载荷携带 input=true。卡片与划词翻译同源同貌，
+      没有徽标用户无法预知译文会自动写回输入框；result/delta/error 均为
+      patch 更新不重建对象，本字段跨流式/结果/错误态全程保留 */
+  input?: boolean;
 }
 
 /* 翻译卡片驻留时长（与后端 hide_later 的 10s 对齐；悬停钉住时暂停） */
 const TRANS_COUNTDOWN_MS = 10000;
+
+/* ---- 记忆召回悬浮搜索卡（sn-mem-recall 事件驱动，Raycast 式交互） ---- */
+
+/* 卡片状态（null = 关闭）。composing 为 IME 合成标志：合成期间一切按键动作
+   （Enter / Esc / 方向键）必须放行给输入法——拼音选词的回车若被当成「注入」，
+   会把半截拼音敲进目标输入框，同类产品的高发事故，中文产品必须内建防线 */
+interface MemRecallCard {
+  q: string;
+  items: MemEntry[];
+  sel: number;
+  composing: boolean;
+  /** 注入/复制失败的内联提示（成功路径由 sn-status 接管清卡，无需字段） */
+  err: string | null;
+}
+
+/* 类型徽章配色与设置页 MemTab 的 KIND_CLS 同色系（听写=sky / 取词=violet /
+   翻译=emerald），用户跨窗不重新学习；overlay 是独立入口不导入设置页模块，
+   三行映射就地复制一份 */
+const MEM_KIND_CLS: Record<MemEntry['kind'], string> = {
+  dictation: 'border-sky-400/25 bg-sky-400/10 text-sky-300',
+  ocr: 'border-violet-400/25 bg-violet-400/10 text-violet-300',
+  translate: 'border-emerald-400/25 bg-emerald-400/10 text-emerald-300',
+  note: 'border-amber-400/25 bg-amber-400/10 text-amber-300',
+  web: 'border-teal-400/25 bg-teal-400/10 text-teal-300',
+  file: 'border-rose-400/25 bg-rose-400/10 text-rose-300',
+};
+
+const MEM_KIND_LABEL: Record<MemEntry['kind'], string> = {
+  dictation: '听写',
+  ocr: '取词',
+  translate: '翻译',
+  note: '快记',
+  web: '网页',
+  file: '文件',
+};
+
+/* 相对时间（刚刚 / N 分钟前 / N 小时前 / N 天前 / M月D日）：列表行元信息用，
+   远于一周落到日期，跨年补年份 */
+function fmtRelTime(ts: number, now: number): string {
+  const diff = now - ts;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
+  const d = new Date(ts);
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+  return new Date(now).getFullYear() === d.getFullYear() ? md : `${d.getFullYear()}年${md}`;
+}
 
 /* 阶段色微光（卡片外圈短焦光晕的颜色，与描边渐变同色系）：
    取代旧版大范围灰色阴影——低透明长尾在 8bit alpha 量化下会出现色带，
@@ -106,6 +162,8 @@ const GLOW_COLORS: Record<string, string> = {
   error: 'rgba(239,68,68,0.22)',
   review: 'rgba(251,191,36,0.20)',
   translate: 'rgba(52,211,153,0.20)',
+  /* 记忆召回卡（violet 色系，与 MemTab 取词徽章同族但更亮的紫） */
+  mem: 'rgba(167,139,250,0.20)',
 };
 
 /* ---- WebAudio 合成提示音（无资源文件依赖） ---- */
@@ -518,6 +576,18 @@ export default function Overlay() {
   /* 可编辑正文：识别错字先改再用（复制/翻译/输入都取编辑后的文本） */
   const [ocrEdit, setOcrEdit] = useState('');
   const ocrEditRef = useRef<HTMLTextAreaElement>(null);
+  /* 记忆召回搜索卡（独立于听写 stage 机器：由 sn-mem-recall 事件驱动） */
+  const [mem, setMem] = useState<MemRecallCard | null>(null);
+  const memInputRef = useRef<HTMLInputElement>(null);
+  const memListRef = useRef<HTMLDivElement>(null);
+  /* 搜索防抖句柄 + 请求序号：120ms 合并键击；序号守卫防慢的旧响应覆盖新词 */
+  const memDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const memSeqRef = useRef(0);
+  /* sn-mem-recall 监听器只挂一次，经 ref 读最新听写阶段做互斥判定 */
+  const stageRef = useRef(stage);
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
   /* 声音反馈开关（翻译完成音随配置；ref 避免监听器闭包过期） */
   const soundRef = useRef(true);
   const editorRef = useRef<HTMLTextAreaElement>(null);
@@ -698,6 +768,7 @@ export default function Overlay() {
         setOcrBusy(false);
         setOcrCard(null);
         setOcrSaved(false); // 取消可能挂起的 Esc 延迟关闭，避免吞掉新一轮会话
+        setMem(null); // 记忆召回卡同样随会话接管清场（含悬浮窗隐藏时的复位）
         if (p.stage === 'error') setErrCopied(false);
         if (p.stage === 'recording') {
           setRawText('');
@@ -779,34 +850,40 @@ export default function Overlay() {
 
   /* ---- 划词翻译卡片：生命周期事件 + 流式增量 ---- */
   useEffect(() => {
-    const un1 = listen<{ gen: number; text: string; target: string; second?: string }>(
-      'sn-translate-start',
-      (e) => {
-        setTrans({
-          text: e.payload.text,
-          target: e.payload.target,
-          second: e.payload.second ?? '',
-          gen: e.payload.gen,
-          status: 'streaming',
-          stream: '',
-          thinking: '',
-          final: '',
-          error: '',
-          ms: 0,
-          firstMs: 0,
-          autoCopied: false,
-          copyFailed: false,
-          structured: '',
-        });
-        setTransBusy(true);
-        setTransCopied(false);
-        setTransActionErr('');
-        setSrcExpanded(false);
-        setTransSaved(false); // 新会话接管旧卡：取消挂起的 Esc 守存延迟关闭
-        // 翻译卡片接管悬浮窗：OCR 卡片让位（截图翻译一键链的切换点）
-        setOcrBusy(false);
-        setOcrCard(null);
-        setOcrSaved(false); // 同 sn-status：取消挂起的 Esc 延迟关闭
+    const un1 = listen<{
+      gen: number;
+      text: string;
+      target: string;
+      second?: string;
+      input?: boolean;
+    }>('sn-translate-start', (e) => {
+      setTrans({
+        text: e.payload.text,
+        target: e.payload.target,
+        second: e.payload.second ?? '',
+        gen: e.payload.gen,
+        status: 'streaming',
+        stream: '',
+        thinking: '',
+        final: '',
+        error: '',
+        ms: 0,
+        firstMs: 0,
+        autoCopied: false,
+        copyFailed: false,
+        structured: '',
+        input: e.payload.input,
+      });
+      setTransBusy(true);
+      setTransCopied(false);
+      setTransActionErr('');
+      setSrcExpanded(false);
+      setTransSaved(false); // 新会话接管旧卡：取消挂起的 Esc 守存延迟关闭
+      // 翻译卡片接管悬浮窗：OCR 卡片让位（截图翻译一键链的切换点）
+      setOcrBusy(false);
+      setOcrCard(null);
+      setOcrSaved(false); // 同 sn-status：取消挂起的 Esc 延迟关闭
+      setMem(null); // 记忆召回卡也让位：搜索卡随时可重开，流式翻译会话丢了找不回
       },
     );
     const un2 = listen<{
@@ -930,20 +1007,20 @@ export default function Overlay() {
   }, [transSaved]);
 
   /* 全局 Esc 兜底：done/error 阶段没有专属 Esc 处理器，此处补齐关闭入口。
-     翻译卡 / OCR 卡 / 审阅编辑框各自的 Esc 处理器会先行 preventDefault 并接管
-     （关闭或守存），这里以「卡片在场即整体让位」+ defaultPrevented 双保险，
-     无论监听器注册先后都不会双触发 */
+     翻译卡 / OCR 卡 / 记忆召回卡 / 审阅编辑框各自的 Esc 处理器会先行
+     preventDefault 并接管（关闭或守存），这里以「卡片在场即整体让位」+
+     defaultPrevented 双保险，无论监听器注册先后都不会双触发 */
   useEffect(() => {
     if (stage !== 'done' && stage !== 'error') return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented) return;
-      if (trans || ocrBusy || ocrCard || ocrErr) return;
+      if (trans || ocrBusy || ocrCard || ocrErr || mem) return;
       e.preventDefault();
       void dismissOverlay();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr]);
+  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr, !!mem]);
 
   /* 翻译卡片：按内容自适应窗口高度（流式与完成共用一条估算） */
   const transBody = trans
@@ -1127,6 +1204,150 @@ export default function Overlay() {
     return () => clearTimeout(t);
   }, [ocrErr]);
 
+  /* ---- 记忆召回搜索卡：生命周期事件 + 输入即搜 + 键位 ---- */
+  useEffect(() => {
+    const un = listen<{ recent: MemEntry[] }>('sn-mem-recall', (e) => {
+      /* 听写会话进行中（录音/识别/优化/审阅）不让位：宁可不弹也不打断正在
+         进行的会话——互斥惯例里听写优先级最高（sn-status 到来会清掉一切卡）。
+         done/error 驻留态允许接管（结果已完整展示过，倒计时卡本就即将消失） */
+      const s = stageRef.current;
+      if (s === 'recording' || s === 'transcribing' || s === 'optimizing' || s === 'review')
+        return;
+      // 作废在途的防抖搜索，防止迟到的旧词结果覆盖事件携带的「最近」序
+      memSeqRef.current++;
+      if (memDebounceRef.current) clearTimeout(memDebounceRef.current);
+      // 召回卡接管悬浮窗：翻译 / OCR 卡片清场（与 translate-start 清 OCR 同一惯例）
+      setTrans(null);
+      setTransBusy(false);
+      setTransActionErr('');
+      setTransSaved(false);
+      setOcrBusy(false);
+      setOcrCard(null);
+      setOcrSaved(false);
+      setMem({ q: '', items: e.payload.recent, sel: 0, composing: false, err: null });
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  const closeMemCard = () => {
+    if (memDebounceRef.current) clearTimeout(memDebounceRef.current);
+    memSeqRef.current++; // 作废在途请求（结果回调对 null 卡片本就是 no-op，双保险）
+    setMem(null);
+    void dismissOverlay();
+  };
+
+  /* 输入即搜：120ms 防抖合并键击；空查询也调（后端返回「置顶 + 最近」序，
+     与热键呼出时同一口径）。序号守卫防慢的旧响应覆盖新词的结果 */
+  const scheduleMemSearch = (q: string) => {
+    if (memDebounceRef.current) clearTimeout(memDebounceRef.current);
+    const seq = ++memSeqRef.current;
+    memDebounceRef.current = setTimeout(() => {
+      memRecall(q, 12)
+        .then((items) => {
+          if (memSeqRef.current !== seq) return;
+          setMem((prev) => (prev ? { ...prev, items, sel: 0, err: null } : prev));
+        })
+        .catch(() => {
+          // 检索失败按空结果呈现，不打断继续输入改词重搜
+          if (memSeqRef.current !== seq) return;
+          setMem((prev) => (prev ? { ...prev, items: [], sel: 0, err: null } : prev));
+        });
+    }, 120);
+  };
+
+  /* ↑↓ 环形移动高亮；Enter 注入 / Ctrl+Enter 复制后关卡（结果提示由后端
+     sn-status 广播，前端只关卡）；Esc 关卡。IME 红线：自管 composing 标志
+     与浏览器 isComposing 标记（各浏览器 compositionend 与 keydown 先后不一）
+     任一命中即放行给输入法，绝不触发动作——拼音选词的回车把半截拼音注入
+     目标输入框是同类产品连修多版的高发事故 */
+  const onMemKey = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (!mem || mem.composing || e.nativeEvent.isComposing) return;
+    const len = mem.items.length;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (len === 0) return;
+      const dir = e.key === 'ArrowDown' ? 1 : -1;
+      setMem((p) => (p ? { ...p, sel: (((p.sel + dir) % len) + len) % len } : p));
+    } else if (e.key === 'Enter') {
+      const it = mem.items[mem.sel];
+      if (!it) return;
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) fireMem(memCopyUsed(it.ts));
+      else fireMem(memRecallPaste(it.ts));
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMemCard();
+    }
+  };
+
+  /* 注入/复制失败不关卡：后端走 Err 语义（不计数），这里在卡内提示一行，
+     用户可重试或改用另一动作；成功则后端 sn-status(done) 会统一清卡 */
+  const fireMem = (p: Promise<unknown>) => {
+    p.catch((e) => {
+      setMem((m) => (m ? { ...m, err: prettyError(e) } : m));
+    });
+  };
+
+  /* 行点击等效于 Enter 注入：鼠标路径不经过键盘合成态，无需 composing 守卫 */
+  const onMemPick = (it: MemEntry) => {
+    fireMem(memRecallPaste(it.ts));
+  };
+
+  /* 召回卡：Esc 兜底（焦点被列表行抢走时输入框 onKeyDown 够不到；与翻译/
+     OCR 卡同款 window 监听 + defaultPrevented 双保险）；IME 合成期放行给
+     输入法取消合成，不关卡 */
+  useEffect(() => {
+    if (!mem) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (mem.composing || e.isComposing) return;
+      e.preventDefault();
+      closeMemCard();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // closeMemCard 只依赖 ref 与 setState（引用语义稳定），无需进依赖
+  }, [!!mem, mem?.composing]);
+
+  /* 开卡聚焦搜索框（60ms 等窗口从隐藏态显示后再聚焦，与审阅编辑器同手法） */
+  useEffect(() => {
+    if (!mem) return;
+    const t = setTimeout(() => memInputRef.current?.focus(), 60);
+    return () => clearTimeout(t);
+  }, [!!mem]);
+
+  /* 键盘高亮行滚入可视区：环形移动跨端跳转时浏览器不自动跟随，
+     不滚入的话高亮会消失在列表视口外 */
+  useEffect(() => {
+    const sel = mem?.sel ?? -1;
+    if (sel < 0) return;
+    memListRef.current
+      ?.querySelector<HTMLElement>(`[data-mem-idx="${sel}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [mem?.sel]);
+
+  /* 召回卡按结果数自适应窗口高度（行高约 40px，封顶 560 后列表内部滚动，
+     与 done/trans/OCR 卡同一自适应手法） */
+  const memH = useMemo(() => {
+    if (!mem) return WIN_NORMAL.h;
+    return Math.min(Math.max(232 + mem.items.length * 40, WIN_NORMAL.h), 560);
+  }, [!!mem, mem?.items.length]);
+  useEffect(() => {
+    if (!mem) return;
+    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, memH));
+  }, [!!mem, memH]);
+
+  /* 关卡后交还尺寸控制权：无其他卡片接管时还原默认窗口，避免下一次以
+     idle 态打开的悬浮内容顶着本卡遗留的放大窗口（与 OCR 卡清场同款守卫） */
+  useEffect(() => {
+    if (mem) return;
+    if (stage === 'idle' && !trans && !ocrBusy && !ocrCard && !ocrErr) {
+      void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
+    }
+  }, [!!mem, stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr]);
+
   /* 语言条切换目标语言并重译（持久化，托盘/设置页同步） */
   const onTransTarget = (code: string) => {
     /* 流式中允许直接换语言：后端 gen 代数会作废旧流（superseded 迟到结果
@@ -1263,10 +1484,10 @@ export default function Overlay() {
 
   /* done/error 卡键盘可达：无焦点窗口够不到卡上的按钮（鼠标专属），补
      C=复制 / R=重试 快捷键；带修饰键的组合不拦截（防误吞系统快捷键），
-     翻译 / OCR 卡在场时整体让位（与 Esc 兜底同一互斥条件） */
+     翻译 / OCR / 记忆召回卡在场时整体让位（与 Esc 兜底同一互斥条件） */
   useEffect(() => {
     if (stage !== 'done' && stage !== 'error') return;
-    if (trans || ocrBusy || ocrCard || ocrErr) return;
+    if (trans || ocrBusy || ocrCard || ocrErr || mem) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
       const k = e.key.toLowerCase();
@@ -1287,7 +1508,7 @@ export default function Overlay() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // onDoneCopy 是闭包内稳定引用的普通函数（依赖 result），进依赖以读取最新值
-  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr, retryable, retrying, result, message]);
+  }, [stage, !!trans, !!ocrBusy, !!ocrCard, !!ocrErr, !!mem, retryable, retrying, result, message]);
 
   /* done 卡「重新优化」：复用审阅卡的 optimize_text 通道（后端纯计算 + 流式
      sn-llm-delta，不改 stage、不动待确认项与历史），结果直接更新终稿显示；
@@ -1313,14 +1534,17 @@ export default function Overlay() {
   const partialSplit = splitPartialTail(partial);
 
   /* OCR 取词链路里后端先发 stage=idle 再发 sn-ocr-start（ocr.rs）：
-     早退条件必须放行 OCR 三态，否则截图取词的结果卡/错误卡永远渲染不出来 */
-  if (stage === 'idle' && !trans && !ocrBusy && !ocrCard && !ocrErr)
+     早退条件必须放行 OCR 三态，否则截图取词的结果卡/错误卡永远渲染不出来。
+     记忆召回卡同理：热键呼出时后端同样先复位到 idle 再广播 sn-mem-recall */
+  if (stage === 'idle' && !trans && !ocrBusy && !ocrCard && !ocrErr && !mem)
     return <div className="h-screen w-screen" />;
 
-  // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红；翻译卡=青绿
+  // 阶段主题色描边：录音=玫红 识别=天蓝 优化=靛紫 完成=翠绿 审阅=琥珀 出错=红；翻译卡=青绿；召回卡=亮紫
   const glow = trans
     ? 'from-emerald-400/50 via-teal-400/25 to-emerald-400/50'
-    : stage === 'recording'
+    : mem
+      ? 'from-violet-400/50 via-indigo-500/25 to-violet-400/50'
+      : stage === 'recording'
       ? 'from-rose-500/55 via-red-500/25 to-rose-500/55'
       : stage === 'optimizing'
         ? 'from-indigo-400/45 via-violet-500/25 to-indigo-400/45'
@@ -1357,7 +1581,9 @@ export default function Overlay() {
             ...(stage === 'review' ? { width: CARD_W_REVIEW } : null),
             '--stage-glow': trans
               ? GLOW_COLORS.translate
-              : (GLOW_COLORS[stage] ?? GLOW_COLORS.transcribing),
+              : mem
+                ? GLOW_COLORS.mem
+                : (GLOW_COLORS[stage] ?? GLOW_COLORS.transcribing),
           } as CSSProperties
         }
       >
@@ -1416,7 +1642,7 @@ export default function Overlay() {
               </span>
             )}
           </div>
-          {(stage === 'done' || stage === 'error') && !trans && (
+          {(stage === 'done' || stage === 'error') && !trans && !mem && (
             <span
               key={`${stage}-${resultId}`}
               className={`countdown-bar absolute bottom-0 left-0 h-[2px] ${
@@ -1579,13 +1805,28 @@ export default function Overlay() {
                 <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-[13px]">
                   🌐
                 </span>
-                <span className="text-[13px] font-medium text-emerald-300">划词翻译</span>
+                {/* 共用此卡的两条路径标题分开：输入框翻译会自动改写用户草稿，
+                    必须让用户一眼分清这次翻译「会动输入框」还是「只出结果」 */}
+                <span className="text-[13px] font-medium text-emerald-300">
+                  {trans.input ? '输入框翻译' : '划词翻译'}
+                </span>
                 {trans.structured && (
                   <span
                     className="rounded-full border border-teal-400/30 bg-teal-400/10 px-2 py-0.5 text-[10px] text-teal-300"
                     title="检测到结构化文本：只翻译了字符串值，键名、注释与格式原样保留"
                   >
                     📄 {trans.structured} · 只译值
+                  </span>
+                )}
+                {/* 输入框翻译：与划词翻译共用此卡，需预示「译文会自动写回
+                    输入框」。错误态（替换失败/同文跳过）不会再有替换，显示
+                    「将替换」反而与错误正文自相矛盾，只在流式与结果态亮 */}
+                {trans.input && trans.status !== 'error' && (
+                  <span
+                    className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[10px] text-amber-300"
+                    title="翻译完成后译文将自动替换回原输入框的草稿，替换后可在目标应用按 Ctrl+Z 撤销"
+                  >
+                    ↩ 将替换回输入框
                   </span>
                 )}
                 {trans.status === 'streaming' && (
@@ -1785,6 +2026,134 @@ export default function Overlay() {
                   {transActionErr}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* 记忆召回搜索卡（互斥由开卡清场 + translate-start/sn-status 反向清场
+              构成闭环；done/error 卡与其倒计时条在本卡在场时一律让位——同屏
+              两卡会被按内容计高的窗口 overflow-hidden 裁切） */}
+          {mem && !trans && (
+            <div className="anim-rise" onClick={(e) => e.stopPropagation()}>
+              {/* 标题行 */}
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-violet-500/15 text-[13px]">
+                  🧠
+                </span>
+                <span className="text-[13px] font-medium text-violet-300">记忆召回</span>
+                <span className="text-[10.5px] text-slate-600">输入即搜个人记忆库</span>
+                <button
+                  type="button"
+                  onClick={closeMemCard}
+                  title="关闭（Esc）"
+                  className="ml-auto flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-black/25 text-[11px] text-slate-500 transition hover:border-white/25 hover:text-slate-200"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* 搜索框：IME 合成中的拼音中间态不上屏就搜（中间态不是用户要查
+                  的词），compositionend 再按定稿词补搜一次 */}
+              <input
+                ref={memInputRef}
+                value={mem.q}
+                spellCheck={false}
+                placeholder="搜索记忆：标题 / 正文 / 关键词（空格分词）…"
+                aria-label="搜索记忆"
+                onChange={(e) => {
+                  const q = e.target.value;
+                  setMem((prev) => (prev ? { ...prev, q } : prev));
+                  /* compositionstart 必先于本次合成的 input 事件（DOM 事件序），
+                     自管 composing 标志此处已可靠为 true；拼音中间态不上屏就搜 */
+                  if (!mem.composing) scheduleMemSearch(q);
+                }}
+                onCompositionStart={() =>
+                  setMem((prev) => (prev ? { ...prev, composing: true } : prev))
+                }
+                onCompositionEnd={(e) => {
+                  setMem((prev) => (prev ? { ...prev, composing: false } : prev));
+                  scheduleMemSearch(e.currentTarget.value);
+                }}
+                onKeyDown={onMemKey}
+                className="mt-2.5 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] focus:border-violet-400/60 focus:ring-2 focus:ring-violet-500/15"
+              />
+
+              {/* 结果列表：键盘高亮 / 悬停预览（Raycast 式），行点击等效 Enter 注入 */}
+              <div
+                ref={memListRef}
+                role="listbox"
+                aria-label="记忆结果"
+                className="sn-scroll mt-2 max-h-[300px] overflow-y-auto"
+              >
+                {mem.items.length === 0 ? (
+                  <div className="py-6 text-center text-[12px] text-slate-500">
+                    没有匹配的记忆
+                  </div>
+                ) : (
+                  mem.items.map((it, i) => (
+                    <button
+                      key={it.ts}
+                      type="button"
+                      role="option"
+                      aria-selected={i === mem.sel}
+                      data-mem-idx={i}
+                      onMouseEnter={() =>
+                        setMem((p) => (p && p.sel !== i ? { ...p, sel: i } : p))
+                      }
+                      onClick={() => onMemPick(it)}
+                      title="点击注入到当前输入框"
+                      className={`flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition ${
+                        i === mem.sel
+                          ? 'border-violet-400/40 bg-violet-400/10'
+                          : 'border-transparent hover:bg-white/[0.04]'
+                      }`}
+                    >
+                      <span
+                        className={`shrink-0 rounded-full border px-1.5 py-0.5 text-[9.5px] ${MEM_KIND_CLS[it.kind]}`}
+                      >
+                        {MEM_KIND_LABEL[it.kind]}
+                      </span>
+                      <span
+                        className="min-w-0 flex-1 truncate text-[12.5px] text-slate-200"
+                        title={it.text}
+                      >
+                        {it.title}
+                      </span>
+                      {/* 使用/命中计数：小字弱色，0 视为未发生不渲染 */}
+                      {!!it.uses && (
+                        <span
+                          className="shrink-0 font-mono text-[10px] text-slate-500"
+                          title={`已使用 ${it.uses} 次（召回注入 / 复制全文）`}
+                        >
+                          ⏱×{it.uses}
+                        </span>
+                      )}
+                      {!!it.hits && (
+                        <span
+                          className="shrink-0 font-mono text-[10px] text-slate-500"
+                          title={`近重复内容再次采到 ${it.hits} 次（合并累计）`}
+                        >
+                          🔁×{it.hits}
+                        </span>
+                      )}
+                      <span className="shrink-0 font-mono text-[10px] text-slate-500">
+                        {fmtRelTime(it.ts, Date.now())}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+
+              {/* 注入/复制失败的内联提示（成功路径走 sn-status 清卡，到不了这里） */}
+              {mem.err && (
+                <div className="mt-2 rounded-lg border border-red-500/25 bg-red-500/[0.08] px-2.5 py-1.5 text-[11px] leading-4 text-red-300">
+                  ⚠ {mem.err}（可重试，或 Ctrl+Enter 改为复制）
+                </div>
+              )}
+
+              {/* 常驻键位提示条 */}
+              <div className="mt-2 border-t border-white/[0.06] pt-2 text-center text-[10px] text-slate-600">
+                ↑↓ 选择 · Enter 注入 · Ctrl+Enter 复制 · Esc 关闭
+              </div>
             </div>
           )}
 
@@ -2008,7 +2377,7 @@ export default function Overlay() {
             </div>
           )}
 
-          {stage === 'done' && !trans && (
+          {stage === 'done' && !trans && !mem && (
             <div className="anim-rise">
               <div className="flex items-center gap-2.5">
                 <span className="anim-pop flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-[12px] text-emerald-400 ring-2 ring-emerald-500/20">
@@ -2106,7 +2475,7 @@ export default function Overlay() {
             </div>
           )}
 
-          {stage === 'error' && !trans && (
+          {stage === 'error' && !trans && !mem && (
             <div
               className="anim-rise"
               /* 重试/管理员重启按钮的点击不冒泡到外层关闭悬浮窗（与翻译/OCR 卡

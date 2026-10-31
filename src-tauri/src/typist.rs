@@ -61,6 +61,11 @@ fn clamp_cfg(cfg: TypistConfig) -> TypistConfig {
 
 /* ---------- 对外命令 ---------- */
 
+/// typist 是否正在向目标窗口逐字注入（输入框翻译据此互斥）
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::SeqCst)
+}
+
 /// 开始把整段文本逐字敲进当前焦点窗口。隐藏 typist 窗口后立即返回，
 /// 等待焦点回归 / 倒计时 / 逐字注入都在后台线程完成，进度走事件。
 #[tauri::command]

@@ -26,6 +26,17 @@ pub fn abort_active_session() {
     GEN.fetch_add(1, Ordering::SeqCst);
 }
 
+/// 取新会话代数（translate_input 用：它在会话外还要持 gen 复查作废状态——
+/// 翻译完成到回填注入之间隔着秒级窗口，Esc/新翻译/新输入框翻译都会 bump GEN）
+pub(crate) fn next_translate_gen() -> u64 {
+    GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// 指代会话是否仍是最新一代
+pub(crate) fn translate_gen_current(gen: u64) -> bool {
+    GEN.load(Ordering::SeqCst) == gen
+}
+
 /* ---------- 悬浮窗隐藏倒计时的「翻译卡让位」闸门 ---------- */
 
 /// 听写收尾（finish_status）会在翻译流式进行中重新武装隐藏倒计时（cancel_hide
@@ -63,7 +74,7 @@ fn arm_hide(app: &AppHandle, ms: u64) {
     crate::pipeline::hide_later(app, ms);
 }
 
-fn current_config(app: &AppHandle) -> Config {
+pub(crate) fn current_config(app: &AppHandle) -> Config {
     app.state::<crate::Ctx>()
         .config
         .lock()
@@ -82,7 +93,7 @@ fn llm_ready(cfg: &Config) -> Result<(), String> {
 }
 
 /// 翻译引擎就绪检查：本地引擎查模型/运行时文件，云端查 LLM 配置
-fn engine_ready(app: &AppHandle, cfg: &Config) -> Result<(), String> {
+pub(crate) fn engine_ready(app: &AppHandle, cfg: &Config) -> Result<(), String> {
     if cfg.translate.engine == "local" {
         let id = crate::local_llm::resolve(&cfg.translate.local_model).id;
         if !crate::local_llm::model_files_ok(app, id) {
@@ -96,7 +107,7 @@ fn engine_ready(app: &AppHandle, cfg: &Config) -> Result<(), String> {
 }
 
 /// 黑名单命中：前台窗口标题或进程名包含任一关键字（大小写不敏感）
-fn blacklist_hit(cfg: &Config) -> Option<String> {
+pub(crate) fn blacklist_hit(cfg: &Config) -> Option<String> {
     let pats: Vec<String> = cfg
         .translate
         .blacklist
@@ -179,7 +190,7 @@ pub fn launch_card(app: &AppHandle, cfg: &Config, text: String) {
     start_session(app, cfg, text, cfg.llm.translate_target.clone());
 }
 
-fn show_translate_error(app: &AppHandle, message: &str) {
+pub(crate) fn show_translate_error(app: &AppHandle, message: &str) {
     // 入口失败（取词失败等）没有新会话可接管卡片：先作废仍在流式的旧会话。
     // 否则这条无 gen 的错误会先劫持现有卡片，旧会话迟到 result 又把卡片
     // 翻回完成态，状态来回跳
@@ -189,6 +200,21 @@ fn show_translate_error(app: &AppHandle, message: &str) {
         crate::overlay::show(app);
     }
     let _ = app.emit("sn-translate-error", serde_json::json!({ "message": message }));
+    arm_hide(app, 6000);
+}
+
+/// 带会话代数的错误卡（会话完成后的收尾错误，如输入框翻译替换失败）。
+/// 与上面无 gen 版本的关键差别：**不作废会话代数**——此刻用户可能已开始
+/// 新一轮翻译，abort 会误杀新会话的流；前端本来就按 gen 过滤旧会话错误
+pub(crate) fn show_translate_error_gen(app: &AppHandle, gen: u64, message: &str) {
+    let cfg = current_config(app);
+    if cfg.general.show_overlay && !crate::pipeline::suppress_local_overlay(&cfg) {
+        crate::overlay::show(app);
+    }
+    let _ = app.emit(
+        "sn-translate-error",
+        serde_json::json!({ "gen": gen, "message": message }),
+    );
     arm_hide(app, 6000);
 }
 
@@ -209,6 +235,34 @@ pub fn start_session(app: &AppHandle, cfg: &Config, text: String, target: String
     tauri::async_runtime::spawn(async move {
         let _ = session(app, cfg, text, target, gen, true).await;
     });
+}
+
+/// 输入框翻译会话：广播 sn-translate-start（悬浮窗出卡）并跑完会话返回译文，
+/// 供 translate_input 随后替换回输入框。gen 由调用方先经 next_translate_gen()
+/// 取得并持有（回填前要复查会话未被作废）。auto_copy 强制关：译文直接回填
+/// 输入框，再顺手写剪贴板会覆盖用户剪贴板里真正重要的内容
+pub(crate) async fn session_for_input(
+    app: &AppHandle,
+    cfg: &Config,
+    text: String,
+    target: String,
+    gen: u64,
+) -> Result<String, String> {
+    let _ = app.emit(
+        "sn-translate-start",
+        serde_json::json!({
+            "gen": gen,
+            "text": text,
+            "target": target,
+            "second": cfg.llm.translate_second_target,
+            // 输入框翻译标记：前端据此在卡片上提示「将自动替换回输入框」，
+            // 与划词翻译的卡区分开（其余翻译路径不带此字段）
+            "input": true,
+        }),
+    );
+    let mut c = cfg.clone();
+    c.translate.auto_copy = false;
+    session(app.clone(), c, text, target, gen, true).await
 }
 
 /// 单次翻译会话。流式增量经 sn-llm-delta 广播（悬浮窗卡片 / 工作台据此逐字上屏）；
@@ -347,6 +401,8 @@ async fn session(
     };
     // 翻译入历史（原文/译文对照，供回查与再复制；asrMs=0 时前端隐藏识别行）
     crate::history::push(&app, &text, &out, 0, ms, "translate");
+    // 记忆库采集：译文入库（输入框翻译也复用本会话，一并覆盖到）
+    crate::mem::capture(&app, "translate", &crate::inject::foreground_process_name(), &out);
     if announce {
         let _ = app.emit(
             "sn-translate-result",
@@ -561,6 +617,8 @@ async fn translate_structured(
         (false, false)
     };
     crate::history::push(app, text, &out, 0, ms, "translate");
+    // 记忆库采集：结构化翻译译文入库（该路径不经 session 的收尾段）
+    crate::mem::capture(app, "translate", &crate::inject::foreground_process_name(), &out);
     if announce {
         let _ = app.emit(
             "sn-translate-result",

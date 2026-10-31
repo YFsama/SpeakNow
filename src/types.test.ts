@@ -17,6 +17,8 @@ function baseConfig(patch: {
       keyTranslate: '',
       keyTranslateSel: '',
       keyOcr: '',
+      keyTranslateInput: '',
+      keyMemRecall: '',
       mode: 'toggle',
       enabled: true,
       minDurationMs: 800,
@@ -102,6 +104,16 @@ function baseConfig(patch: {
       hideLocalOverlay: false,
       allowLan: false,
       port: 8866,
+    },
+    mem: {
+      enabled: true,
+      captureDictation: true,
+      captureOcr: true,
+      captureTranslate: true,
+      distill: false,
+      captureBlacklist: '',
+      apiToken: '',
+      limit: 500,
     },
   } as unknown as Config;
 }

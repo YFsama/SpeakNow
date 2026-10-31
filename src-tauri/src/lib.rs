@@ -11,6 +11,8 @@ mod inject;
 mod llm;
 pub mod local_whisper;
 mod local_llm;
+mod mem;
+mod mem_import;
 mod ocr;
 mod overlay;
 mod pipeline;
@@ -18,6 +20,7 @@ mod qwen_asr;
 mod selection;
 mod trans_struct;
 mod translate;
+mod translate_input;
 mod tray;
 mod text_clean;
 mod typist;
@@ -1004,6 +1007,9 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
         .map_err(|e| format!("输入失败：{e:#}"))?;
 
     history::push(&app, &pending.raw, &text, pending.asr_ms, pending.llm_ms, "dictation");
+    // 记忆库采集：审阅模式的终稿只在确认时落历史，此处一并入库（编辑后的文本
+    // 才是用户认可的产出；取消审阅则不会走到这里，不采集）
+    mem::capture(&app, "dictation", &inject::foreground_process_name(), &text);
     events::emit(
         &app,
         "sn-result",
@@ -1268,6 +1274,9 @@ pub fn run() {
                 });
             }
             tray::setup(app.handle())?;
+            // /mem 只读端点需要全局 AppHandle（display_api 的 router 链路拿不到），
+            // 启动期登记一次即可（OnceLock 首写为准）
+            display_api::set_app_handle(app.handle().clone());
             if let Err(e) = hotkey::apply_tracked(app.handle(), &cfg.hotkey) {
                 eprintln!("[speaknow] {e:#}");
             }
@@ -1414,6 +1423,20 @@ pub fn run() {
             regenerate,
             update_history_final,
             history_set_pin,
+            mem::mem_list,
+            mem::mem_delete_batch,
+            mem::mem_set_pinned,
+            mem::mem_clear,
+            mem::mem_recall,
+            mem::mem_used,
+            mem::mem_recall_paste,
+            mem::mem_copy_used,
+            mem::mem_storage_stats,
+            mem::mem_gen_token,
+            mem_import::mem_add_note,
+            mem_import::mem_import_url,
+            mem_import::mem_import_files,
+            mem_import::mem_import_folder,
             ocr_screen_source,
             copy_text,
             dismiss_overlay,
@@ -1429,6 +1452,7 @@ pub fn run() {
             translate::translate_retarget,
             translate::translate_replace,
             translate::translate_announce,
+            translate_input::translate_input_cmd,
             ocr::ocr_capture_cmd,
             ocr::ocr_region_selected,
             ocr::ocr_cancel,

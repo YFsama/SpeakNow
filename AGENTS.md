@@ -48,11 +48,14 @@ devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
 | `src-tauri/src/typist.rs` | 文本模拟输入：独立小窗（按需创建）+ 逐字注入（Windows 直发 KEYEVENTF_UNICODE，不经 enigo 的 VK 映射；HIGH_RESOLUTION waitable timer 定节奏——thread::sleep 受 15.6ms 系统分辨率限制，快档会失真）+ 低级钩子「按任意物理键中止」+ 剪贴板直输 / 输入中实时调速 / 草稿落盘 |
 | `src-tauri/src/selection.rs` | 划词取词：UIA 无副作用通道 + 模拟 Ctrl+C 兜底 |
 | `src-tauri/src/translate.rs` / `trans_struct.rs` | 划词/复制即翻译 + 结构化（i18n 文件）翻译，见 docs/translation.md |
+| `src-tauri/src/translate_input.rs` | 输入框翻译：UIA 读聚焦输入框草稿 → 复用翻译会话 → 全选粘贴替换回输入框 |
+| `src-tauri/src/mem.rs` | 记忆库：听写/OCR/翻译产出自动沉淀 mem.json（采集钩子在 pipeline/ocr/translate/lib.confirm_edit 四处，各一行）、加权检索（keywords=3/title=2/text=1，分词 AND）、LLM 蒸馏（复用 llm::optimize，DISTILL_BUSY 单飞）、滚动清理；检索语义须与 mock-tauri.ts 的 mockMemSearch 逐字对齐，见 docs/mem.md |
 | `src-tauri/src/ocr.rs` | 截图取词：每屏选区窗 + GDI 截屏 + Windows OCR / PP-OCR |
 | `src-tauri/src/qwen_asr.rs` / `local_llm.rs` | llama.cpp sidecar 进程管理（下载/预热/Job Object 回收） |
 | `src-tauri/src/display_api.rs` | 外接字幕屏 axum HTTP/WS 服务，见 docs/external-display-api.md |
 | `src-tauri/src/events.rs` | 所有 `sn-*` 事件的统一发射出口 |
 | `src/components/Overlay.tsx` | 悬浮窗全部卡片（听写/翻译/OCR/审阅/错误），2000+ 行，改动画注意各卡互斥条件 |
+| `src/components/tabs/MemTab.tsx` | 记忆页：时间轴/搜索高亮/类型过滤/多选批量/导出，交互范式对齐 HistoryTab |
 | `src/dev/mock-tauri.ts` | 浏览器 mock 层（`?mock=1`），新增命令/事件须同步补 mock |
 
 ## 三条契约（改一侧必须同步另一侧，CI 用 `npm run contracts` 门禁）

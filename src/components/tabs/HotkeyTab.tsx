@@ -13,7 +13,9 @@ type HotkeyField =
   | 'keyTranslate'
   | 'keyTranslateSel'
   | 'keyOcr'
-  | 'keyTypist';
+  | 'keyTypist'
+  | 'keyTranslateInput'
+  | 'keyMemRecall';
 
 const HOTKEY_FIELD_LABELS: Record<HotkeyField, string> = {
   key: '主快捷键',
@@ -22,6 +24,8 @@ const HOTKEY_FIELD_LABELS: Record<HotkeyField, string> = {
   keyTranslateSel: '划词翻译',
   keyOcr: '截图取词',
   keyTypist: '文本模拟输入',
+  keyTranslateInput: '输入框翻译',
+  keyMemRecall: '记忆召回',
 };
 
 const HOTKEY_FIELDS: HotkeyField[] = [
@@ -31,6 +35,8 @@ const HOTKEY_FIELDS: HotkeyField[] = [
   'keyTranslateSel',
   'keyOcr',
   'keyTypist',
+  'keyTranslateInput',
+  'keyMemRecall',
 ];
 
 export function HotkeyTab({ cfg, set }: TabProps) {
@@ -77,7 +83,9 @@ export function HotkeyTab({ cfg, set }: TabProps) {
     else if (field === 'keyTranslate') set('hotkey', { keyTranslate: v });
     else if (field === 'keyTranslateSel') set('hotkey', { keyTranslateSel: v });
     else if (field === 'keyOcr') set('hotkey', { keyOcr: v });
-    else set('hotkey', { keyTypist: v });
+    else if (field === 'keyTypist') set('hotkey', { keyTypist: v });
+    else if (field === 'keyTranslateInput') set('hotkey', { keyTranslateInput: v });
+    else set('hotkey', { keyMemRecall: v });
   };
 
   // 渲染时复核冲突是否仍在（另一字段改走后警告自动消失）
@@ -91,9 +99,10 @@ export function HotkeyTab({ cfg, set }: TabProps) {
     ) : null;
 
   // 已设置槽位的「清除」入口：写入空串即「未设置」（后端 hotkey.rs 对空串一律跳过注册）。
-  // 空串不会与其他槽位撞车，可安全绕过查重分支；此前误录后只能换绑、无法解绑
+  // 空串不会与其他槽位撞车，可安全绕过查重分支；此前误录后只能换绑、无法解绑。
+  // keyMemRecall 为可选字段（旧配置缺省 undefined），统一 ?? '' 归一
   const clearBtn = (field: HotkeyField) =>
-    cfg.hotkey[field].trim() === '' ? null : (
+    (cfg.hotkey[field] ?? '').trim() === '' ? null : (
       <button
         type="button"
         onClick={() => applyKey(field, '')}
@@ -191,6 +200,30 @@ export function HotkeyTab({ cfg, set }: TabProps) {
           />
           {dupWarning('keyTypist')}
           {clearBtn('keyTypist')}
+        </Field>
+      </div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Field
+          label="输入框翻译（可选）"
+          hint="光标在任意应用输入框且写了一半时按此键：读取框内未发送草稿，翻译成目标语言后替换回输入框（目标语言在「翻译」页设置）；替换后可用 Ctrl+Z 撤销"
+        >
+          <HotkeyRecorder
+            value={cfg.hotkey.keyTranslateInput}
+            onChange={(keyTranslateInput) => applyKey('keyTranslateInput', keyTranslateInput)}
+          />
+          {dupWarning('keyTranslateInput')}
+          {clearBtn('keyTranslateInput')}
+        </Field>
+        <Field
+          label="记忆召回（可选）"
+          hint="呼出记忆搜索悬浮卡：输入即搜，Enter 把选中记忆注入当前输入框（建议 Alt+M）"
+        >
+          <HotkeyRecorder
+            value={cfg.hotkey.keyMemRecall ?? ''}
+            onChange={(keyMemRecall) => applyKey('keyMemRecall', keyMemRecall)}
+          />
+          {dupWarning('keyMemRecall')}
+          {clearBtn('keyMemRecall')}
         </Field>
       </div>
       <Field label="触发方式">

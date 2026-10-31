@@ -54,6 +54,7 @@ open src-tauri/target/release/bundle/macos/   # 或直接运行 .app
 | 悬浮窗锚点跟随光标（UIA） | ✅ | 降级为默认位置显示 |
 | 系统麦克风音量读取/调节 | ✅ | 不支持（软件增益仍可用） |
 | 「终端键入」输出模式 | ✅ | 不适用（Mac 终端均支持 ⌘V） |
+| 输入框翻译（读草稿+替换回框） | ✅ | 不支持（依赖 Windows UI Automation 读输入框内容，会提示仅支持 Windows） |
 | 管理员提权（UIPI）相关 | ✅ | 不适用 |
 | 本地 Whisper | CPU 推理 | 同左（较慢）；Qwen3-ASR 引擎仅限 Windows。Mac 上建议用云端 ASR |
 

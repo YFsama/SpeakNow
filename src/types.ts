@@ -38,6 +38,10 @@ export interface HotkeyConfig {
   keyOcr: string;
   /** 文本模拟输入快捷键（可选）：打开 Typist 小窗，粘贴大段文本后模拟键盘逐字敲进目标窗口 */
   keyTypist: string;
+  /** 输入框翻译快捷键：读取聚焦输入框的未发送草稿，翻译后替换回输入框；空 = 未启用 */
+  keyTranslateInput: string;
+  /** 记忆召回快捷键：呼出悬浮搜索卡，检索记忆库并一键注入当前输入框；空 = 未启用 */
+  keyMemRecall: string;
   mode: HotkeyMode;
   enabled: boolean;
   /** 短于该时长的录音视为误触忽略（ms，默认 800；hold 模式说短口令可调低） */
@@ -226,6 +230,87 @@ export interface ExternalDisplayConfig {
   hideLocalOverlay: boolean;
 }
 
+/** 记忆库（Mem）：把听写 / 截图取词 / 翻译的产出自动沉淀为可检索的个人记忆
+ *  （借鉴 Nowledge Mem 的「记忆层」理念：本地优先、可蒸馏、可检索） */
+export interface MemConfig {
+  /** 功能总开关：关闭后不再采集，已有记忆仍可查看 */
+  enabled: boolean;
+  /** 听写结果自动入库 */
+  captureDictation: boolean;
+  /** 截图取词结果自动入库 */
+  captureOcr: boolean;
+  /** 划词 / 输入框翻译结果自动入库 */
+  captureTranslate: boolean;
+  /** 入库时用已配置的 LLM 蒸馏关键词与一句话摘要（失败静默跳过，纯文本照常入库） */
+  distill: boolean;
+  /** 采集黑名单（每行一个关键字，子串匹配进程名）：命中不入库；密码管理器内置名单始终生效 */
+  captureBlacklist: string;
+  /** 记忆 REST 令牌：loopback 免钥，局域网访问 /mem/* 必须携带 X-SN-API-Key；空 = 未生成 */
+  apiToken: string;
+  /** 保留条数（滚动清理） */
+  limit: number;
+}
+
+/** 一条记忆：由听写 / 截图取词 / 翻译产出自动沉淀，或经导入中心（网页 / 文件 / 项目 / 快记）录入 */
+export interface MemEntry {
+  ts: number;
+  /** dictation（听写）/ ocr（截图取词）/ translate（划词·输入框翻译）/
+   *  note（快记·剪贴板）/ web（网页导入）/ file（文件·项目文档导入） */
+  kind: 'dictation' | 'ocr' | 'translate' | 'note' | 'web' | 'file';
+  /** 采集时的前台应用名（exe 基名，如 chrome；取不到为空串） */
+  app: string;
+  /** 展示标题：LLM 蒸馏摘要或正文前若干字 */
+  title: string;
+  /** 正文（听写终稿 / OCR 文本 / 译文） */
+  text: string;
+  /** LLM 蒸馏关键词（未蒸馏为空数组） */
+  keywords: string[];
+  distilled: boolean;
+  /** 置顶：不占保留条数名额（后端上限 20 个） */
+  pinned: boolean;
+  /** 正文字符数（码点口径，与前端 [...str].length 一致） */
+  chars: number;
+  /** 近重复再次出现次数（同源高度相似内容不另立条目，只累计） */
+  hits?: number;
+  /** 实际使用次数（召回注入 / 复制才算，检索命中不算——防错误记忆自我强化） */
+  uses?: number;
+  /** 上次实际使用时间戳（ms，0 = 从未）；用过即在新近度排序中浮顶 */
+  lastUsedAt?: number;
+  /** 软作废：被哪条记忆的时间戳取代（0 = 在世）。AI 蒸馏判定语义重复/过时后
+   *  标记；召回与 context.md 默认过滤，设置页可见、导出保留（作废优先于删除） */
+  supersededBy?: number;
+}
+
+/** 导入结果摘要（网页 / 文件 / 项目 / 快记共用） */
+export interface MemImportSummary {
+  /** 新建条数 */
+  added: number;
+  /** 近重复合并进既有条目（hits +1）的条数 */
+  merged: number;
+  /** 因大小超限/解析失败/非法路径等跳过的条数（显式导入不走采集黑名单） */
+  skipped: number;
+}
+
+/** 存储统计（记忆页存储卡与容量管理用） */
+export interface MemStorageStats {
+  items: number;
+  pinned: number;
+  superseded: number;
+  /** mem.json 字节数 */
+  bytes: number;
+  /** mem.bak 字节数（0 = 无备份） */
+  bakBytes: number;
+  chars: number;
+}
+
+/** mem_list 返回：条目 + 概览统计（统计不受查询过滤影响） */
+export interface MemListResult {
+  items: MemEntry[];
+  total: number;
+  todayCount: number;
+  totalChars: number;
+}
+
 export interface Config {
   /** 统一 API 凭据组（v2 配置；旧配置启动时自动迁移） */
   providers: ProviderProfile[];
@@ -242,6 +327,8 @@ export interface Config {
   output: OutputConfig;
   general: GeneralConfig;
   externalDisplay: ExternalDisplayConfig;
+  /** 记忆库（Mem） */
+  mem: MemConfig;
 }
 
 /** 展开凭据组引用后的生效凭据（providerId 命中 → 凭据组，否则内联字段） */
@@ -333,6 +420,7 @@ export interface UpdateInfo {
 
 export type TabId =
   | 'dash'
+  | 'mem'
   | 'hotkey'
   | 'mic'
   | 'asr'

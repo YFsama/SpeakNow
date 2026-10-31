@@ -236,6 +236,8 @@ pub async fn ocr_region_selected(
             emit_error(&h, "该区域没有识别到文字（可尝试框选更大的范围）");
             return;
         }
+        // 记忆库采集：用识别原文入库（在进入可选翻译链之前；译文由 translate 侧另行采集）
+        crate::mem::capture(&h, "ocr", &crate::inject::foreground_process_name(), &text);
         // 识别后自动复制也可能失败（剪贴板被占用）：结果事件带回 copyFailed，
         // 卡片据此提示手动复制——否则用户粘贴出旧内容还以为识别错了
         let copy_failed =

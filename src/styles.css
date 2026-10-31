@@ -11,9 +11,36 @@
     Consolas, 'Liberation Mono', monospace;
 }
 
+/* ============ 语义设计令牌（设置窗口 v2） ============
+   目的：新增视觉一律走变量，浅色只需在 html.light 换值，避免再往
+   「按 Tailwind 类名逐条覆盖」的兼容清单里加行。仅设置窗口使用；
+   overlay/typist 不引用这些变量，定义在 :root 上是惰性的、零影响。 */
+:root {
+  /* 表面层级：卡面 / 嵌套输入底 / 更浅的内嵌容器 */
+  --sn-surface: rgba(255, 255, 255, 0.025);
+  --sn-surface-2: rgba(0, 0, 0, 0.3);
+  --sn-surface-3: rgba(0, 0, 0, 0.2);
+  /* 边框：发丝线 / 悬停加强线 */
+  --sn-border: rgba(255, 255, 255, 0.07);
+  --sn-border-strong: rgba(255, 255, 255, 0.14);
+  /* 文本四级层级（标题 / 正文 / 说明 / 弱化） */
+  --sn-text-1: #f1f5f9;
+  --sn-text-2: #cbd5e1;
+  --sn-text-3: #94a3b8;
+  --sn-text-4: #64748b;
+  /* 强调色：主（天蓝）/ 副（靛蓝），与既有 sky/indigo 体系同源 */
+  --sn-accent: #38bdf8;
+  --sn-accent-2: #6366f1;
+  /* 侧栏底与页头雾化面（配合 backdrop-blur 使用） */
+  --sn-sidebar: rgba(13, 13, 20, 0.8);
+  --sn-header-veil: rgba(10, 10, 15, 0.82);
+}
+
 html {
   height: 100%;
-  /* 背景挂在 html（画布）上，滚动时整页覆盖，避免超出首屏后露底色 */
+  /* 背景挂在 html（画布）上，滚动时整页覆盖，避免超出首屏后露底色。
+     typist.html 未覆盖此规则、依赖这里的基础深色——改氛围层须保持底色不变，
+     设置窗口更细腻的氛围（网格纹理等）见下方 .sn-shell-bg，只作用于主窗口 */
   background:
     radial-gradient(1100px 520px at 85% -5%, rgba(99, 102, 241, 0.1), transparent 60%),
     radial-gradient(900px 480px at -10% 15%, rgba(56, 189, 248, 0.07), transparent 55%),
@@ -185,24 +212,27 @@ input[type='range']::-webkit-slider-thumb {
     background 0.2s;
 }
 
-/* 卡片悬浮提升 */
+/* 卡片悬浮提升（调参焕新：位移更克制、阴影改令牌化双层） */
 .card-lift {
   transition:
     transform 0.2s ease,
     border-color 0.2s ease,
-    box-shadow 0.2s ease;
+    box-shadow 0.25s ease;
 }
 .card-lift:hover {
   transform: translateY(-1px);
-  box-shadow: 0 10px 30px -14px rgba(0, 0, 0, 0.7);
+  box-shadow:
+    0 8px 24px -12px rgba(0, 0, 0, 0.55),
+    0 2px 6px -2px rgba(0, 0, 0, 0.3);
 }
 
-/* 侧栏激活渐变 */
+/* 侧栏激活渐变（调参焕新：右端淡出，与左侧指示条一起构成整体激活态） */
 .nav-glow {
   background: linear-gradient(
-    90deg,
-    rgba(56, 189, 248, 0.14),
-    rgba(99, 102, 241, 0.1)
+    92deg,
+    color-mix(in srgb, var(--sn-accent) 15%, transparent),
+    color-mix(in srgb, var(--sn-accent-2) 9%, transparent) 62%,
+    transparent
   );
 }
 
@@ -312,6 +342,21 @@ input[type='range']::-webkit-slider-thumb {
 
 /* ================= 浅色主题（html.light） ================= */
 html.light {
+  /* 语义令牌换浅色值：所有走 var() 的新视觉随之整体翻转 */
+  --sn-surface: rgba(255, 255, 255, 0.78);
+  --sn-surface-2: rgba(15, 23, 42, 0.045);
+  --sn-surface-3: rgba(15, 23, 42, 0.035);
+  --sn-border: rgba(15, 23, 42, 0.1);
+  --sn-border-strong: rgba(15, 23, 42, 0.18);
+  --sn-text-1: #0f172a;
+  --sn-text-2: #1e293b;
+  --sn-text-3: #475569;
+  --sn-text-4: #94a3b8;
+  --sn-accent: #0284c7;
+  --sn-accent-2: #4f46e5;
+  --sn-sidebar: rgba(255, 255, 255, 0.72);
+  --sn-header-veil: rgba(243, 244, 248, 0.86);
+
   background:
     radial-gradient(1100px 520px at 85% -5%, rgba(99, 102, 241, 0.08), transparent 60%),
     radial-gradient(900px 480px at -10% 15%, rgba(14, 165, 233, 0.08), transparent 55%),
@@ -605,6 +650,124 @@ html.light ::selection {
   background: rgba(2, 132, 199, 0.25);
   color: #0f172a;
 }
+
+/* ============ 设置窗口外壳 v2：氛围层与新组件类 ============ */
+
+/* 主窗口根节点氛围：在 html 底色之上叠一层更细腻的双径向光晕 + 44px 网格纹理
+   （1px 发丝线，暗端 2% 白、亮端 3% 墨），给「产品外壳」一点材质感。
+   overlay.html 覆盖了透明底、typist.html 不挂此类，二者均不受影响 */
+.sn-shell-bg {
+  background:
+    radial-gradient(1200px 640px at 70% -12%, rgba(99, 102, 241, 0.09), transparent 58%),
+    radial-gradient(820px 520px at -8% 30%, rgba(56, 189, 248, 0.06), transparent 55%),
+    radial-gradient(1400px 800px at 50% 118%, rgba(56, 189, 248, 0.045), transparent 62%),
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size:
+    auto, auto, auto, 44px 44px, 44px 44px;
+  background-attachment: fixed;
+}
+html.light .sn-shell-bg {
+  background:
+    radial-gradient(1200px 640px at 70% -12%, rgba(99, 102, 241, 0.07), transparent 58%),
+    radial-gradient(820px 520px at -8% 30%, rgba(14, 165, 233, 0.06), transparent 55%),
+    radial-gradient(1400px 800px at 50% 118%, rgba(14, 165, 233, 0.05), transparent 62%),
+    linear-gradient(rgba(15, 23, 42, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.03) 1px, transparent 1px);
+  background-size:
+    auto, auto, auto, 44px 44px, 44px 44px;
+  background-attachment: fixed;
+}
+
+/* 主区 sticky 页头：雾化 + 模糊，底部渐隐让滚过的内容柔和消失 */
+.sn-pagehead {
+  background: linear-gradient(
+    to bottom,
+    var(--sn-header-veil) 0%,
+    var(--sn-header-veil) 58%,
+    transparent 100%
+  );
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+}
+
+/* 侧栏激活项左侧指示条：竖向渐变 + 微光（配 nav-glow 渐变底一起构成激活态） */
+.sn-nav-indicator {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 16px;
+  width: 3px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: linear-gradient(to bottom, var(--sn-accent), var(--sn-accent-2));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--sn-accent) 60%, transparent);
+}
+
+/* 侧栏分组标题：小号字距 + 右延发丝线，层级感靠线不靠底色 */
+.sn-group-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  color: var(--sn-text-4);
+}
+.sn-group-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    var(--sn-border-strong),
+    transparent
+  );
+}
+
+/* 侧栏计数徽章（历史条数 / 记忆条数共用） */
+.sn-nav-badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--sn-border);
+  background: var(--sn-surface-2);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sn-text-3);
+}
+
+/* Dashboard hero 卡纹理：细网格 + 斜向双强调色渐变，身份感比纯色卡强 */
+.sn-hero {
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    radial-gradient(640px 260px at 100% 0%, rgba(56, 189, 248, 0.09), transparent 62%),
+    linear-gradient(
+      135deg,
+      rgba(56, 189, 248, 0.07),
+      rgba(99, 102, 241, 0.05) 45%,
+      transparent 78%
+    );
+  background-size:
+    28px 28px, 28px 28px, auto, auto;
+}
+html.light .sn-hero {
+  background:
+    linear-gradient(rgba(15, 23, 42, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.025) 1px, transparent 1px),
+    radial-gradient(640px 260px at 100% 0%, rgba(14, 165, 233, 0.08), transparent 62%),
+    linear-gradient(
+      135deg,
+      rgba(14, 165, 233, 0.05),
+      rgba(79, 70, 229, 0.04) 45%,
+      transparent 78%
+    );
+  background-size:
+    28px 28px, 28px 28px, auto, auto;
+}
+
 
 
 /* 悬浮窗长文本阅读区：细滚动条 */

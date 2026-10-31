@@ -17,6 +17,7 @@ import {
   getConfig,
   getHistory,
   listDevices,
+  memList,
   saveConfig,
   shortcutChips,
   startRecording,
@@ -39,6 +40,9 @@ import './styles.css';
    保持静态导入，首屏渲染不经过 Suspense、无加载占位闪烁 */
 const HotkeyTab = lazy(() =>
   import('./components/tabs/HotkeyTab').then((m) => ({ default: m.HotkeyTab })),
+);
+const MemTab = lazy(() =>
+  import('./components/tabs/MemTab').then((m) => ({ default: m.MemTab })),
 );
 const MicTab = lazy(() =>
   import('./components/tabs/MicTab').then((m) => ({ default: m.MicTab })),
@@ -68,18 +72,94 @@ const AboutTab = lazy(() =>
   import('./components/tabs/AboutTab').then((m) => ({ default: m.AboutTab })),
 );
 
-const NAV: { id: TabId; label: string; group: string; keys: string }[] = [
-  { id: 'dash', label: '总览', group: '使用', keys: '总览 概览 状态 统计 上手' },
-  { id: 'hotkey', label: '快捷键', group: '使用', keys: '热键 快捷键 hotkey 触发 误触 录音时长' },
-  { id: 'mic', label: '麦克风', group: '输入与识别', keys: '麦克风 设备 增益 音量 agc 测试' },
-  { id: 'asr', label: '语音识别', group: '输入与识别', keys: '识别 语音 asr whisper qwen 引擎 模型 热词' },
-  { id: 'ocr', label: '截图取词', group: '输入与识别', keys: '截图 取词 ocr 框选 屏幕 文字识别' },
-  { id: 'llm', label: 'AI 优化', group: '增强', keys: 'ai 优化 纠错 润色 llm key 凭据 提示词 术语' },
-  { id: 'translate', label: '翻译', group: '增强', keys: '翻译 translation 语言 划词 复制即翻译 双击' },
-  { id: 'output', label: '输入方式', group: '输出与数据', keys: '输出 粘贴 输入方式 回车 剪贴板 还原 键入' },
-  { id: 'display', label: '外接显示', group: '输出与数据', keys: '外接 显示 字幕屏 display 局域网' },
-  { id: 'history', label: '历史', group: '数据与其他', keys: '历史 记录 收藏 统计' },
-  { id: 'about', label: '关于', group: '数据与其他', keys: '关于 版本 更新' },
+/* 导航信息架构 v2：分组即产品叙事——使用 / 记忆 / 输入与识别 / 增强 / 输出与数据 / 关于。
+   desc 供主区 sticky 页头做一句定位（页面给「页在哪」，Section 给「功能块是什么」，
+   各司其职避免标题重复）；keys 供侧栏搜索按拼音/别名命中 */
+const NAV: { id: TabId; label: string; group: string; keys: string; desc: string }[] = [
+  {
+    id: 'dash',
+    label: '总览',
+    group: '使用',
+    keys: '总览 概览 状态 统计 上手',
+    desc: '运行状态、使用统计与快速入口，一屏尽收眼底',
+  },
+  {
+    id: 'mem',
+    label: '记忆',
+    group: '记忆',
+    keys: '记忆 mem 知识库 检索 时间线 沉淀 蒸馏 关键词',
+    desc: '听写、取词与翻译自动沉淀为可检索的个人记忆',
+  },
+  {
+    id: 'hotkey',
+    label: '快捷键',
+    group: '输入与识别',
+    keys: '热键 快捷键 hotkey 触发 误触 录音时长',
+    desc: '全局触发键、按住 / 点按模式与误触防护',
+  },
+  {
+    id: 'mic',
+    label: '麦克风',
+    group: '输入与识别',
+    keys: '麦克风 设备 增益 音量 agc 测试',
+    desc: '输入设备选择、增益与麦克风测试',
+  },
+  {
+    id: 'asr',
+    label: '语音识别',
+    group: '输入与识别',
+    keys: '识别 语音 asr whisper qwen 引擎 模型 热词',
+    desc: '云端或本地识别引擎、模型下载与热词',
+  },
+  {
+    id: 'ocr',
+    label: '截图取词',
+    group: '输入与识别',
+    keys: '截图 取词 ocr 框选 屏幕 文字识别',
+    desc: '框选屏幕任意区域，离线识别出文字',
+  },
+  {
+    id: 'llm',
+    label: 'AI 优化',
+    group: '增强',
+    keys: 'ai 优化 纠错 润色 llm key 凭据 提示词 术语',
+    desc: '纠错与润色引擎、凭据组与提示词',
+  },
+  {
+    id: 'translate',
+    label: '翻译',
+    group: '增强',
+    keys: '翻译 translation 语言 划词 复制即翻译 双击',
+    desc: '划词 / 复制即翻译与目标语言',
+  },
+  {
+    id: 'output',
+    label: '输入方式',
+    group: '输出与数据',
+    keys: '输出 粘贴 输入方式 回车 剪贴板 还原 键入',
+    desc: '结果送达方式：粘贴、键入与确认节奏',
+  },
+  {
+    id: 'display',
+    label: '外接显示',
+    group: '输出与数据',
+    keys: '外接 显示 字幕屏 display 局域网',
+    desc: '把实时字幕推送到外接硬件字幕屏',
+  },
+  {
+    id: 'history',
+    label: '历史',
+    group: '输出与数据',
+    keys: '历史 记录 收藏 统计',
+    desc: '最近听写记录，收藏与统计',
+  },
+  {
+    id: 'about',
+    label: '关于',
+    group: '关于',
+    keys: '关于 版本 更新',
+    desc: '版本信息、检查更新与开源致谢',
+  },
 ];
 
 /* 侧栏 16px 线性 stroke 图标：stroke=currentColor，激活态自动跟随 sky-300 */
@@ -100,6 +180,14 @@ const ICONS: Record<TabId, ReactNode> = {
       <path d="M3 10.5 12 3l9 7.5" />
       <path d="M5.5 9.5V21h13V9.5" />
       <path d="M9.5 21v-6h5v6" />
+    </svg>
+  ),
+  mem: (
+    <svg {...iconSvgProps} aria-hidden>
+      {/* 大脑双叶轮廓：记忆是产品新主线，给它区别于「数据库」的身份图标 */}
+      <path d="M12 5.2a2.6 2.6 0 0 0-4.8 1.3A2.4 2.4 0 0 0 5 8.9c0 .7.3 1.3.8 1.7-.5.4-.8 1-.8 1.7a2.4 2.4 0 0 0 2.2 2.4A2.6 2.6 0 0 0 12 17z" />
+      <path d="M12 5.2a2.6 2.6 0 0 1 4.8 1.3 2.4 2.4 0 0 1 2.2 2.4c0 .7-.3 1.3-.8 1.7.5.4.8 1 .8 1.7a2.4 2.4 0 0 1-2.2 2.4A2.6 2.6 0 0 1 12 17z" />
+      <path d="M12 5.2V17" />
     </svg>
   ),
   hotkey: (
@@ -280,6 +368,28 @@ export default function App() {
   // dev StrictMode 双挂载会把下面的启动检查跑两次（两条 toast、两次请求）：
   // 仅对这一副作用防重，effect 其余初始化保持原语义（挂载-清理-再挂载）
   const updateCheckedRef = useRef(false);
+
+  /* 记忆徽标计数：只取 total（limit=1 不拉正文），与历史徽章同一交互语言。
+     后端采集/删除/清空都广播 sn-mem-changed，监听刷新保持侧栏数字实时 */
+  const [memTotal, setMemTotal] = useState<number | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const pull = () => {
+      memList('', null, 1)
+        .then((r) => {
+          if (alive) setMemTotal(r.total);
+        })
+        .catch(() => {
+          /* 旧后端无 mem_list：徽标静默不显示 */
+        });
+    };
+    pull();
+    const un = listen('sn-mem-changed', pull);
+    return () => {
+      alive = false;
+      un.then((f) => f());
+    };
+  }, []);
 
   useEffect(() => {
     const updateGuarded = updateCheckedRef.current;
@@ -511,11 +621,12 @@ export default function App() {
     }
   }, [recording]);
 
-  /* 首屏骨架：配置未就绪时渲染完整侧栏 + 主区 skeleton 卡，降低白屏/孤零 Spinner 感 */
+  /* 首屏骨架：配置未就绪时渲染完整侧栏 + 页头占位 + 主区 skeleton 卡，
+     降低白屏 / 孤零 Spinner 感；结构与正式外壳一致（含 sticky 页头占位） */
   if (!cfg) {
     return (
-      <div className="flex min-h-screen">
-        <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-white/[0.06] bg-[#0d0d14]/80 backdrop-blur-xl">
+      <div className="sn-shell-bg flex min-h-screen">
+        <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-[var(--sn-border)] bg-[var(--sn-sidebar)] backdrop-blur-xl">
           <div className="flex items-center gap-2.5 px-5 pb-7 pt-7">
             <div className="skeleton h-9 w-9 rounded-xl" />
             <div className="space-y-1.5">
@@ -535,32 +646,44 @@ export default function App() {
             ))}
           </div>
           <div className="p-3.5">
-            <div className="rounded-xl border border-white/[0.06] bg-black/30 p-3">
+            <div className="rounded-2xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] p-3">
               <div className="skeleton h-2.5 w-2/3 rounded-full" />
               <div className="skeleton mt-2.5 h-3 w-1/2 rounded-full" />
             </div>
           </div>
         </aside>
-        <main className="min-w-0 flex-1 px-8 pb-32 pt-8">
-          <div className="mx-auto max-w-2xl space-y-5">
-            <div className="rounded-[20px] border border-white/[0.07] bg-white/[0.025] p-5">
-              <div className="flex items-center gap-3">
-                <div className="skeleton h-9 w-9 rounded-xl" />
-                <div className="flex-1 space-y-1.5">
-                  <div className="skeleton h-3.5 w-1/3 rounded-full" />
-                  <div className="skeleton h-2.5 w-1/2 rounded-full" />
+        <main className="relative min-w-0 flex-1">
+          {/* sticky 页头占位 */}
+          <div className="sn-pagehead sticky top-0 z-20">
+            <div className="mx-auto flex max-w-2xl items-center gap-3.5 px-8 pb-4 pt-7">
+              <div className="skeleton h-10 w-10 rounded-[14px]" />
+              <div className="flex-1 space-y-1.5">
+                <div className="skeleton h-3.5 w-28 rounded-full" />
+                <div className="skeleton h-2.5 w-52 rounded-full" />
+              </div>
+            </div>
+          </div>
+          <div className="px-8 pb-32 pt-4">
+            <div className="mx-auto max-w-2xl space-y-5">
+              <div className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
+                <div className="flex items-center gap-3">
+                  <div className="skeleton h-9 w-9 rounded-xl" />
+                  <div className="flex-1 space-y-1.5">
+                    <div className="skeleton h-3.5 w-1/3 rounded-full" />
+                    <div className="skeleton h-2.5 w-1/2 rounded-full" />
+                  </div>
+                </div>
+                <div className="skeleton mt-5 h-[104px] rounded-xl" />
+              </div>
+              <div className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
+                <div className="skeleton h-3.5 w-1/4 rounded-full" />
+                <div className="mt-4 space-y-2.5">
+                  <div className="skeleton h-10 rounded-2xl" />
+                  <div className="skeleton h-10 rounded-2xl" />
                 </div>
               </div>
-              <div className="skeleton mt-5 h-[104px] rounded-xl" />
+              <div className="skeleton h-24 rounded-[20px]" />
             </div>
-            <div className="rounded-[20px] border border-white/[0.07] bg-white/[0.025] p-5">
-              <div className="skeleton h-3.5 w-1/4 rounded-full" />
-              <div className="mt-4 space-y-2.5">
-                <div className="skeleton h-10 rounded-2xl" />
-                <div className="skeleton h-10 rounded-2xl" />
-              </div>
-            </div>
-            <div className="skeleton h-24 rounded-[20px]" />
           </div>
         </main>
       </div>
@@ -592,9 +715,9 @@ export default function App() {
   };
 
   return (
-    <div className="flex min-h-screen">
+    <div className="sn-shell-bg flex min-h-screen">
       {/* 侧边栏 */}
-      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-white/[0.06] bg-[#0d0d14]/80 backdrop-blur-xl">
+      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-[var(--sn-border)] bg-[var(--sn-sidebar)] backdrop-blur-xl">
         <div className="relative flex items-center gap-2.5 px-5 pb-7 pt-7">
           <span
             className="aurora pointer-events-none absolute -left-6 -top-8 h-24 w-24 rounded-full bg-sky-500/20 blur-2xl"
@@ -605,20 +728,20 @@ export default function App() {
           </div>
           <div>
             <div className="text-[14px] font-semibold text-slate-50">SpeakNow</div>
-            <div className="text-[10px] text-slate-500">语音输入助手</div>
+            <div className="text-[10px] text-slate-500">语音输入 · 记忆助手</div>
           </div>
         </div>
 
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-4">
-          {/* 设置项搜索：11 页设置靠翻找太慢，按名称/关键词过滤侧栏 */}
-          <div className="sticky top-0 z-10 -mt-1 mb-2 bg-[#0d0d14]/80 pb-1 pt-1 backdrop-blur">
+        <nav className="sn-scroll flex-1 space-y-1 overflow-y-auto px-3 pb-4">
+          {/* 设置项搜索：12 页设置靠翻找太慢，按名称/关键词过滤侧栏 */}
+          <div className="sticky top-0 z-10 -mt-1 mb-2 bg-[var(--sn-sidebar)] pb-1 pt-1 backdrop-blur">
             <input
               type="text"
               value={navQuery}
               onChange={(e) => setNavQuery(e.target.value)}
               placeholder="搜索设置页…"
               spellCheck={false}
-              className="w-full rounded-lg border border-white/[0.07] bg-black/30 px-2.5 py-1.5 text-[12px] text-slate-200 placeholder:text-slate-600 outline-none transition focus:border-sky-500/50"
+              className="w-full rounded-lg border border-[var(--sn-border)] bg-[var(--sn-surface-2)] px-2.5 py-1.5 text-[12px] text-slate-200 placeholder:text-slate-600 outline-none transition hover:border-[var(--sn-border-strong)] focus:border-sky-500/50 focus:ring-[3px] focus:ring-sky-500/10"
             />
           </div>
           {navItems.map((n, i) => {
@@ -628,9 +751,7 @@ export default function App() {
               <Fragment key={n.id}>
                 {showGroup && (
                   <div
-                    className={`px-3 text-[10px] font-medium tracking-widest text-slate-600 ${
-                      i > 0 ? 'mb-1 mt-4' : 'mb-1 mt-1'
-                    }`}
+                    className={`sn-group-label ${i > 0 ? 'mb-1.5 mt-4' : 'mb-1.5 mt-1'}`}
                   >
                     {n.group}
                   </div>
@@ -638,26 +759,28 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setTab(n.id)}
-                  className={`relative flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] transition active:scale-[0.98] ${
+                  className={`group relative flex w-full items-center gap-2.5 rounded-xl px-3 py-[7px] text-[13px] transition-all duration-200 active:scale-[0.98] ${
                     active
                       ? 'nav-glow font-medium text-sky-300'
                       : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
                   }`}
                 >
-                  {active && (
-                    <span
-                      className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-full bg-gradient-to-b from-sky-400 to-indigo-500 shadow-[0_0_8px_rgba(56,189,248,0.6)]"
-                      aria-hidden
-                    />
-                  )}
-                  <span className="flex w-5 shrink-0 items-center justify-center">
+                  {active && <span className="sn-nav-indicator" aria-hidden />}
+                  <span
+                    className={`flex w-5 shrink-0 items-center justify-center transition-colors duration-200 ${
+                      active
+                        ? 'text-sky-300'
+                        : 'text-slate-500 group-hover:text-slate-300'
+                    }`}
+                  >
                     {ICONS[n.id]}
                   </span>
-                  <span>{n.label}</span>
+                  <span className="truncate">{n.label}</span>
+                  {n.id === 'mem' && memTotal !== null && memTotal > 0 && (
+                    <span className="sn-nav-badge">{memTotal}</span>
+                  )}
                   {n.id === 'history' && history.length > 0 && (
-                    <span className="ml-auto rounded-full bg-white/[0.07] px-1.5 py-0.5 text-[10px] text-slate-500">
-                      {history.length}
-                    </span>
+                    <span className="sn-nav-badge">{history.length}</span>
                   )}
                   {n.id === 'asr' &&
                     cfg.asr.provider === 'local' &&
@@ -679,78 +802,107 @@ export default function App() {
           })}
         </nav>
 
-        {/* 底部状态卡 */}
+        {/* 底部状态卡：上行会话状态（失败提示换行铺满），发丝线分隔，
+            下行快捷键徽章 + 模式说明，flex-wrap 保证窄侧栏不溢出 */}
         <div className="p-3.5">
-          <div className="rounded-xl border border-white/[0.06] bg-black/30 p-3">
+          <div className="rounded-2xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] p-3">
             <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 rounded-full ${stageInfo.dot}`} aria-hidden />
-              <span className="text-[12px] font-medium text-slate-300">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${stageInfo.dot}`} aria-hidden />
+              <span className="shrink-0 text-[12px] font-medium text-slate-300">
                 {stageInfo.text}
               </span>
-              <span className="text-[10px] text-slate-600">
+              <span className="ml-auto truncate text-[10px] text-slate-600">
                 {STAGE_HINT[stage] ?? ''}
               </span>
-              {saveFails > 0 && (
-                <span className="ml-auto flex items-center gap-1.5 text-[10.5px] text-red-400">
-                  <span
-                    className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500"
-                    aria-hidden
-                  />
-                  保存失败
-                </span>
-              )}
             </div>
-            {hotkeyChips.length > 0 && (
-              <div className="mt-2 flex flex-wrap items-center gap-1">
-                {hotkeyChips.map((c, i) => (
-                  <span key={i} className="flex items-center gap-1">
-                    {i > 0 && <span className="text-[10px] text-slate-600">+</span>}
-                    <span className="kbd">{c}</span>
-                  </span>
-                ))}
-                {quickChips.length > 0 && (
-                  <span className="ml-1 rounded border border-amber-400/25 bg-amber-400/10 px-1 py-0.5 text-[9.5px] text-amber-300">
-                    快速
-                  </span>
-                )}
-                {translateChips.length > 0 && (
-                  <span className="ml-1 rounded border border-emerald-400/25 bg-emerald-400/10 px-1 py-0.5 text-[9.5px] text-emerald-300">
-                    翻译
-                  </span>
-                )}
-                {translateSelChips.length > 0 && (
-                  <span className="ml-1 rounded border border-teal-400/25 bg-teal-400/10 px-1 py-0.5 text-[9.5px] text-teal-300">
-                    划词
-                  </span>
-                )}
+            {saveFails > 0 && (
+              <div className="mt-1.5 flex items-center gap-1.5 text-[10.5px] text-red-400">
+                <span
+                  className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-red-500"
+                  aria-hidden
+                />
+                配置保存失败 · 将自动重试
               </div>
+            )}
+            {hotkeyChips.length > 0 && (
+              <>
+                <div className="my-2.5 h-px bg-[var(--sn-border)]" aria-hidden />
+                <div className="flex flex-wrap items-center gap-1">
+                  {hotkeyChips.map((c, i) => (
+                    <span key={i} className="flex items-center gap-1">
+                      {i > 0 && <span className="text-[10px] text-slate-600">+</span>}
+                      <span className="kbd">{c}</span>
+                    </span>
+                  ))}
+                  <span className="rounded border border-[var(--sn-border)] bg-[var(--sn-surface-2)] px-1 py-0.5 text-[9.5px] text-slate-400">
+                    {cfg.hotkey.mode === 'hold' ? '按住说话' : '点按开关'}
+                  </span>
+                  {quickChips.length > 0 && (
+                    <span className="rounded border border-amber-400/25 bg-amber-400/10 px-1 py-0.5 text-[9.5px] text-amber-300">
+                      快速
+                    </span>
+                  )}
+                  {translateChips.length > 0 && (
+                    <span className="rounded border border-emerald-400/25 bg-emerald-400/10 px-1 py-0.5 text-[9.5px] text-emerald-300">
+                      翻译
+                    </span>
+                  )}
+                  {translateSelChips.length > 0 && (
+                    <span className="rounded border border-teal-400/25 bg-teal-400/10 px-1 py-0.5 text-[9.5px] text-teal-300">
+                      划词
+                    </span>
+                  )}
+                </div>
+              </>
             )}
           </div>
         </div>
       </aside>
 
-      {/* 主内容（按 tab 切换动画） */}
-      <main className="min-w-0 flex-1 px-8 pb-32 pt-8">
-        <div key={tab} className="anim-page mx-auto max-w-2xl space-y-5">
-          <Suspense
-            fallback={
-              <div className="flex min-h-[40vh] items-center justify-center text-xs text-slate-600">
-                加载中…
-              </div>
-            }
+      {/* 主内容：sticky 页头（页面定位）+ 按 tab 切换动画的内容区 */}
+      <main className="relative min-w-0 flex-1">
+        <div className="sn-pagehead sticky top-0 z-20">
+          <div
+            key={`head-${tab}`}
+            className="anim-rise mx-auto flex max-w-2xl items-center gap-3.5 px-8 pb-3.5 pt-7"
           >
-            {tab === 'dash' && <Dashboard {...tabProps} />}
-            {tab === 'hotkey' && <HotkeyTab {...tabProps} />}
-            {tab === 'mic' && <MicTab {...tabProps} />}
-            {tab === 'asr' && <AsrTab {...tabProps} />}
-            {tab === 'llm' && <LlmTab {...tabProps} />}
-            {tab === 'translate' && <TranslateTab {...tabProps} />}
-            {tab === 'ocr' && <OcrTab {...tabProps} />}
-            {tab === 'output' && <OutputTab {...tabProps} />}
-            {tab === 'display' && <DisplayTab {...tabProps} />}
-            {tab === 'history' && <HistoryTab {...tabProps} />}
-            {tab === 'about' && <AboutTab {...tabProps} />}
-          </Suspense>
+            {/* 页面图标：复用侧栏 16px 线性图标，经任意子选择器放大到 20px */}
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-[var(--sn-border)] bg-gradient-to-br from-sky-500/[0.16] via-indigo-500/[0.1] to-transparent text-sky-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] [&>svg]:h-5 [&>svg]:w-5">
+              {ICONS[tab]}
+            </span>
+            <div className="min-w-0">
+              <h1 className="truncate text-[16px] font-semibold leading-6 tracking-wide text-slate-100">
+                {(NAV.find((n) => n.id === tab) ?? NAV[0]).label}
+              </h1>
+              <p className="mt-0.5 truncate text-xs leading-4 text-slate-500">
+                {(NAV.find((n) => n.id === tab) ?? NAV[0]).desc}
+              </p>
+            </div>
+          </div>
+        </div>
+        <div className="px-8 pb-32 pt-4">
+          <div key={tab} className="anim-page mx-auto max-w-2xl space-y-5">
+            <Suspense
+              fallback={
+                <div className="flex min-h-[40vh] items-center justify-center text-xs text-slate-600">
+                  加载中…
+                </div>
+              }
+            >
+              {tab === 'dash' && <Dashboard {...tabProps} />}
+              {tab === 'mem' && <MemTab {...tabProps} />}
+              {tab === 'hotkey' && <HotkeyTab {...tabProps} />}
+              {tab === 'mic' && <MicTab {...tabProps} />}
+              {tab === 'asr' && <AsrTab {...tabProps} />}
+              {tab === 'llm' && <LlmTab {...tabProps} />}
+              {tab === 'translate' && <TranslateTab {...tabProps} />}
+              {tab === 'ocr' && <OcrTab {...tabProps} />}
+              {tab === 'output' && <OutputTab {...tabProps} />}
+              {tab === 'display' && <DisplayTab {...tabProps} />}
+              {tab === 'history' && <HistoryTab {...tabProps} />}
+              {tab === 'about' && <AboutTab {...tabProps} />}
+            </Suspense>
+          </div>
         </div>
       </main>
 

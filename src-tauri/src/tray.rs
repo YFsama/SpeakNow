@@ -28,6 +28,8 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         MenuItem::with_id(app, "record_quick", "快速录音（跳过 AI）", true, None::<&str>)?;
     let translate_sel =
         MenuItem::with_id(app, "translate_sel", "划词翻译选中文字", true, None::<&str>)?;
+    let translate_input =
+        MenuItem::with_id(app, "translate_input", "翻译输入框草稿", true, None::<&str>)?;
     let ocr_item = MenuItem::with_id(app, "ocr", "截图取词（框选识别）", true, None::<&str>)?;
     // 文本模拟输入做成子菜单：小窗（编辑长文）与剪贴板直输（复制→点一下）
     // 是同一功能的两个入口，平铺会让本就长的主菜单更难扫读
@@ -114,7 +116,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let sep2 = PredefinedMenuItem::separator(app)?;
     Menu::with_items(
         app,
-        &[&record, &record_quick, &translate_sel, &ocr_item, &typist_menu, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
+        &[&record, &record_quick, &translate_sel, &translate_input, &ocr_item, &typist_menu, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
     )
 }
 
@@ -154,6 +156,11 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             // 焦点回到原窗口，选区仍在即可取词
             let h = app.clone();
             std::thread::spawn(move || crate::translate::translate_selection(&h));
+        }
+        "translate_input" => {
+            // 读草稿（UIA）+ 翻译（秒级）+ 替换（按键模拟）全阻塞，放独立线程
+            let h = app.clone();
+            std::thread::spawn(move || crate::translate_input::run(&h));
         }
         "ocr" => crate::ocr::start_capture(app),
         "typist:win" => crate::typist::open_window(app),

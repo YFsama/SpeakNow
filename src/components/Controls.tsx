@@ -15,22 +15,22 @@ export function Section({
   children: ReactNode;
 }) {
   return (
-    <section className="group relative overflow-hidden rounded-[20px] border border-white/[0.07] bg-white/[0.025] p-5 shadow-sm transition-colors hover:border-white/[0.12]">
-      {/* 顶部微光渐变线 */}
+    <section className="group relative overflow-hidden rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5 shadow-sm transition-colors hover:border-[var(--sn-border-strong)]">
+      {/* 顶部微光渐变线：悬停时亮起，暗示整卡可交互（纯装饰） */}
       <span
         className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-sky-400/30 to-transparent opacity-0 transition-opacity duration-500 group-hover:opacity-100"
         aria-hidden
       />
       <div className="mb-5 flex items-start gap-3">
-        <span className="card-lift relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/[0.07] bg-gradient-to-br from-sky-500/[0.16] via-indigo-500/[0.1] to-transparent text-[16px] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+        <span className="card-lift relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--sn-border)] bg-gradient-to-br from-sky-500/[0.16] via-indigo-500/[0.1] to-transparent text-[16px] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
           {icon}
         </span>
         <div className="min-w-0 flex-1">
-          <h2 className="text-[15px] font-semibold leading-6 tracking-wide text-slate-100">
+          <h2 className="text-[15px] font-semibold leading-6 tracking-wide text-[var(--sn-text-1)]">
             {title}
           </h2>
           {desc && (
-            <p className="mt-1 text-xs leading-5 text-slate-400/90">{desc}</p>
+            <p className="mt-1 text-xs leading-5 text-[var(--sn-text-3)]">{desc}</p>
           )}
         </div>
       </div>
@@ -53,11 +53,11 @@ export function Field({
   return (
     <div>
       <div className="mb-1.5 flex items-center gap-2">
-        <span className="text-[13px] font-medium text-slate-300/90">{label}</span>
+        <span className="text-[13px] font-medium text-[var(--sn-text-2)]">{label}</span>
         {badge}
       </div>
       {hint && (
-        <div className="mb-2 flex gap-1.5 text-xs leading-5 text-slate-500">
+        <div className="mb-2 flex gap-1.5 text-xs leading-5 text-[var(--sn-text-4)]">
           <span className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-slate-600" aria-hidden />
           <span>{hint}</span>
         </div>
@@ -69,8 +69,10 @@ export function Field({
 
 /* ============ 输入控件 ============ */
 
+/* 输入底样式：令牌化边框（浅色自动翻转）；焦点态 = 亮边 + 3px 同色低透明光环，
+   键盘与鼠标用户都能清楚看到「现在编辑的是哪个框」 */
 const inputBase =
-  'w-full rounded-xl border border-white/10 bg-black/30 px-3.5 py-2.5 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] hover:bg-black/[0.38] focus:border-sky-500/60 focus:bg-black/[0.42] focus:ring-[3px] focus:ring-sky-500/10';
+  'w-full rounded-xl border border-[var(--sn-border-strong)] bg-black/30 px-3.5 py-2.5 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] hover:bg-black/[0.38] focus:border-sky-500/60 focus:bg-black/[0.42] focus:ring-[3px] focus:ring-sky-500/10';
 
 /* 密码显隐眼睛图标（线性 stroke 风格，与整体一致） */
 function EyeIcon() {
@@ -239,10 +241,10 @@ export function Toggle({
       role="switch"
       aria-checked={checked}
       onClick={() => onChange(!checked)}
-      className={`flex w-full items-center justify-between gap-4 rounded-2xl border px-3.5 py-3 text-left transition ${
+      className={`flex w-full items-center justify-between gap-4 rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 ${
         checked
           ? 'border-sky-500/25 bg-sky-500/[0.05] hover:border-sky-500/40'
-          : 'border-white/[0.06] bg-black/20 hover:border-white/15'
+          : 'border-[var(--sn-border)] bg-black/20 hover:border-[var(--sn-border-strong)]'
       }`}
     >
       <span className="min-w-0">
@@ -442,12 +444,12 @@ export function Button({
   title?: string;
 }) {
   const base =
-    'inline-flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100';
+    'inline-flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100';
   const kinds = {
     primary:
       'bg-gradient-to-r from-sky-500 to-indigo-500 text-white shadow-lg shadow-sky-500/20 hover:brightness-110 hover:shadow-sky-500/35',
     ghost:
-      'border border-white/10 bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35',
+      'border border-[var(--sn-border-strong)] bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35',
     subtle:
       'bg-white/[0.05] text-slate-300 hover:bg-white/[0.09] hover:text-slate-100',
     danger:
@@ -520,10 +522,10 @@ export function ConfirmButton({
       type="button"
       onClick={onClick}
       title={title}
-      className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] ${
+      className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 ${
         arming
           ? 'border-red-400/30 bg-red-500/15 text-red-300'
-          : 'border-white/10 bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35'
+          : 'border-[var(--sn-border-strong)] bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35'
       } ${className}`}
     >
       {arming ? confirmLabel : label}

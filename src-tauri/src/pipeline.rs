@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 use crate::config::{AsrConfig, Config};
-use crate::{asr, audio, events, history, inject, llm, overlay, Ctx, PendingReview};
+use crate::{asr, audio, events, history, inject, llm, mem, overlay, Ctx, PendingReview};
 
 /// 外接显示独占模式：本地不再弹出聆听悬浮窗（字幕只推给外接硬件）
 pub fn suppress_local_overlay(cfg: &Config) -> bool {
@@ -1050,6 +1050,8 @@ pub async fn finish_and_input(
     note: &str,
 ) {
     history::push(app, raw, final_text, asr_ms, llm_ms, "dictation");
+    // 记忆库采集：听写终稿入库（快速模式与 LLM 模式都汇到 finish_and_input）
+    mem::capture(app, "dictation", &inject::foreground_process_name(), final_text);
     events::emit(
         app,
         "sn-result",

@@ -125,6 +125,26 @@ pub fn apply(app: &AppHandle, hk: &HotkeyConfig) -> Result<()> {
             )
         })?;
     }
+    // 输入框翻译快捷键：读聚焦输入框的未发送草稿，翻译后全选替换回输入框
+    if !hk.key_translate_input.trim().is_empty() {
+        let shortcut = parse_shortcut(&hk.key_translate_input)?;
+        gs.on_shortcut(shortcut, handle_event).map_err(|e| {
+            anyhow!(
+                "注册输入框翻译快捷键 {} 失败（可能已被其他应用占用）: {e}",
+                hk.key_translate_input
+            )
+        })?;
+    }
+    // 记忆召回快捷键：呼出悬浮搜索卡检索记忆库（结果可一键注入输入框）
+    if !hk.key_mem_recall.trim().is_empty() {
+        let shortcut = parse_shortcut(&hk.key_mem_recall)?;
+        gs.on_shortcut(shortcut, handle_event).map_err(|e| {
+            anyhow!(
+                "注册记忆召回快捷键 {} 失败（可能已被其他应用占用）: {e}",
+                hk.key_mem_recall
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -165,25 +185,75 @@ fn handle_event(app: &AppHandle, sc: &Shortcut, event: ShortcutEvent) {
         && parse_shortcut(&hk.key_typist)
             .map(|t| t == *sc)
             .unwrap_or(false);
+    let is_translate_input = !is_quick
+        && !is_translate
+        && !is_translate_sel
+        && !is_ocr
+        && !is_typist
+        && !hk.key_translate_input.is_empty()
+        && parse_shortcut(&hk.key_translate_input)
+            .map(|t| t == *sc)
+            .unwrap_or(false);
+    let is_mem_recall = !is_quick
+        && !is_translate
+        && !is_translate_sel
+        && !is_ocr
+        && !is_typist
+        && !is_translate_input
+        && !hk.key_mem_recall.is_empty()
+        && parse_shortcut(&hk.key_mem_recall)
+            .map(|m| m == *sc)
+            .unwrap_or(false);
 
+    // 辅助功能热键（划词/OCR/Typist/输入框翻译）只认 Pressed；Released 必须
+    // 同样拦截——若放行落到末尾的 hold 分支，hold 听写中顺手按一下任一辅助
+    // 热键再松开，松键会被当成主键的 post_stop 把录音掐断
+    //
     // 划词翻译独立于听写会话：取词含按键模拟与剪贴板轮询（阻塞可达秒级），
     // 放独立线程执行，不占住热键回调线程
-    if is_translate_sel && event.state() == ShortcutState::Pressed {
-        let h = app.clone();
-        std::thread::spawn(move || crate::translate::translate_selection(&h));
+    if is_translate_sel {
+        if event.state() == ShortcutState::Pressed {
+            let h = app.clone();
+            std::thread::spawn(move || crate::translate::translate_selection(&h));
+        }
         return;
     }
 
     // 截图取词同样独立：弹选区窗 + GDI 截屏 + OCR 全在后台完成
-    if is_ocr && event.state() == ShortcutState::Pressed {
-        crate::ocr::start_capture(app);
+    if is_ocr {
+        if event.state() == ShortcutState::Pressed {
+            crate::ocr::start_capture(app);
+        }
         return;
     }
 
     // 文本模拟输入：热键为开关语义（可见即收起）；窗口创建须回主线程，
     // toggle_window 内自理
-    if is_typist && event.state() == ShortcutState::Pressed {
-        crate::typist::toggle_window(app);
+    if is_typist {
+        if event.state() == ShortcutState::Pressed {
+            crate::typist::toggle_window(app);
+        }
+        return;
+    }
+
+    // 输入框翻译独立线程：读草稿（UIA）+ 翻译（秒级）+ 替换（按键模拟）全阻塞
+    if is_translate_input {
+        if event.state() == ShortcutState::Pressed {
+            let h = app.clone();
+            std::thread::spawn(move || crate::translate_input::run(&h));
+        }
+        return;
+    }
+
+    // 记忆召回独立线程：预取最近记忆要读 mem.json（整库 JSON 反序列化，
+    // 大库可达毫秒~几十毫秒级），热键回调在主线程不能做文件 IO（translate_sel
+    // 同款转后台）。open_recall 内部若再自带后台化，这里多一层转发也无碍；
+    // 悬浮搜索卡经 sn-mem-recall 事件呼出，emit 本身线程安全
+    if is_mem_recall {
+        if event.state() == ShortcutState::Pressed {
+            let h = app.clone();
+            std::thread::spawn(move || crate::mem::open_recall(&h));
+        }
         return;
     }
 

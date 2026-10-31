@@ -8,6 +8,10 @@ import type {
   HistoryItem,
   LlmConfig,
   LocalModelStatus,
+  MemEntry,
+  MemImportSummary,
+  MemListResult,
+  MemStorageStats,
   MicTestResult,
   ProviderProfile,
   UpdateInfo,
@@ -136,6 +140,51 @@ export const updateHistoryFinal = (ts: number, final: string) =>
 /** 收藏 / 取消收藏一条历史（置顶显示，不占保留条数名额） */
 export const historySetPin = (ts: number, pinned: boolean) =>
   invoke('history_set_pin', { ts, pinned });
+
+/* ============ 记忆库（Mem） ============ */
+
+/** 检索记忆：query 按空格分词 AND 匹配（标题/正文/关键词）；kind 为空查全部；
+ *  返回的统计口径不受查询过滤影响 */
+export const memList = (query: string, kind: string | null, limit: number) =>
+  invoke<MemListResult>('mem_list', { query, kind, limit });
+/** 批量删除记忆（多选），返回实际删除条数 */
+export const memDeleteBatch = (ts: number[]) =>
+  invoke<number>('mem_delete_batch', { ts });
+/** 置顶 / 取消置顶一条记忆（不占保留条数名额） */
+export const memSetPinned = (ts: number, pinned: boolean) =>
+  invoke('mem_set_pinned', { ts, pinned });
+/** 清空全部记忆（置顶的也删；二次确认由前端负责） */
+export const memClear = () => invoke('mem_clear');
+/** 召回检索（悬浮搜索卡用）：多因子排序（文本分 × 时间衰减 × 使用增益）；
+ *  空查询 = 置顶优先 + 「用过/采过」最新在前 */
+export const memRecall = (query: string, limit: number) =>
+  invoke<MemEntry[]>('mem_recall', { query, limit });
+/** 记录一次实际使用（注入/复制后调用：uses+1、lastUsedAt=now，用过浮顶） */
+export const memUsed = (ts: number) => invoke('mem_used', { ts });
+/** 召回卡 Enter：把该条记忆注入当前输入框（悬浮窗收回后执行）并计一次使用 */
+export const memRecallPaste = (ts: number) => invoke<string>('mem_recall_paste', { ts });
+/** 召回卡 Ctrl+Enter：复制该条全文到剪贴板并计一次使用 */
+export const memCopyUsed = (ts: number) => invoke('mem_copy_used', { ts });
+
+/* ============ 记忆库 v3：导入中心 / 存储管理 / 安全 ============ */
+
+/** 快记一条（也用于「从剪贴板记一条」：前端先读剪贴板再传入） */
+export const memAddNote = (text: string) =>
+  invoke<MemImportSummary>('mem_add_note', { text });
+/** 导入网页：后端抓取并抽取正文（http/https、2MB、15s 超时上限） */
+export const memImportUrl = (url: string) =>
+  invoke<MemImportSummary>('mem_import_url', { url });
+/** 导入文本文件（.txt/.md，可多选；大文件按段落分块入库） */
+export const memImportFiles = (paths: string[]) =>
+  invoke<MemImportSummary>('mem_import_files', { paths });
+/** 导入项目文档：递归收集目录下 .md/.txt（上限 200 个文件），来源应用记为目录名 */
+export const memImportFolder = (path: string) =>
+  invoke<MemImportSummary>('mem_import_folder', { path });
+/** 存储统计：条数 / 置顶 / 已软作废 / mem.json 与 mem.bak 字节数 / 累计字数 */
+export const memStorageStats = () =>
+  invoke<MemStorageStats>('mem_storage_stats');
+/** 生成（或轮换）记忆 REST 令牌并保存，返回新令牌 */
+export const memGenToken = () => invoke<string>('mem_gen_token');
 /** 截取选区窗自身物理区域为 PNG base64（截图框选放大镜数据源） */
 export const ocrScreenSource = (x: number, y: number, w: number, h: number) =>
   invoke<{ png: string; width: number; height: number }>('ocr_screen_source', { x, y, w, h });
@@ -178,6 +227,8 @@ export const translateReplace = (text: string) =>
 /** 广播式翻译会话（OCR 卡片「翻译」按钮）：悬浮窗切到流式翻译卡片，目标语言不落盘 */
 export const translateAnnounce = (text: string, target?: string) =>
   invoke('translate_announce', { text, target: target ?? null });
+/** 输入框翻译：读取聚焦输入框草稿→翻译→替换回输入框（托盘/设置页手动触发用） */
+export const translateInput = () => invoke<string>('translate_input_cmd');
 
 /* ============ 截图取词（OCR） ============ */
 

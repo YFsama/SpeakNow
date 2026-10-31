@@ -143,6 +143,145 @@ fn uia_selection_text() -> Option<String> {
     None
 }
 
+/* ---------- 输入框草稿读取（输入框翻译用，无副作用不碰剪贴板） ---------- */
+
+/// TextPattern 回退通道的草稿长度上限：该通道无法证明聚焦的是输入控件
+/// （网页正文/文档的 DocumentRange 同样命中），超长视为误读拒绝
+#[cfg(target_os = "windows")]
+const TEXT_FALLBACK_MAX_CHARS: usize = 2_000;
+
+/// 读输入框草稿失败的原因（各变体仅在 Windows 的 UIA 通道构造，
+/// mac 构建下「matched 但 never constructed」按同文件 CaptureError::Elevated
+/// 的先例允许 dead_code）
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub enum InputCaptureError {
+    /// 聚焦控件不是可编辑的输入框（读不到 ValuePattern/TextPattern）
+    NotEditable,
+    /// 密码框：内容不该被翻译或广播
+    Password,
+    /// 读到了但为空（输入框没有草稿）
+    Empty,
+    Failed(String),
+}
+
+impl InputCaptureError {
+    /// 面向用户的中文说明（风格仿 CaptureError::message）
+    pub fn message(&self) -> String {
+        match self {
+            InputCaptureError::NotEditable => "当前聚焦的不是一个可编辑的输入框：请先把光标点到聊天框/搜索框等输入框里再触发输入框翻译".into(),
+            InputCaptureError::Password => "聚焦的是密码框：密码内容不会送去翻译".into(),
+            InputCaptureError::Empty => "输入框里没有可翻译的草稿：先输入内容再触发输入框翻译".into(),
+            InputCaptureError::Failed(e) => e.clone(),
+        }
+    }
+}
+
+/// 读取当前聚焦输入控件的完整草稿文本（输入框翻译第一步，无副作用不碰剪贴板）。
+/// ValuePattern 优先（Win32 Edit / UWP / Chromium 输入框的整框取值通道），
+/// 失败回退 TextPattern 的 DocumentRange 全文。密码框一律拒绝。
+pub fn capture_input_text() -> Result<String, InputCaptureError> {
+    #[cfg(target_os = "windows")]
+    {
+        capture_input_text_win()
+    }
+    // macOS/Linux 无 UI Automation 通道（模拟键全选兜底会动用户输入框，不可用）
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(InputCaptureError::Failed("输入框翻译目前仅支持 Windows".into()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_input_text_win() -> Result<String, InputCaptureError> {
+    use windows::core::Interface;
+    use windows::Win32::Foundation::VARIANT_TRUE;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::Variant::VT_BOOL;
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern, CUIAutomation,
+        UIA_IsPasswordPropertyId, UIA_TextPatternId, UIA_ValuePatternId,
+    };
+
+    // COM 初始化守卫：模式冲突（线程已以其他模式初始化）时视为借用，不配对卸载
+    struct ComGuard {
+        owned: bool,
+    }
+    impl ComGuard {
+        fn new() -> Self {
+            let owned = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            ComGuard { owned }
+        }
+    }
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.owned {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let _com = ComGuard::new();
+    unsafe {
+        let uia = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_ALL)
+            .map_err(|e| InputCaptureError::Failed(format!("初始化 UI Automation 失败: {e}")))?;
+        let el = uia
+            .GetFocusedElement()
+            .map_err(|e| InputCaptureError::Failed(format!("获取聚焦控件失败: {e}")))?;
+        // 密码框：草稿是敏感凭据，不读内容、不翻译、不上广播。windows crate 的
+        // VARIANT 是裸结构体（无 to_bool 助手），手动判 VT_BOOL + VARIANT_TRUE
+        if let Ok(v) = el.GetCurrentPropertyValue(UIA_IsPasswordPropertyId) {
+            if v.Anonymous.Anonymous.vt == VT_BOOL
+                && v.Anonymous.Anonymous.Anonymous.boolVal == VARIANT_TRUE
+            {
+                return Err(InputCaptureError::Password);
+            }
+        }
+        // 主通道 ValuePattern：Win32 Edit / UWP / Chromium 输入框的整框取值
+        if let Ok(unk) = el.GetCurrentPattern(UIA_ValuePatternId) {
+            if let Ok(vp) = unk.cast::<IUIAutomationValuePattern>() {
+                if let Ok(val) = vp.CurrentValue() {
+                    let t = val.to_string();
+                    // 只 trim 首尾，不做软换行合并——输入框草稿的换行是用户
+                    // 刻意敲的（聊天软件 Shift+Enter 分段），合并会改写原意
+                    let t = t.trim();
+                    if t.is_empty() {
+                        return Err(InputCaptureError::Empty);
+                    }
+                    return Ok(t.to_string());
+                }
+            }
+        }
+        // 回退 TextPattern DocumentRange 全文：部分自绘输入框只暴露文本协议。
+        // 该通道拿不到「这是输入控件」的证明——网页正文/Word 文档的
+        // DocumentRange 同样走这里（整页整篇），比 ValuePattern 不可靠得多，
+        // 收紧长度上限：真实聊天草稿几乎不可能超此数，超了大概率焦点在
+        // 文档/网页正文上，白翻一遍只烧 token
+        if let Ok(unk) = el.GetCurrentPattern(UIA_TextPatternId) {
+            if let Ok(tp) = unk.cast::<IUIAutomationTextPattern>() {
+                if let Ok(range) = tp.DocumentRange() {
+                    if let Ok(text) = range.GetText(-1) {
+                        let t = text.to_string();
+                        let n = t.chars().count();
+                        if n > TEXT_FALLBACK_MAX_CHARS {
+                            return Err(InputCaptureError::Failed(format!(
+                                "读到的文本有 {n} 字，超出输入框草稿的合理范围（焦点可能落在网页正文或文档上），已取消"
+                            )));
+                        }
+                        let t = t.trim();
+                        if t.is_empty() {
+                            return Err(InputCaptureError::Empty);
+                        }
+                        return Ok(t.to_string());
+                    }
+                }
+            }
+        }
+        Err(InputCaptureError::NotEditable)
+    }
+}
+
 /* ---------- 模拟复制兜底 ---------- */
 
 /// 剪贴板变更基线：在「触发复制动作」的时刻捕获（必须早于复制落盘），
