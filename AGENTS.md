@@ -34,7 +34,8 @@ cargo test                    # 96 个单测（纯逻辑层：提示词/结构�
 **绿灯 ≠ 能跑**：全局热键、麦克风采集（WASAPI）、UIA 光标定位、按键注入、
 剪贴板还原、截图 OCR 只能在真机 Windows 手测。改动这些区域后请提醒用户
 `npm run tauri dev` 回归。`src-tauri/examples/`（anchorcheck / asrcheck /
-devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
+devtest / memimport / sysvol / zhcheck）是这些路径的独立诊断程序——
+memimport 可离线把文档喂进真实 mem.json（不启动应用）。
 
 ## 目录地图（README 未展开的部分）
 
@@ -49,10 +50,11 @@ devtest / sysvol / zhcheck）是这些硬件路径的独立诊断程序。
 | `src-tauri/src/selection.rs` | 划词取词：UIA 无副作用通道 + 模拟 Ctrl+C 兜底 |
 | `src-tauri/src/translate.rs` / `trans_struct.rs` | 划词/复制即翻译 + 结构化（i18n 文件）翻译，见 docs/translation.md |
 | `src-tauri/src/translate_input.rs` | 输入框翻译：UIA 读聚焦输入框草稿 → 复用翻译会话 → 全选粘贴替换回输入框 |
-| `src-tauri/src/mem.rs` | 记忆库：听写/OCR/翻译产出自动沉淀 mem.json（采集钩子在 pipeline/ocr/translate/lib.confirm_edit 四处，各一行）、加权检索（keywords=3/title=2/text=1，分词 AND）、LLM 蒸馏（复用 llm::optimize，DISTILL_BUSY 单飞）、滚动清理；检索语义须与 mock-tauri.ts 的 mockMemSearch 逐字对齐，见 docs/mem.md |
+| `src-tauri/src/mem.rs` | 记忆库：听写/OCR/翻译产出自动沉淀 mem.json（采集钩子在 pipeline/ocr/translate/lib.confirm_edit 四处，各一行）、多因子检索（文本分×时间衰减×使用增益）、加权检索、LLM 蒸馏（复用 llm::optimize，DISTILL_BUSY 单飞 + RAII 守卫）、近重复合并、采集黑名单（BUILTIN_SENSITIVE_APPS 不可关）、软作废；检索语义须与 mock-tauri.ts 逐字对齐，见 docs/mem.md |
+| `src-tauri/src/mem_import.rs` | 记忆导入：网页（Readability 抽取 + 四级编码探测）/文件/项目目录/快记，RAG 式分块（面包屑标题、零重叠、400 块上限）；`import_paths_standalone` 供 examples/memimport 离线导入复用 |
 | `src-tauri/src/ocr.rs` | 截图取词：每屏选区窗 + GDI 截屏 + Windows OCR / PP-OCR |
 | `src-tauri/src/qwen_asr.rs` / `local_llm.rs` | llama.cpp sidecar 进程管理（下载/预热/Job Object 回收） |
-| `src-tauri/src/display_api.rs` | 外接字幕屏 axum HTTP/WS 服务，见 docs/external-display-api.md |
+| `src-tauri/src/display_api.rs` | 外接字幕屏 axum HTTP/WS 服务 + 记忆只读端点 `/mem/search`、`/mem/context.md`（loopback 免钥，LAN 须 `X-SN-API-Key` 常时比较 + Host 防 rebinding），见 docs/external-display-api.md |
 | `src-tauri/src/events.rs` | 所有 `sn-*` 事件的统一发射出口 |
 | `src/components/Overlay.tsx` | 悬浮窗全部卡片（听写/翻译/OCR/审阅/错误），2000+ 行，改动画注意各卡互斥条件 |
 | `src/components/tabs/MemTab.tsx` | 记忆页：时间轴/搜索高亮/类型过滤/多选批量/导出，交互范式对齐 HistoryTab |

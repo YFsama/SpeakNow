@@ -110,10 +110,22 @@ fn path(app: &AppHandle) -> anyhow::Result<std::path::PathBuf> {
     Ok(app.path().app_config_dir()?.join("mem.json"))
 }
 
+/// 显式目录版的存储路径（mem_import::import_paths_standalone 与部分单测用：
+/// 离线导入不依赖 Tauri AppHandle，但必须与运行时完全同一路径规则）
+pub(crate) fn path_at(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("mem.json")
+}
+
 fn load(app: &AppHandle) -> Vec<MemEntry> {
-    path(app)
+    match path(app) {
+        Ok(p) => load_at(&p),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub(crate) fn load_at(p: &std::path::Path) -> Vec<MemEntry> {
+    fs::read_to_string(p)
         .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
@@ -122,14 +134,19 @@ fn load(app: &AppHandle) -> Vec<MemEntry> {
 /// （capture 线程 / 命令线程 / 蒸馏任务），不在主线程
 fn write(app: &AppHandle, items: &[MemEntry]) {
     if let Ok(p) = path(app) {
-        if let Some(dir) = p.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(items) {
-            let _ = crate::config::atomic_write(&p, json.as_bytes());
-        }
+        write_at(&p, items);
     }
     let _ = app.emit("sn-mem-changed", ());
+}
+
+/// 显式路径版落盘（离线导入用；不广播——没有 AppHandle 也就没有监听者）
+pub(crate) fn write_at(p: &std::path::Path, items: &[MemEntry]) {
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(items) {
+        let _ = crate::config::atomic_write(p, json.as_bytes());
+    }
 }
 
 fn now_ms_i64() -> i64 {
@@ -297,7 +314,7 @@ fn local_unix_ms(unix_ms: i64) -> i64 {
 
 /// 滚动清理：非置顶子列保新弃旧截到 limit（= 超限从最旧开始删非 pinned），
 /// 置顶不占名额、始终保留；结果整体按 ts 新→旧重排
-fn truncate_keep_pinned(items: Vec<MemEntry>, limit: usize) -> Vec<MemEntry> {
+pub(crate) fn truncate_keep_pinned(items: Vec<MemEntry>, limit: usize) -> Vec<MemEntry> {
     if !items.iter().any(|i| i.pinned) {
         let mut items = items;
         items.truncate(limit);
@@ -331,7 +348,7 @@ fn evict_pinned_overflow(items: &mut Vec<MemEntry>, just_pinned: i64) {
 
 /// exe 基名规整：小写 + 去 .exe（"Chrome.exe" → "chrome"），与前端 mock
 /// 数据 / types.ts 注释的展示口径一致；取不到（空串）保持空串
-fn normalize_app(name: &str) -> String {
+pub(crate) fn normalize_app(name: &str) -> String {
     let n = name.trim().to_lowercase();
     n.strip_suffix(".exe").unwrap_or(&n).to_string()
 }
@@ -415,7 +432,7 @@ fn jaccard(a: &HashSet<[char; 2]>, b: &HashSet<[char; 2]>) -> f64 {
 /// 调用方落盘广播、本次不新建。否则「同一句话反复说」会刷屏挤掉别的
 /// 记忆。v1 的精确相等去重是 Jaccard=1 的特例，自然被覆盖；任一侧文本
 /// 规整后不足 2 字符时无 bigram 可言，退化为相等比较
-fn bump_near_duplicate(items: &mut [MemEntry], kind: &str, app: &str, text: &str) -> bool {
+pub(crate) fn bump_near_duplicate(items: &mut [MemEntry], kind: &str, app: &str, text: &str) -> bool {
     let norm = normalize_for_bigram(text);
     let short = norm.chars().count() < 2;
     let grams = if short { HashSet::new() } else { char_bigrams(&norm) };
@@ -840,7 +857,6 @@ pub fn mem_clear(app: AppHandle) {
 ///   造成「点了导入没反应」的困惑
 /// - 同毫秒多条（分块导入常态）ts 递增防撞：ts 在本库兼作主键（删除/
 ///   置顶/裁决都按 ts 寻址），共享 ts 会让多块同生同死
-/// 返回 (新建条数, 近重复合并条数)
 /// 返回 (实际留存的新增数, 近重复合并数, 被滚动清理挤出的本批条数)
 pub(crate) fn import_batch(
     app: &AppHandle,
@@ -852,12 +868,32 @@ pub(crate) fn import_batch(
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut items = load(app);
     let app_norm = normalize_app(app_name);
+    let (added, merged, new_ts) = import_batch_core(&mut items, kind, &app_norm, chunks);
+    if added > 0 || merged > 0 {
+        items = truncate_keep_pinned(items, limit);
+        write(app, &items);
+    }
+    // 滚动清理可能把本批新条目挤出（limit 较小而导入量大时）：added 以实际
+    // 留存数为准、被挤出的并入第三个返回值，摘要 toast 才不会虚报「新增 400」
+    let kept = new_ts.iter().filter(|t| items.iter().any(|e| e.ts == **t)).count() as u32;
+    (kept, merged, added - kept)
+}
+
+/// 批量入库核心（调用方已持有items 并完成 load；不落盘不截断，由调用方决定
+/// write 与 truncate 时机）。运行时导入与离线导入（import_paths_standalone）
+/// 共用此处，保证两条路径行为逐字一致
+pub(crate) fn import_batch_core(
+    items: &mut Vec<MemEntry>,
+    kind: &str,
+    app_norm: &str,
+    chunks: &[(String, String)],
+) -> (u32, u32, Vec<i64>) {
     let mut added = 0u32;
     let mut merged = 0u32;
     let mut new_ts: Vec<i64> = Vec::new();
     let mut ts = now_ms_i64();
     for (title, text) in chunks {
-        if bump_near_duplicate(&mut items, kind, &app_norm, text) {
+        if bump_near_duplicate(items, kind, app_norm, text) {
             merged += 1;
             continue;
         }
@@ -869,7 +905,7 @@ pub(crate) fn import_batch(
             MemEntry {
                 ts,
                 kind: kind.to_string(),
-                app: app_norm.clone(),
+                app: app_norm.to_string(),
                 title: title.clone(),
                 chars: text.chars().count() as u32,
                 text: text.clone(),
@@ -885,14 +921,7 @@ pub(crate) fn import_batch(
         new_ts.push(ts);
         added += 1;
     }
-    if added > 0 || merged > 0 {
-        items = truncate_keep_pinned(items, limit);
-        write(app, &items);
-    }
-    // 滚动清理可能把本批新条目挤出（limit 较小而导入量大时）：added 以实际
-    // 留存数为准、被挤出的并入第三个返回值，摘要 toast 才不会虚报「新增 400」
-    let kept = new_ts.iter().filter(|t| items.iter().any(|e| e.ts == **t)).count() as u32;
-    (kept, merged, added - kept)
+    (added, merged, new_ts)
 }
 
 /// 存储统计（记忆页存储卡与容量管理用）。软作废条目的保留策略 = Obsidian

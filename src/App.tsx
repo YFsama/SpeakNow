@@ -87,7 +87,7 @@ const NAV: { id: TabId; label: string; group: string; keys: string; desc: string
     id: 'mem',
     label: '记忆',
     group: '记忆',
-    keys: '记忆 mem 知识库 检索 时间线 沉淀 蒸馏 关键词',
+    keys: '记忆 mem 知识库 检索 时间线 沉淀 蒸馏 关键词 导入 网页 文件 项目 备份 令牌 召回 已作废 黑名单',
     desc: '听写、取词与翻译自动沉淀为可检索的个人记忆',
   },
   {

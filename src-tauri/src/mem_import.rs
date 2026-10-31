@@ -858,6 +858,96 @@ pub async fn mem_add_note(app: AppHandle, text: String) -> MemImportSummary {
     }
 }
 
+/// 离线导入（examples/memimport 诊断工具用）：对显式给定的配置目录执行与
+/// UI 导入完全相同的读取校验/分块/近重复合并/滚动清理——复用 import_batch_core
+/// 与同一 mem.json 路径规则，只是不经过 Tauri 命令层（无 AppHandle、不广播
+/// 事件）。运行中的 app 下一次读盘即见新条目。dry=true 只统计不落盘。
+/// 返回 (摘要, 新增条目标题清单) 供调用方打印
+pub fn import_paths_standalone(
+    config_dir: &Path,
+    inputs: &[String],
+    app_name: &str,
+    dry: bool,
+) -> Result<(MemImportSummary, Vec<String>), String> {
+    let mem_json = crate::mem::path_at(config_dir);
+    let mut items = crate::mem::load_at(&mem_json);
+    // limit 与运行时同源：读同目录 config.json 的 mem.limit（读不到用默认值）
+    let limit = std::fs::read_to_string(config_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::config::Config>(&s).ok())
+        .map(|c| c.mem.limit)
+        .unwrap_or(500);
+    let app_norm = crate::mem::normalize_app(app_name);
+    let mut summary = MemImportSummary::default();
+    let mut new_titles: Vec<String> = Vec::new();
+    let mut all_new_ts: Vec<i64> = Vec::new();
+    for input in inputs {
+        let p = Path::new(input);
+        let files: Vec<std::path::PathBuf> = if p.is_dir() {
+            let mut v = Vec::new();
+            if collect_docs(p, &mut v).is_err() {
+                summary.skipped += 1;
+                continue;
+            }
+            v
+        } else if p.is_file() {
+            vec![p.to_path_buf()]
+        } else {
+            summary.skipped += 1;
+            continue;
+        };
+        for f in files {
+            // 与 import_one_file 同款校验与分块（此处不落盘，最后统一处理）
+            let (bytes, truncated) = match read_capped(&f) {
+                Ok(v) => v,
+                Err(_) => {
+                    summary.skipped += 1;
+                    continue;
+                }
+            };
+            if truncated {
+                summary.skipped += 1;
+            }
+            let Some(text) = validate_text_bytes(&bytes) else {
+                summary.skipped += 1;
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                summary.skipped += 1;
+                continue;
+            }
+            let title = f
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "导入文件".into());
+            let (pairs, skipped) = cap_chunks(chunk_pairs(&title, text));
+            summary.skipped += skipped;
+            let (added, merged, new_ts) =
+                crate::mem::import_batch_core(&mut items, "file", &app_norm, &pairs);
+            summary.added += added;
+            summary.merged += merged;
+            if added > 0 {
+                // core 每批从最新往旧插（insert 0），取本批前 added 条的标题
+                for e in items.iter().take(added as usize) {
+                    new_titles.push(e.title.clone());
+                }
+            }
+            all_new_ts.extend(new_ts);
+        }
+    }
+    if !all_new_ts.is_empty() || summary.merged > 0 {
+        items = crate::mem::truncate_keep_pinned(items, limit);
+        let kept = all_new_ts.iter().filter(|t| items.iter().any(|e| e.ts == **t)).count() as u32;
+        summary.skipped += summary.added - kept;
+        summary.added = kept;
+        if !dry {
+            crate::mem::write_at(&mem_json, &items);
+        }
+    }
+    Ok((summary, new_titles))
+}
+
 /* ---------- 杂项 ---------- */
 
 /// 当前配置的记忆保留上限（滚动清理用）：读内存配置（微秒级），缺省 500

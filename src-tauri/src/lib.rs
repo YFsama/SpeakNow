@@ -12,7 +12,7 @@ mod llm;
 pub mod local_whisper;
 mod local_llm;
 mod mem;
-mod mem_import;
+pub mod mem_import;
 mod ocr;
 mod overlay;
 mod pipeline;
