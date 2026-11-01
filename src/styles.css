@@ -70,6 +70,9 @@ section h2,
 }
 .tabular {
   font-variant-numeric: tabular-nums;
+  /* 数字列约定（UI 精修 S5/S6）：计数与统计数字一律 tabular-nums +
+     min-w-[3ch]（配 text-right），数值位数变化不牵动周边布局；
+     本区域改动的间距只取 4/8/12/16/24 阶梯（gap-x/px/py 均含在内） */
 }
 
 ::selection {
@@ -616,12 +619,14 @@ html.light .\!border-teal-400\/25 {
   border-color: rgba(13, 148, 136, 0.45) !important;
 }
 
-/* 徽章与滚动条 */
+/* 徽章与滚动条 —— .kbd 浅色改走 GitHub Primer 规格：浅灰面板 + 中性描边 +
+   底边内阴影（替换旧的「深色低透明」方案，白底上更像实体键帽） */
 html.light .kbd {
-  border-color: rgba(15, 23, 42, 0.2);
-  border-bottom-width: 2px;
-  background: rgba(15, 23, 42, 0.05);
-  color: #0369a1;
+  border-color: rgba(31, 35, 40, 0.15);
+  border-bottom-color: #d1d9e0;
+  background: #f6f8fa;
+  color: #1f2328;
+  box-shadow: inset 0 -1px 0 rgba(209, 215, 222, 0.6);
 }
 /* 滑杆轨道：深色 #26263a → 浅灰 */
 html.light input[type='range'] {
@@ -863,4 +868,19 @@ html.light .sn-hero {
     0 5px 12px -2px rgba(2, 6, 23, 0.4),
     0 18px 36px -10px rgba(2, 6, 23, 0.55),
     0 0 26px -4px var(--stage-glow);
+}
+
+/* ============ 动效无障碍兜底（S1） ============
+   系统「减少动态」时全量关停动画与过渡：时长压到 0.01ms 而非 none，
+   animationend/transitionend 仍然触发——依赖动画回调收尾的组件
+   （word-in-fade、countdown-bar 等）不会因关停而卡在中间态 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

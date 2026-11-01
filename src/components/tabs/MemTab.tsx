@@ -342,13 +342,13 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         <button
           type="button"
           onClick={pullFull}
-          className="ml-2 text-sky-400 transition hover:text-sky-300"
+          className="ml-2 text-sky-400 transition-colors duration-150 hover:text-sky-300"
         >
           重试
         </button>
       </div>
     ) : full === null ? (
-      <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs text-slate-600">
+      <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs text-[var(--sn-text-4)]">
         加载中…
       </div>
     ) : (
@@ -742,7 +742,8 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         title="记忆库"
         desc="听写、截图取词、翻译的产出自动沉淀为可检索的个人记忆——「说过/看过/译过」皆可追索。"
       >
-        {/* 统计带：三项均为后端累计口径（不受当前筛选影响） */}
+        {/* 统计带：三项均为后端累计口径（不受当前筛选影响）。
+            T9：数字首次入场 anim-rise，数值变化靠 key 重挂触发 wordInFade */}
         <div className="grid grid-cols-3 gap-3">
           {[
             { label: '累计记忆', value: data?.total, unit: '条' },
@@ -751,11 +752,13 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
           ].map((s) => (
             <div
               key={s.label}
-              className="rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3"
+              className="rounded-xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] px-4 py-3"
             >
               <div className="text-[11px] text-slate-500">{s.label}</div>
-              <div className="tabular-nums mt-1 text-xl font-semibold text-slate-100">
-                {s.value == null ? '—' : s.value.toLocaleString()}
+              <div className="anim-rise tabular-nums mt-1 text-xl font-semibold text-[var(--sn-text-1)]">
+                <span key={s.value ?? 'na'} className="word-in-fade">
+                  {s.value == null ? '—' : s.value.toLocaleString()}
+                </span>
                 <span className="ml-1 text-[11px] font-normal text-slate-500">
                   {s.unit}
                 </span>
@@ -767,23 +770,23 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         {/* 存储卡：磁盘占用与条目构成（软作废条目仍占存储、近重复合并不增条数，
             所以占用与上方「累计记忆」是两套口径）。样式与统计带同一卡片语言 */}
         {stats && (
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-2.5 text-[11.5px] leading-5 text-slate-500">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] px-4 py-2.5 text-[11.5px] leading-5 text-slate-500">
             <span className="shrink-0">📦 存储</span>
-            <span className="tabular-nums font-medium text-slate-200">
+            <span className="tabular-nums font-medium text-[var(--sn-text-2)]">
               {stats.items} 条
             </span>
             <span className="tabular-nums">
               （置顶 {stats.pinned} / 已作废 {stats.superseded}）
             </span>
             <span className="text-slate-700">·</span>
-            <span className="tabular-nums font-medium text-slate-200">
+            <span className="tabular-nums font-medium text-[var(--sn-text-2)]">
               {fmtBytes(stats.bytes)}
             </span>
             {stats.bakBytes > 0 && (
               <span className="tabular-nums">（备份 {fmtBytes(stats.bakBytes)}）</span>
             )}
             <span className="text-slate-700">·</span>
-            <span className="tabular-nums font-medium text-slate-200">
+            <span className="tabular-nums font-medium text-[var(--sn-text-2)]">
               {stats.chars.toLocaleString()} 字
             </span>
           </div>
@@ -794,7 +797,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             跟随 stats——旧后端无统计时整块隐藏。ConfirmButton 无 disabled
             通道，空态退化为同款样式的禁用 Button 提示原因 */}
         {stats && (
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-2.5">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] px-4 py-2.5">
             <span className="shrink-0 text-[11.5px] leading-5 text-slate-500">🧹 治理</span>
             {stats.superseded > 0 ? (
               <ConfirmButton
@@ -828,15 +831,26 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             >
               {dlgBusy === 'bak' ? <Spinner size={14} /> : '从备份合并导入'}
             </Button>
-            <span className="min-w-[240px] flex-1 text-[11px] leading-5 text-slate-600">
+            <span className="min-w-[240px] flex-1 text-[11px] leading-5 text-[var(--sn-text-4)]">
               合并导入是多设备迁移路径：另一台设备导出的 JSON 拿来合并，不覆盖本机记忆
             </span>
           </div>
         )}
 
         {/* 视图切换（v5）：时间轴 / 图谱 / 洞察。图谱与洞察自带过滤
-            （时间档位/模式），切换后隐藏搜索与类型 chips 避免两套过滤器打架 */}
-        <div className="flex rounded-full border border-white/10 bg-black/20 p-0.5">
+            （时间档位/模式），切换后隐藏搜索与类型 chips 避免两套过滤器打架。
+            T6：绝对定位 thumb 随索引滑动（spring 曲线 200ms），三等分等宽段 */}
+        <div className="relative flex rounded-full border border-white/10 bg-[var(--sn-surface-3)] p-0.5">
+          <span
+            aria-hidden
+            className="absolute bottom-0.5 left-0.5 top-0.5 rounded-full bg-sky-500/15 transition-[left] duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
+            style={{
+              width: 'calc((100% - 4px) / 3)',
+              left: `calc(2px + ${
+                view === 'timeline' ? 0 : view === 'graph' ? 1 : 2
+              } * (100% - 4px) / 3)`,
+            }}
+          />
           {(
             [
               { v: 'timeline', label: '📋 时间轴' },
@@ -849,10 +863,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               type="button"
               onClick={() => setView(o.v)}
               aria-pressed={view === o.v}
-              className={`rounded-full px-3.5 py-1.5 text-[11.5px] transition ${
+              className={`relative z-10 flex-1 rounded-full px-3.5 py-1.5 text-[11.5px] transition-colors duration-150 ${
                 view === o.v
-                  ? 'bg-sky-500/15 text-sky-300'
-                  : 'text-slate-400 hover:text-slate-200'
+                  ? 'font-medium text-sky-300'
+                  : 'text-[var(--sn-text-3)] hover:text-[var(--sn-text-2)]'
               }`}
             >
               {o.label}
@@ -874,7 +888,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                 type="button"
                 title="清空搜索"
                 onClick={() => setQuery('')}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded px-1 text-[13px] leading-none text-slate-500 transition hover:text-slate-200"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded px-1 text-[13px] leading-none text-slate-500 transition-colors duration-150 hover:text-[var(--sn-text-2)]"
               >
                 ✕
               </button>
@@ -883,7 +897,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
           {data && (
             <span
               title={hasFilter ? '筛选结果 / 全部记忆' : '库内全部记忆'}
-              className="rounded-full border border-white/[0.08] bg-black/20 px-2.5 py-1 font-mono text-[10.5px] text-slate-500"
+              className="rounded-full border border-white/[0.08] bg-[var(--sn-surface-3)] px-2.5 py-1 font-mono text-[10.5px] text-slate-500"
             >
               {hasFilter ? `${visible.length} 条结果` : `共 ${data.total} 条`}
             </span>
@@ -915,10 +929,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                   key={k}
                   type="button"
                   onClick={() => setKind(k)}
-                  className={`rounded-full border px-2.5 py-1 text-[11px] transition ${
+                  className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors duration-150 ${
                     active
                       ? 'border-sky-500/60 bg-sky-500/10 text-sky-300'
-                      : 'border-white/10 bg-black/20 text-slate-400 hover:border-white/25 hover:text-slate-200'
+                      : 'border-white/10 bg-[var(--sn-surface-3)] text-[var(--sn-text-3)] hover:border-[var(--sn-border-strong)] hover:text-[var(--sn-text-2)]'
                   }`}
                 >
                   {k === '' ? '全部' : `${KIND_ICON[k]} ${KIND_LABEL[k]}`}
@@ -930,10 +944,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               type="button"
               onClick={() => setPinnedOnly((v) => !v)}
               aria-pressed={pinnedOnly}
-              className={`rounded-full border px-2.5 py-1 text-[11px] transition ${
+              className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors duration-150 ${
                 pinnedOnly
                   ? 'border-amber-400/50 bg-amber-400/10 text-amber-300'
-                  : 'border-white/10 bg-black/20 text-slate-400 hover:border-white/25 hover:text-slate-200'
+                  : 'border-white/10 bg-[var(--sn-surface-3)] text-[var(--sn-text-3)] hover:border-[var(--sn-border-strong)] hover:text-[var(--sn-text-2)]'
               }`}
             >
               ★ 置顶
@@ -945,10 +959,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               onClick={() => setShowSuperseded((v) => !v)}
               aria-pressed={showSuperseded}
               title="软作废条目默认隐藏（与召回一致）；开启后在此查看，导出始终保留"
-              className={`rounded-full border px-2.5 py-1 text-[11px] transition ${
+              className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors duration-150 ${
                 showSuperseded
-                  ? 'border-slate-400/50 bg-slate-400/10 text-slate-300'
-                  : 'border-white/10 bg-black/20 text-slate-400 hover:border-white/25 hover:text-slate-200'
+                  ? 'border-slate-400/50 bg-slate-400/10 text-[var(--sn-text-2)]'
+                  : 'border-white/10 bg-[var(--sn-surface-3)] text-[var(--sn-text-3)] hover:border-[var(--sn-border-strong)] hover:text-[var(--sn-text-2)]'
               }`}
             >
               ⊘ 已作废
@@ -970,7 +984,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                   disabled={exporting}
                   onClick={() => void onExport(e.fmt)}
                   title="全量导出（不受当前搜索/筛选影响），保存位置由系统对话框选择"
-                  className="rounded-full border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-slate-300 transition hover:border-white/25 hover:text-slate-100 disabled:opacity-50"
+                  className="rounded-full border border-white/10 bg-[var(--sn-surface-3)] px-2.5 py-1 text-[11px] text-[var(--sn-text-2)] transition-colors duration-150 hover:border-[var(--sn-border-strong)] hover:text-[var(--sn-text-1)] disabled:opacity-50"
                 >
                   {e.label}
                 </button>
@@ -994,7 +1008,13 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
 
         {/* 主体区按视图切换：图谱/洞察只换这一块，采集横幅与统计带全视图共享 */}
         {view === 'graph'
-          ? fullGate(<MemGraph items={aliveFull} onPickKeyword={pickKeyword} />)
+          ? fullGate(
+              <MemGraph
+                items={aliveFull}
+                onPickKeyword={pickKeyword}
+                onGoDictate={() => navigate('dash')}
+              />,
+            )
           : view === 'insights'
             ? fullGate(<MemInsights items={aliveFull} onPickKeyword={pickKeyword} />)
             : loadErr ? (
@@ -1003,25 +1023,42 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             <button
               type="button"
               onClick={refresh}
-              className="ml-2 text-sky-400 transition hover:text-sky-300"
+              className="ml-2 text-sky-400 transition-colors duration-150 hover:text-sky-300"
             >
               重试
             </button>
           </div>
         ) : data === null ? (
-          <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs text-slate-600">
-            加载中…
+          /* T7 骨架卡：首帧（列表未到）用 3 张与实体卡同构的骨架占位，
+             比「加载中…」更能锚定即将出现的内容版式 */
+          <div className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <div
+                key={i}
+                className="rounded-lg border border-[var(--sn-border)] bg-[var(--sn-surface-3)] px-4 py-3"
+              >
+                <div className="flex h-6 items-center gap-2">
+                  <div className="skeleton h-4 w-14 rounded-full" />
+                  <div className="skeleton h-3.5 min-w-0 max-w-[260px] flex-1" />
+                </div>
+                <div className="skeleton mt-2 h-3 w-full" />
+                <div className="skeleton mt-2 h-3 w-2/3" />
+              </div>
+            ))}
           </div>
         ) : visible.length === 0 ? (
-          /* 空态分四种成因给出各自引导：空库 / 搜索无匹配 / 类型无记录 / 无置顶 */
-          <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs leading-6 text-slate-600">
+          /* 空态四分（T8）：图标 + 主/副文 + 行动按钮，按成因给各自出路
+             （空库→去听写 / 搜索落空→清空搜索 / 类型落空→切回全部 / 无置顶→纯引导） */
+          <div className="rounded-lg border border-dashed border-white/10 px-4 py-10 text-center">
             {data.total === 0 ? (
               <>
-                记忆库还是空的
-                <br />
-                <span className="text-[11px]">
+                <div className="text-[28px] leading-none opacity-60">🧠</div>
+                <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
+                  记忆库还是空的
+                </div>
+                <div className="mt-1 text-[11px] leading-5 text-[var(--sn-text-4)]">
                   使用听写、截图取词、划词翻译后，产出会自动沉淀到这里，随时可检索
-                </span>
+                </div>
                 <div className="mt-3">
                   <Button kind="primary" onClick={() => navigate('dash')}>
                     去听写 →
@@ -1030,31 +1067,45 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               </>
             ) : searching ? (
               <>
-                没有匹配「{query.trim()}」的记忆
-                <br />
-                <span className="text-[11px]">
+                <div className="text-[28px] leading-none opacity-60">🔍</div>
+                <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
+                  没有匹配「{query.trim()}」的记忆
+                </div>
+                <div className="mt-1 text-[11px] leading-5 text-[var(--sn-text-4)]">
                   试试更短的关键词，或切换类型筛选（多词之间是「与」关系）
-                </span>
+                </div>
+                <div className="mt-3">
+                  <Button onClick={() => setQuery('')}>清空搜索</Button>
+                </div>
               </>
             ) : kind !== '' ? (
               <>
-                该类型暂无记忆
-                <br />
-                <span className="text-[11px]">切换「全部」查看所有记忆</span>
+                <div className="text-[28px] leading-none opacity-60">{KIND_ICON[kind]}</div>
+                <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
+                  该类型暂无记忆
+                </div>
+                <div className="mt-1 text-[11px] leading-5 text-[var(--sn-text-4)]">
+                  切换「全部」查看所有记忆
+                </div>
+                <div className="mt-3">
+                  <Button onClick={() => setKind('')}>切回全部</Button>
+                </div>
               </>
             ) : (
               <>
-                还没有置顶的记忆
-                <br />
-                <span className="text-[11px]">
+                <div className="text-[28px] leading-none opacity-60">⭐</div>
+                <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
+                  还没有置顶的记忆
+                </div>
+                <div className="mt-1 text-[11px] leading-5 text-[var(--sn-text-4)]">
                   点击条目标题行的 ☆ 置顶常用记忆，置顶不占保留条数名额
-                </span>
+                </div>
               </>
             )}
           </div>
         ) : (
           <div
-            className={`sn-scroll max-h-[480px] overflow-y-auto pr-1 transition-opacity ${
+            className={`sn-scroll max-h-[480px] overflow-y-auto pr-1 transition-opacity duration-150 ${
               loading ? 'opacity-60' : ''
             }`}
           >
@@ -1064,15 +1115,16 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                   /* 粘性日期头：滚动时贴在本组顶部、组尾把它顶出去——组 wrapper
                      限定吸附范围，保证半透明磨砂底下任意时刻至多一个日期头在
                      顶部、互不叠字；bg-black/45 深浅两主题都有浅色映射
-                     （black/70 无浅色覆盖会呈纯黑） */
+                     （black/70 无浅色覆盖会呈纯黑）。
+                     T5：左文字 + 右延发丝线（after 伪元素 flex-1），去掉两侧破折号 */
                   <div
-                    className={`sticky top-0 z-10 bg-black/45 py-1.5 text-[10px] tracking-widest backdrop-blur ${
+                    className={`sticky top-0 z-10 flex items-center gap-2 bg-black/45 py-1.5 pl-0.5 text-[10px] tracking-widest backdrop-blur after:h-px after:flex-1 after:bg-[var(--sn-border)] after:content-[''] ${
                       g.day === PINNED_SECTION
                         ? 'text-amber-500/80'
-                        : 'text-slate-600'
+                        : 'text-[var(--sn-text-4)]'
                     }`}
                   >
-                    ── {g.day} ──
+                    {g.day}
                   </div>
                 )}
                 {g.items.map((it) => {
@@ -1084,13 +1136,13 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                   return (
                     <div
                       key={it.ts}
-                      className={`group rounded-lg border px-3.5 py-2.5 transition ${
+                      className={`group rounded-lg border px-4 py-3 transition-colors duration-150 ${
                         isSel
                           ? 'border-sky-500/40 bg-sky-500/[0.04]'
-                          : 'border-white/[0.06] bg-black/20 hover:border-white/[0.14]'
+                          : 'border-[var(--sn-border)] bg-[var(--sn-surface-3)] hover:border-[var(--sn-border-strong)]'
                       }`}
                     >
-                      <div className="flex items-start gap-3">
+                      <div className="flex items-start gap-2">
                         {selectMode && (
                           <button
                             type="button"
@@ -1099,7 +1151,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             onClick={() => toggleSel(it.ts)}
                             title="选中 / 取消选中"
                             aria-label="选中该条记忆"
-                            className={`mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition ${
+                            className={`mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition-colors duration-150 ${
                               isSel
                                 ? 'border-sky-400 bg-sky-500/80 text-white'
                                 : 'border-white/25 text-transparent hover:border-sky-400/60'
@@ -1109,8 +1161,9 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                           </button>
                         )}
                         <div className={`min-w-0 flex-1 ${dead ? 'opacity-60' : ''}`}>
-                          {/* 标题行：类型徽章 + 软作废标 + 蒸馏标 + 标题 + 置顶星标（可点）+ 时刻 */}
-                          <div className="flex items-center gap-2">
+                          {/* 标题行：类型徽章 + 软作废标 + 蒸馏标 + 标题 + 置顶星标（可点）+ 时刻。
+                              T2：行高固定 h-6，多行徽章/星标不再撑高抖动 */}
+                          <div className="flex h-6 items-center gap-2">
                             <span
                               className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${KIND_CLS[it.kind]}`}
                             >
@@ -1119,7 +1172,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             {dead && (
                               <span
                                 title="被更新的记忆取代，召回不再出现，可在导出中保留"
-                                className="shrink-0 rounded-full border border-slate-500/25 bg-slate-500/10 px-2 py-0.5 text-[10px] text-slate-400"
+                                className="shrink-0 rounded-full border border-slate-500/25 bg-slate-500/10 px-2 py-0.5 text-[10px] text-[var(--sn-text-3)]"
                               >
                                 已被取代
                               </span>
@@ -1130,7 +1183,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                               </span>
                             )}
                             <span
-                              className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-slate-200"
+                              className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-[var(--sn-text-2)]"
                               title={it.title}
                             >
                               <Highlight text={it.title} q={query} />
@@ -1146,16 +1199,20 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                                 }
                                 aria-label={isPinned ? '取消置顶' : '置顶'}
                                 aria-pressed={isPinned}
-                                className={`shrink-0 text-[11px] leading-none transition ${
+                                className={`shrink-0 text-[11px] leading-none transition-colors duration-150 ${
                                   isPinned
                                     ? 'text-amber-400'
-                                    : 'text-slate-600 hover:text-amber-300'
+                                    : 'text-[var(--sn-text-4)] hover:text-amber-300'
                                 }`}
                               >
                                 {isPinned ? '⭐' : '☆'}
                               </button>
                             )}
-                            <span className="tabular-nums shrink-0 font-mono text-[10.5px] text-slate-600">
+                            {/* T3：时刻 hover（卡悬停）提亮 + title 完整时间，11px */}
+                            <span
+                              title={new Date(it.ts).toLocaleString()}
+                              className="tabular-nums shrink-0 font-mono text-[11px] text-[var(--sn-text-4)] transition-colors duration-150 group-hover:text-[var(--sn-text-3)]"
+                            >
                               {fmtHM(it.ts)}
                             </span>
                           </div>
@@ -1172,13 +1229,14 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             title={expanded ? '点击收起' : '点击展开全文'}
                             className={
                               expanded
-                                ? 'sn-scroll mt-1.5 max-h-72 cursor-pointer overflow-y-auto whitespace-pre-wrap text-[12px] leading-5 text-slate-400'
-                                : 'mt-1.5 line-clamp-2 cursor-pointer whitespace-pre-wrap text-[12px] leading-5 text-slate-400'
+                                ? 'sn-scroll mt-1.5 max-h-72 cursor-pointer overflow-y-auto whitespace-pre-wrap text-[12px] leading-5 text-[var(--sn-text-3)]'
+                                : 'mt-1.5 line-clamp-2 cursor-pointer whitespace-pre-wrap text-[12px] leading-5 text-[var(--sn-text-3)]'
                             }
                           >
                             <Highlight text={it.text} q={query} />
                           </div>
-                          {/* 关键词：可点回填搜索，蒸馏产出即刻可追索 */}
+                          {/* 关键词：可点回填搜索，蒸馏产出即刻可追索。
+                              T10：hover 补 bg 提示可点性 */}
                           {it.keywords.length > 0 && (
                             <div className="mt-2 flex flex-wrap gap-1">
                               {it.keywords.map((kw) => (
@@ -1187,7 +1245,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                                   type="button"
                                   onClick={() => setQuery(kw)}
                                   title="点击检索该关键词"
-                                  className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px] text-slate-500 transition hover:text-slate-300"
+                                  className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px] text-slate-500 transition-colors duration-150 hover:bg-white/10 hover:text-[var(--sn-text-2)]"
                                 >
                                   # {kw}
                                 </button>
@@ -1195,7 +1253,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             </div>
                           )}
                           {/* 元信息 + 行内操作：多选模式与行内操作互斥，进入即隐藏 */}
-                          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10.5px] text-slate-600">
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10.5px] text-[var(--sn-text-4)]">
                             {it.app && (
                               <span className="font-mono" title="采集时的前台应用">
                                 {it.app}
@@ -1221,7 +1279,9 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                             )}
                             <span className="flex-1" />
                             {!selectMode && (
-                              <span className="flex items-center gap-1 opacity-70 transition group-hover:opacity-100">
+                              /* T4 hover-reveal：静置 40% 淡出、卡悬停与键盘聚焦
+                                 （focus-within，Tab 导航到按钮时）全显 */
+                              <span className="flex items-center gap-1 opacity-40 transition-opacity duration-150 group-focus-within:opacity-100 group-hover:opacity-100">
                                 {/* 恢复只出现在软作废卡上：软作废默认隐藏，能看到
                                     本按钮即代表用户已开「⊘ 已作废」开关在治理视图中 */}
                                 {dead && (
@@ -1229,7 +1289,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                                     type="button"
                                     onClick={() => void onRestore(it.ts)}
                                     title="撤销软作废：清空「被取代」标记，重新进入召回与检索"
-                                    className="rounded px-1.5 py-1 text-emerald-400 transition hover:bg-white/10 hover:text-emerald-300"
+                                    className="rounded px-1.5 py-1 text-emerald-400 transition-colors duration-150 hover:bg-white/10 hover:text-emerald-300"
                                   >
                                     恢复
                                   </button>
@@ -1254,7 +1314,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                                       })
                                       .catch((e) => toast(String(e), 'error'));
                                   }}
-                                  className={`rounded px-1.5 py-1 transition ${
+                                  className={`rounded px-1.5 py-1 transition-colors duration-150 ${
                                     copiedTs === it.ts
                                       ? 'text-emerald-400'
                                       : 'text-sky-400 hover:bg-white/10 hover:text-sky-300'
@@ -1265,7 +1325,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
                                 <button
                                   type="button"
                                   onClick={() => void onDeleteOne(it.ts)}
-                                  className={`rounded px-1.5 py-1 transition ${
+                                  className={`rounded px-1.5 py-1 transition-colors duration-150 ${
                                     confirmDelTs === it.ts
                                       ? 'text-red-400'
                                       : 'text-slate-500 hover:bg-white/10 hover:text-red-400'
@@ -1290,7 +1350,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
             bg-black/45 而非历史页的 black/70：后者无浅色主题覆盖 */}
         {selectMode && (
           <div className="sticky bottom-0 z-20 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-black/45 px-4 py-2.5 backdrop-blur">
-            <span className="text-xs text-slate-300">已选 {selected.size} 条</span>
+            <span className="text-xs text-[var(--sn-text-2)]">已选 {selected.size} 条</span>
             <Button
               kind="subtle"
               onClick={selectAll}
@@ -1396,11 +1456,11 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         {/* 安全态势卡（v4）：放在采集设置末尾而不进 m.enabled 门内——
             REST 暴露面与采集黑名单在关闭采集时依然生效，蒸馏在导入中心
             手动导入时也可能触发；三行状态点给「内容出不出本机」一个直答 */}
-        <div className="space-y-2 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3">
+        <div className="space-y-2 rounded-xl border border-[var(--sn-border)] bg-[var(--sn-surface-3)] px-4 py-3">
           <div className="flex items-center gap-2 text-[11px] text-slate-500">
             <span>🛡</span>
             <span>安全态势</span>
-            <span className="text-slate-600">记忆内容的暴露面，随上方配置即时更新</span>
+            <span className="text-[var(--sn-text-4)]">记忆内容的暴露面，随上方配置即时更新</span>
           </div>
           {posture.map((r) => (
             <div key={r.label} className="flex items-center gap-2 text-[11.5px] leading-5">
@@ -1413,7 +1473,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               />
               <span className="w-[72px] shrink-0 text-slate-500">{r.label}</span>
               <span
-                className={`min-w-0 flex-1 ${r.warn ? 'text-amber-200/90' : 'text-slate-300'}`}
+                className={`min-w-0 flex-1 ${r.warn ? 'text-amber-200/90' : 'text-[var(--sn-text-2)]'}`}
               >
                 {r.text}
               </span>
@@ -1435,7 +1495,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
         {importProg && (
           <div className="rounded-xl border border-sky-400/20 bg-sky-500/[0.05] px-4 py-2.5">
             <div className="flex items-center justify-between gap-3 text-[11px]">
-              <span className="truncate font-mono text-slate-400" title={importProg.label}>
+              <span className="truncate font-mono text-[var(--sn-text-3)]" title={importProg.label}>
                 {importProg.label || '正在导入…'}
               </span>
               <span className="tabular-nums shrink-0 text-slate-500">
