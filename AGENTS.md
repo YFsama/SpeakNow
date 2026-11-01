@@ -109,4 +109,4 @@ memimport 可离线把文档喂进真实 mem.json（不启动应用）。
 
 ## 版本
 
-SpeakNow v0.4.10 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
+SpeakNow v0.6.0 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
