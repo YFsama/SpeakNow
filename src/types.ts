@@ -216,6 +216,8 @@ export interface GeneralConfig {
   autoCheckUpdate?: boolean;
   /** 已选择「跳过此版本」的版本号：该版本不再提示，清空恢复 */
   skipVersion?: string;
+  /** 强调色主题 id（sky/indigo/violet/teal/amber）：驱动 data-accent 与全套强调色变量 */
+  accent?: string;
 }
 
 /** 外接显示（硬件字幕屏）API */

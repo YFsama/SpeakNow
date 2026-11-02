@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Button, ConfirmButton, Field, Section, Segmented, TextArea, Toggle } from '../Controls';
+import { LogoBadge } from '../Logo';
+import { SoundFadeLine } from '../EmptyArt';
 import {
   appVersion,
   checkUpdate,
@@ -488,18 +490,10 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
     <>
     <Section icon="ℹ️" title="关于 SpeakNow">
       <div className="flex items-center gap-4 rounded-xl border border-white/[0.06] bg-black/20 p-4">
-        <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shadow-sky-500/25">
-          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden>
-            <rect x="9" y="3" width="6" height="11" rx="3" fill="white" />
-            <path
-              d="M5 11a7 7 0 0 0 14 0"
-              stroke="white"
-              strokeWidth="2"
-              strokeLinecap="round"
-              fill="none"
-            />
-            <path d="M12 18v3" stroke="white" strokeWidth="2" strokeLinecap="round" />
-          </svg>
+        {/* 回声涟漪徽章（渐变随主题 accent 联动）+ 下方声波渐隐装饰线 */}
+        <div className="flex shrink-0 flex-col items-center gap-2.5 py-1">
+          <LogoBadge size={96} />
+          <SoundFadeLine />
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-semibold text-slate-100">

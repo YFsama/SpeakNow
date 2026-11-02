@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Button, ConfirmButton, Section, Select, TextArea, TextInput } from '../Controls';
+import { EmptyArt } from '../EmptyArt';
 import {
   clearHistory,
   copyText,
@@ -467,12 +468,18 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
         <div className="rounded-lg border border-dashed border-white/10 py-8 text-center text-xs leading-6 text-slate-600">
           {query ? (
             <>
+              <div className="mb-2">
+                <EmptyArt name="search" size={96} />
+              </div>
               没有匹配「{query}」的记录
               <br />
               <span className="text-[11px]">试试更短的关键词，或切换类型筛选</span>
             </>
           ) : kindFilter !== 'all' ? (
             <>
+              <div className="mb-2">
+                <EmptyArt name="search" size={96} />
+              </div>
               该类型暂无记录
               <br />
               <span className="text-[11px]">切换「全部」查看所有历史</span>
@@ -481,6 +488,9 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
             <>
               {hotkeyChips.length > 0 ? (
                 <>
+                  <div className="mb-2">
+                    <EmptyArt name="history" size={96} />
+                  </div>
                   还没有记录
                   <br />
                   <span className="text-[11px]">
@@ -496,6 +506,9 @@ export function HistoryTab({ cfg, set, history, toast, refreshHistory }: TabProp
                 </>
               ) : (
                 <>
+                  <div className="mb-2">
+                    <EmptyArt name="hotkey" size={96} />
+                  </div>
                   还没有记录
                   <br />
                   <span className="text-[11px] text-amber-300/80">

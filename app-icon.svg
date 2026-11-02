@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- SpeakNow 应用图标源图（回声涟漪）：npx tauri icon 从此生成全套尺寸。
+       内容占高 ~84%（860/1024），rx 230≈22% 圆角：macOS squircle 安全区与
+       Win11 二次圆角都留足出血；渐变与应用内 LogoBadge 同源（天青→靛蓝） -->
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#38bdf8"/>
+    <stop offset="1" stop-color="#6366f1"/>
+  </linearGradient></defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="230" fill="url(#g)"/>
+  <g transform="translate(82 130) scale(35.8)" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round">
+    <path d="M5.42 13.6A7 7 0 0 1 18.58 13.6"/>
+    <path d="M1.66 12.24A11 11 0 0 1 22.34 12.24"/>
+    <circle cx="12" cy="13.5" r="3.5" fill="#ffffff" stroke="none"/>
+  </g>
+</svg>

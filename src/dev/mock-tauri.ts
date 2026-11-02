@@ -135,6 +135,7 @@ const mockConfig = {
     lingerMult: 1,
     autoCheckUpdate: true,
     skipVersion: '',
+    accent: 'sky',
   },
   mem: {
     enabled: true,

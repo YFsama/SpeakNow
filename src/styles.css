@@ -11,6 +11,18 @@
     Consolas, 'Liberation Mono', monospace;
 }
 
+/* accent 主题桥接（Tailwind v4）：把下方 data-accent 预设块定义的角色变量
+   暴露为工具类色名——inline 让生成的工具类直接引用 var(--sn-accent*)，
+   运行时随 <html data-accent> 翻转、无级联延迟。
+   新代码一律用 text-accent / bg-accent / border-accent / from-accent /
+   to-accent-2 / text-accent-text 等类（透明度修饰符同样可用，如 bg-accent/15），
+   不再手写 sky-xxx 承担强调角色 */
+@theme inline {
+  --color-accent: var(--sn-accent);
+  --color-accent-text: var(--sn-accent-text);
+  --color-accent-2: var(--sn-accent-2);
+}
+
 /* ============ 语义设计令牌（设置窗口 v2） ============
    目的：新增视觉一律走变量，浅色只需在 html.light 换值，避免再往
    「按 Tailwind 类名逐条覆盖」的兼容清单里加行。仅设置窗口使用；
@@ -40,10 +52,12 @@ html {
   height: 100%;
   /* 背景挂在 html（画布）上，滚动时整页覆盖，避免超出首屏后露底色。
      typist.html 未覆盖此规则、依赖这里的基础深色——改氛围层须保持底色不变，
-     设置窗口更细腻的氛围（网格纹理等）见下方 .sn-shell-bg，只作用于主窗口 */
+     设置窗口更细腻的氛围（网格纹理等）见下方 .sn-shell-bg，只作用于主窗口。
+     双径向光晕的颜色端走 accent 角色变量（--sn-accent*-glow），
+     几何（位置/尺寸/终止位）与旧版一致 */
   background:
-    radial-gradient(1100px 520px at 85% -5%, rgba(99, 102, 241, 0.1), transparent 60%),
-    radial-gradient(900px 480px at -10% 15%, rgba(56, 189, 248, 0.07), transparent 55%),
+    radial-gradient(1100px 520px at 85% -5%, var(--sn-accent-2-glow, rgba(99, 102, 241, 0.1)), transparent 60%),
+    radial-gradient(900px 480px at -10% 15%, var(--sn-accent-glow, rgba(56, 189, 248, 0.07)), transparent 55%),
     #0a0a0f;
   background-attachment: fixed;
 }
@@ -76,7 +90,7 @@ section h2,
 }
 
 ::selection {
-  background: rgba(56, 189, 248, 0.35);
+  background: color-mix(in srgb, var(--sn-accent, #38bdf8) 35%, transparent);
   color: #fff;
 }
 
@@ -94,7 +108,8 @@ section h2,
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   line-height: 16px;
-  color: #7dd3fc;
+  /* 深色档键帽文字走 accent 文本档（浅色档在 html.light .kbd 换 Primer 中性色） */
+  color: var(--sn-accent-text, #7dd3fc);
   white-space: nowrap;
 }
 
@@ -130,7 +145,7 @@ input[type='range']::-webkit-slider-thumb {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: #38bdf8;
+  background: var(--sn-accent, #38bdf8);
   cursor: pointer;
   border: none;
 }
@@ -312,17 +327,18 @@ input[type='range']::-webkit-slider-thumb {
   animation: wordInFade 0.3s ease-out both;
 }
 
-/* AI 修改处的强调高亮，动画结束后保留极淡常驻底色（审计可回溯哪些词被改过） */
+/* AI 修改处的强调高亮，动画结束后保留极淡常驻底色（审计可回溯哪些词被改过）。
+   颜色端走 accent 变量，随主题联动（overlay 窗口未设 data-accent 时回退 sky） */
 @keyframes wordChanged {
   0% {
-    background: rgba(56, 189, 248, 0.35);
-    color: #e0f2fe;
+    background: color-mix(in srgb, var(--sn-accent, #38bdf8) 35%, transparent);
+    color: #fff;
   }
   70% {
-    background: rgba(56, 189, 248, 0.22);
+    background: color-mix(in srgb, var(--sn-accent, #38bdf8) 22%, transparent);
   }
   100% {
-    background: rgba(56, 189, 248, 0.1);
+    background: color-mix(in srgb, var(--sn-accent, #38bdf8) 10%, transparent);
   }
 }
 .word-changed {
@@ -360,15 +376,167 @@ html.light {
   --sn-sidebar: rgba(255, 255, 255, 0.72);
   --sn-header-veil: rgba(243, 244, 248, 0.86);
 
+  /* 光晕端色与深色档同源（accent 预设的浅色 glow 值），底色 #f3f4f8 不变 */
   background:
-    radial-gradient(1100px 520px at 85% -5%, rgba(99, 102, 241, 0.08), transparent 60%),
-    radial-gradient(900px 480px at -10% 15%, rgba(14, 165, 233, 0.08), transparent 55%),
+    radial-gradient(1100px 520px at 85% -5%, var(--sn-accent-2-glow, rgba(99, 102, 241, 0.08)), transparent 60%),
+    radial-gradient(900px 480px at -10% 15%, var(--sn-accent-glow, rgba(14, 165, 233, 0.08)), transparent 55%),
     #f3f4f8;
   background-attachment: fixed;
 }
 
 html.light body {
   color: #1e293b;
+}
+
+/* ============ 强调色主题预设（accent） ============
+   <html data-accent="sky|indigo|violet|teal|amber"> 由 api.ts applyAppearance
+   写入；每预设深/浅两档——深档挂 html[data-accent=x]（压过 :root 默认），
+   浅档挂 html.light[data-accent=x]（属性+类，特异性高于 html.light 的兜底值）。
+   明度步阶语义取自 Radix：深底取亮步（accent 400 / 文本 300 / ring 500）、
+   浅底取深步（accent 600 / hover·文本 700）——同一角色在两种底色下都保证对比度。
+   九个角色：
+   --sn-accent         实心底（主按钮/选中圆点/进度/渐变主端）
+   --sn-accent-hover   实心底悬停（深底提亮一档 300、浅底压暗一档 700）
+   --sn-accent-fg      accent 之上的文字（深色档恒深墨 #06121f、浅色档恒白）
+   --sn-accent-text    强调文本（nav 激活/链接/徽章文字）
+   --sn-accent-subtle  激活 tint 底（选中芯片/卡片 5%~15% 洗色统一走这）
+   --sn-accent-border  accent 系发丝边框
+   --sn-accent-ring    焦点环（键盘可达性主通道，深 500@30% / 浅 600@25%）
+   --sn-accent-2       渐变副端（各预设的搭配见块内注释）
+   --sn-accent-glow / --sn-accent-2-glow  氛围光晕（html/shell/hero 背景端色）
+   sky 块为默认档、显式写出（同 :root 值）——保证下方兜底层用
+   :not([data-accent='sky']) 能把默认档完整排除，overlay/typist 等未写
+   data-accent 的窗口回落 :root 的 sky 值不受影响 */
+
+/* 天青（默认）：副端靛蓝，与既有 sky/indigo 体系同源 */
+html[data-accent='sky'] {
+  --sn-accent: #38bdf8; /* sky-400 */
+  --sn-accent-hover: #7dd3fc; /* sky-300 */
+  --sn-accent-fg: #06121f;
+  --sn-accent-text: #7dd3fc; /* sky-300 */
+  --sn-accent-subtle: rgba(56, 189, 248, 0.12); /* 400@12% */
+  --sn-accent-border: rgba(56, 189, 248, 0.28); /* 400@28% */
+  --sn-accent-ring: rgba(14, 165, 233, 0.3); /* 500@30% */
+  --sn-accent-2: #6366f1; /* indigo-500 */
+  --sn-accent-glow: rgba(56, 189, 248, 0.09);
+  --sn-accent-2-glow: rgba(99, 102, 241, 0.1);
+}
+html.light[data-accent='sky'] {
+  --sn-accent: #0284c7; /* sky-600 */
+  --sn-accent-hover: #0369a1; /* sky-700 */
+  --sn-accent-fg: #ffffff;
+  --sn-accent-text: #0369a1; /* sky-700，与旧浅色 .text-sky-300 覆盖同值 */
+  --sn-accent-subtle: rgba(2, 132, 199, 0.1); /* 600@10% */
+  --sn-accent-border: rgba(2, 132, 199, 0.35); /* 600@35% */
+  --sn-accent-ring: rgba(2, 132, 199, 0.25); /* 600@25% */
+  --sn-accent-2: #4f46e5; /* indigo-600 */
+  --sn-accent-glow: rgba(2, 132, 199, 0.08);
+  --sn-accent-2-glow: rgba(79, 70, 229, 0.07);
+}
+
+/* 靛蓝：副端紫罗兰（同频段冷色，避免主副难分） */
+html[data-accent='indigo'] {
+  --sn-accent: #818cf8; /* indigo-400 */
+  --sn-accent-hover: #a5b4fc; /* indigo-300 */
+  --sn-accent-fg: #06121f;
+  --sn-accent-text: #a5b4fc; /* indigo-300 */
+  --sn-accent-subtle: rgba(129, 140, 248, 0.12);
+  --sn-accent-border: rgba(129, 140, 248, 0.28);
+  --sn-accent-ring: rgba(99, 102, 241, 0.3); /* indigo-500@30% */
+  --sn-accent-2: #8b5cf6; /* violet-500 */
+  --sn-accent-glow: rgba(129, 140, 248, 0.09);
+  --sn-accent-2-glow: rgba(139, 92, 246, 0.1);
+}
+html.light[data-accent='indigo'] {
+  --sn-accent: #4f46e5; /* indigo-600 */
+  --sn-accent-hover: #4338ca; /* indigo-700 */
+  --sn-accent-fg: #ffffff;
+  --sn-accent-text: #4338ca; /* indigo-700 */
+  --sn-accent-subtle: rgba(79, 70, 229, 0.1);
+  --sn-accent-border: rgba(79, 70, 229, 0.35);
+  --sn-accent-ring: rgba(79, 70, 229, 0.25);
+  --sn-accent-2: #7c3aed; /* violet-600 */
+  --sn-accent-glow: rgba(79, 70, 229, 0.08);
+  --sn-accent-2-glow: rgba(124, 58, 237, 0.07);
+}
+
+/* 紫罗兰：副端天青（冷暖互补，紫底上比紫+紫更稳） */
+html[data-accent='violet'] {
+  --sn-accent: #a78bfa; /* violet-400 */
+  --sn-accent-hover: #c4b5fd; /* violet-300 */
+  --sn-accent-fg: #06121f;
+  --sn-accent-text: #c4b5fd; /* violet-300 */
+  --sn-accent-subtle: rgba(167, 139, 250, 0.12);
+  --sn-accent-border: rgba(167, 139, 250, 0.28);
+  --sn-accent-ring: rgba(139, 92, 246, 0.3); /* violet-500@30% */
+  --sn-accent-2: #0ea5e9; /* sky-500 */
+  --sn-accent-glow: rgba(167, 139, 250, 0.09);
+  --sn-accent-2-glow: rgba(14, 165, 233, 0.1);
+}
+html.light[data-accent='violet'] {
+  --sn-accent: #7c3aed; /* violet-600 */
+  --sn-accent-hover: #6d28d9; /* violet-700 */
+  --sn-accent-fg: #ffffff;
+  --sn-accent-text: #6d28d9; /* violet-700 */
+  --sn-accent-subtle: rgba(124, 58, 237, 0.1);
+  --sn-accent-border: rgba(124, 58, 237, 0.35);
+  --sn-accent-ring: rgba(124, 58, 237, 0.25);
+  --sn-accent-2: #0284c7; /* sky-600 */
+  --sn-accent-glow: rgba(124, 58, 237, 0.08);
+  --sn-accent-2-glow: rgba(2, 132, 199, 0.07);
+}
+
+/* 青碧：副端天青（邻近色过渡，水色系一体） */
+html[data-accent='teal'] {
+  --sn-accent: #2dd4bf; /* teal-400 */
+  --sn-accent-hover: #5eead4; /* teal-300 */
+  --sn-accent-fg: #06121f;
+  --sn-accent-text: #5eead4; /* teal-300 */
+  --sn-accent-subtle: rgba(45, 212, 191, 0.12);
+  --sn-accent-border: rgba(45, 212, 191, 0.28);
+  --sn-accent-ring: rgba(20, 184, 166, 0.3); /* teal-500@30% */
+  --sn-accent-2: #0ea5e9; /* sky-500 */
+  --sn-accent-glow: rgba(45, 212, 191, 0.09);
+  --sn-accent-2-glow: rgba(14, 165, 233, 0.1);
+}
+html.light[data-accent='teal'] {
+  --sn-accent: #0d9488; /* teal-600 */
+  --sn-accent-hover: #0f766e; /* teal-700 */
+  --sn-accent-fg: #ffffff;
+  --sn-accent-text: #0f766e; /* teal-700 */
+  --sn-accent-subtle: rgba(13, 148, 136, 0.1);
+  --sn-accent-border: rgba(13, 148, 136, 0.35);
+  --sn-accent-ring: rgba(13, 148, 136, 0.25);
+  --sn-accent-2: #0284c7; /* sky-600 */
+  --sn-accent-glow: rgba(13, 148, 136, 0.08);
+  --sn-accent-2-glow: rgba(2, 132, 199, 0.07);
+}
+
+/* 琥珀：副端橙色（暖色一体）；注意琥珀与「待确认/警示」语义色同族，
+   告警徽章仍用 amber-400 原色、不随 accent 翻转（见兜底层取舍注释） */
+html[data-accent='amber'] {
+  --sn-accent: #fbbf24; /* amber-400 */
+  --sn-accent-hover: #fcd34d; /* amber-300 */
+  --sn-accent-fg: #06121f;
+  --sn-accent-text: #fcd34d; /* amber-300 */
+  --sn-accent-subtle: rgba(251, 191, 36, 0.12);
+  --sn-accent-border: rgba(251, 191, 36, 0.28);
+  --sn-accent-ring: rgba(245, 158, 11, 0.3); /* amber-500@30% */
+  --sn-accent-2: #f97316; /* orange-500 */
+  --sn-accent-glow: rgba(251, 191, 36, 0.09);
+  --sn-accent-2-glow: rgba(249, 115, 22, 0.1);
+}
+html.light[data-accent='amber'] {
+  --sn-accent: #d97706; /* amber-600 */
+  --sn-accent-hover: #b45309; /* amber-700 */
+  --sn-accent-fg: #ffffff;
+  --sn-accent-text: #b45309; /* amber-700 */
+  --sn-accent-subtle: rgba(217, 119, 6, 0.1);
+  --sn-accent-border: rgba(217, 119, 6, 0.35);
+  --sn-accent-ring: rgba(217, 119, 6, 0.25);
+  --sn-accent-2: #ea580c; /* orange-600 */
+  --sn-accent-glow: rgba(217, 119, 6, 0.08);
+  --sn-accent-2-glow: rgba(234, 88, 12, 0.07);
 }
 
 /* 硬编码深色表面 */
@@ -595,6 +763,17 @@ html.light .text-teal-400 {
 html.light .text-violet-300 {
   color: #6d28d9;
 }
+/* cyan 为「识别中」阶段的固定语义色（accent 系统化时从 sky 拆出，
+   避免随 accent 翻转后与 indigo「AI 优化中」/amber「待确认」撞档） */
+html.light .text-cyan-300 {
+  color: #0e7490;
+}
+html.light .bg-cyan-500\/15 {
+  background: rgba(8, 145, 178, 0.12);
+}
+html.light .bg-cyan-400 {
+  background: #0891b2;
+}
 html.light .text-amber-200,
 html.light .text-amber-200\/80,
 html.light .text-amber-200\/90 {
@@ -649,10 +828,15 @@ html.light .skeleton {
   background-size: 200% 100%;
 }
 html.light .nav-glow {
-  background: linear-gradient(90deg, rgba(2, 132, 199, 0.12), rgba(79, 70, 229, 0.08));
+  /* 浅色激活渐变随 accent（与深色版同一对变量，强度略低） */
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--sn-accent) 12%, transparent),
+    color-mix(in srgb, var(--sn-accent-2) 8%, transparent)
+  );
 }
 html.light ::selection {
-  background: rgba(2, 132, 199, 0.25);
+  background: color-mix(in srgb, var(--sn-accent, #0284c7) 25%, transparent);
   color: #0f172a;
 }
 
@@ -662,10 +846,12 @@ html.light ::selection {
    （1px 发丝线，暗端 2% 白、亮端 3% 墨），给「产品外壳」一点材质感。
    overlay.html 覆盖了透明底、typist.html 不挂此类，二者均不受影响 */
 .sn-shell-bg {
+  /* 三径向端色随 accent：主晕直接用 glow 变量，下缘两晕按原强度比例
+     （66% / 50%）从 glow 派生，保持「上亮下弱」的层次不因参数化而压平 */
   background:
-    radial-gradient(1200px 640px at 70% -12%, rgba(99, 102, 241, 0.09), transparent 58%),
-    radial-gradient(820px 520px at -8% 30%, rgba(56, 189, 248, 0.06), transparent 55%),
-    radial-gradient(1400px 800px at 50% 118%, rgba(56, 189, 248, 0.045), transparent 62%),
+    radial-gradient(1200px 640px at 70% -12%, var(--sn-accent-2-glow, rgba(99, 102, 241, 0.09)), transparent 58%),
+    radial-gradient(820px 520px at -8% 30%, color-mix(in srgb, var(--sn-accent-glow, rgba(56, 189, 248, 0.09)) 66%, transparent), transparent 55%),
+    radial-gradient(1400px 800px at 50% 118%, color-mix(in srgb, var(--sn-accent-glow, rgba(56, 189, 248, 0.09)) 50%, transparent), transparent 62%),
     linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
   background-size:
@@ -674,9 +860,9 @@ html.light ::selection {
 }
 html.light .sn-shell-bg {
   background:
-    radial-gradient(1200px 640px at 70% -12%, rgba(99, 102, 241, 0.07), transparent 58%),
-    radial-gradient(820px 520px at -8% 30%, rgba(14, 165, 233, 0.06), transparent 55%),
-    radial-gradient(1400px 800px at 50% 118%, rgba(14, 165, 233, 0.05), transparent 62%),
+    radial-gradient(1200px 640px at 70% -12%, var(--sn-accent-2-glow, rgba(99, 102, 241, 0.07)), transparent 58%),
+    radial-gradient(820px 520px at -8% 30%, color-mix(in srgb, var(--sn-accent-glow, rgba(14, 165, 233, 0.08)) 75%, transparent), transparent 55%),
+    radial-gradient(1400px 800px at 50% 118%, color-mix(in srgb, var(--sn-accent-glow, rgba(14, 165, 233, 0.08)) 62%, transparent), transparent 62%),
     linear-gradient(rgba(15, 23, 42, 0.03) 1px, transparent 1px),
     linear-gradient(90deg, rgba(15, 23, 42, 0.03) 1px, transparent 1px);
   background-size:
@@ -743,16 +929,17 @@ html.light .sn-shell-bg {
   color: var(--sn-text-3);
 }
 
-/* Dashboard hero 卡纹理：细网格 + 斜向双强调色渐变，身份感比纯色卡强 */
+/* Dashboard hero 卡纹理：细网格 + 斜向双强调色渐变，身份感比纯色卡强。
+   渐变两端参数化：主端 --sn-accent-subtle（激活 tint 档），副端 accent-2@6% */
 .sn-hero {
   background:
     linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    radial-gradient(640px 260px at 100% 0%, rgba(56, 189, 248, 0.09), transparent 62%),
+    radial-gradient(640px 260px at 100% 0%, color-mix(in srgb, var(--sn-accent, #38bdf8) 9%, transparent), transparent 62%),
     linear-gradient(
       135deg,
-      rgba(56, 189, 248, 0.07),
-      rgba(99, 102, 241, 0.05) 45%,
+      var(--sn-accent-subtle, rgba(56, 189, 248, 0.07)),
+      color-mix(in srgb, var(--sn-accent-2, #6366f1) 6%, transparent) 45%,
       transparent 78%
     );
   background-size:
@@ -762,11 +949,11 @@ html.light .sn-hero {
   background:
     linear-gradient(rgba(15, 23, 42, 0.025) 1px, transparent 1px),
     linear-gradient(90deg, rgba(15, 23, 42, 0.025) 1px, transparent 1px),
-    radial-gradient(640px 260px at 100% 0%, rgba(14, 165, 233, 0.08), transparent 62%),
+    radial-gradient(640px 260px at 100% 0%, color-mix(in srgb, var(--sn-accent, #0284c7) 8%, transparent), transparent 62%),
     linear-gradient(
       135deg,
-      rgba(14, 165, 233, 0.05),
-      rgba(79, 70, 229, 0.04) 45%,
+      color-mix(in srgb, var(--sn-accent, #0284c7) 5%, transparent),
+      color-mix(in srgb, var(--sn-accent-2, #4f46e5) 4%, transparent) 45%,
       transparent 78%
     );
   background-size:
@@ -848,7 +1035,7 @@ html.light .sn-hero {
 
 /* 卡片边缘：1px 勾边 + 接触/近景/环境三层短焦阴影 + 阶段色微光 */
 .overlay-edge {
-  --stage-glow: rgba(56, 189, 248, 0.18);
+  --stage-glow: color-mix(in srgb, var(--sn-accent, #38bdf8) 18%, transparent);
   box-shadow:
     0 0 0 1px rgba(2, 6, 23, 0.22),
     0 1px 2px rgba(2, 6, 23, 0.4),
@@ -883,4 +1070,172 @@ html.light .sn-hero {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ============ 旧 sky 工具类 → accent 兜底映射层 ============
+   背景：accent 系统化之前 sky 就是强调色，存量代码（Overlay/tabs/Typist 等
+   本轮不可改的文件）里大量 sky-300/400/500 类承担的就是「强调」角色。
+   data-accent ≠ sky 时在此把它们重定向到上方 accent 角色变量，未迁完的
+   页面整体换肤；data-accent='sky' 或未写（overlay/typist 旧窗口）时
+   :not() 不命中，视觉与旧版逐像素一致。
+
+   映射取舍（2026-11 grep src/ 全量统计）：
+   ① 只映射承担强调角色的 sky 档：文本 300/200/400、实心点底 400、
+     tint 底 400/10~20 与 500/10~25（含任意透明度变体）、边框 400 发丝档
+     （15~30%）→ accent-border、强档（≥40% 与 500 系）→ 实心 accent、
+     焦点边框/焦点环、渐变端点 from/to/via sky-500/400、阴影染色。
+   ② 语义色一律不动：emerald(成功)/red(错误)/amber(警示·待确认)/
+     teal(划词)/violet(记忆)/indigo(AI 优化中) 保持固有色。
+   ③ 例外——「识别中」原用 sky，若随 accent 翻转会在 indigo/amber 主题下
+     与「AI 优化中」「待确认」撞档：已在源头（App/Dashboard 的 STAGE 表）
+     改为固定 cyan，cyan 类不在本层映射。
+   ④ 任意透明度变体（/[0.05]、/[0.07]、/[0.12]…）与标准档一并映射到
+     subtle，避免同一表面「一半映射一半残留 sky」的花斑。
+   ⑤ 本层必须位于全部 html.light sky 覆盖之后（文件末尾）：两者同为
+     非分层规则且特异性相同（0,2,1 / hover 档 0,3,1），靠源顺序取胜。
+   ⑥ Tailwind 工具类在 @layer utilities 内、本层非分层，天然压过——
+     因此无需 !important（!xxx 重要变体除外，本层不碰）。 */
+
+/* —— 文本：300/200 档 → 强调文本色 —— */
+html:not([data-accent='sky']) .text-sky-300,
+html:not([data-accent='sky']) .text-sky-200,
+html:not([data-accent='sky']) .hover\:text-sky-300:hover,
+html:not([data-accent='sky']) .hover\:text-sky-200:hover {
+  color: var(--sn-accent-text);
+}
+/* 300 档的透明度变体：按原透明度对 accent-text 再混 */
+html:not([data-accent='sky']) .text-sky-300\/90 {
+  color: color-mix(in srgb, var(--sn-accent-text) 90%, transparent);
+}
+html:not([data-accent='sky']) .text-sky-300\/80 {
+  color: color-mix(in srgb, var(--sn-accent-text) 80%, transparent);
+}
+html:not([data-accent='sky']) .text-sky-300\/70 {
+  color: color-mix(in srgb, var(--sn-accent-text) 70%, transparent);
+}
+html:not([data-accent='sky']) .text-sky-200\/70 {
+  color: color-mix(in srgb, var(--sn-accent-text) 70%, transparent);
+}
+/* —— 文本：400 档 → 实心底色（链接/数字强调） —— */
+html:not([data-accent='sky']) .text-sky-400 {
+  color: var(--sn-accent);
+}
+html:not([data-accent='sky']) .text-sky-400\/80 {
+  color: color-mix(in srgb, var(--sn-accent) 80%, transparent);
+}
+html:not([data-accent='sky']) .text-sky-400\/60 {
+  color: color-mix(in srgb, var(--sn-accent) 60%, transparent);
+}
+
+/* —— 实心点底：状态圆点/单选圆点/进度条 —— */
+html:not([data-accent='sky']) .bg-sky-400 {
+  background-color: var(--sn-accent);
+}
+
+/* —— tint 底：芯片/选中卡洗色（含任意透明度变体）→ subtle —— */
+html:not([data-accent='sky']) .bg-sky-400\/10,
+html:not([data-accent='sky']) .bg-sky-400\/20,
+html:not([data-accent='sky']) .bg-sky-400\/\[0\.07\],
+html:not([data-accent='sky']) .bg-sky-500\/10,
+html:not([data-accent='sky']) .bg-sky-500\/15,
+html:not([data-accent='sky']) .bg-sky-500\/20,
+html:not([data-accent='sky']) .bg-sky-500\/25,
+html:not([data-accent='sky']) .bg-sky-500\/\[0\.05\],
+html:not([data-accent='sky']) .hover\:bg-sky-500\/10:hover,
+html:not([data-accent='sky']) .hover\:bg-sky-400\/15:hover,
+html:not([data-accent='sky']) .hover\:bg-sky-400\/20:hover {
+  background-color: var(--sn-accent-subtle);
+}
+
+/* —— 边框：发丝档（15~30%）→ accent-border —— */
+html:not([data-accent='sky']) .border-sky-400\/15,
+html:not([data-accent='sky']) .border-sky-400\/20,
+html:not([data-accent='sky']) .border-sky-400\/25,
+html:not([data-accent='sky']) .border-sky-400\/30 {
+  border-color: var(--sn-accent-border);
+}
+/* —— 边框：强档（40%+ 与 500 系选中态）→ 实心 accent —— */
+html:not([data-accent='sky']) .border-sky-400,
+html:not([data-accent='sky']) .border-sky-400\/40,
+html:not([data-accent='sky']) .border-sky-400\/50,
+html:not([data-accent='sky']) .border-sky-400\/90,
+html:not([data-accent='sky']) .border-sky-500\/25,
+html:not([data-accent='sky']) .border-sky-500\/40,
+html:not([data-accent='sky']) .border-sky-500\/60,
+html:not([data-accent='sky']) .border-sky-500\/70,
+html:not([data-accent='sky']) .hover\:border-sky-400\/30:hover,
+html:not([data-accent='sky']) .hover\:border-sky-400\/40:hover,
+html:not([data-accent='sky']) .hover\:border-sky-400\/60:hover {
+  border-color: var(--sn-accent);
+}
+/* 加载 spinner 的顶边（只染顶边，环身保持低透明度档） */
+html:not([data-accent='sky']) .border-t-sky-400 {
+  border-top-color: var(--sn-accent);
+}
+
+/* —— 焦点态：输入框聚焦边框 → 实心；聚焦光环 → ring 角色 —— */
+html:not([data-accent='sky']) .focus\:border-sky-500\/50:focus,
+html:not([data-accent='sky']) .focus\:border-sky-500\/60:focus,
+html:not([data-accent='sky']) .focus\:border-sky-400\/60:focus {
+  border-color: var(--sn-accent);
+}
+html:not([data-accent='sky']) .focus\:ring-sky-500\/10:focus,
+html:not([data-accent='sky']) .focus\:ring-sky-500\/15:focus {
+  --tw-ring-color: var(--sn-accent-ring);
+}
+/* 静态 ring（Typist 编辑徽标 / MemGraph 画布焦点环） */
+html:not([data-accent='sky']) .ring-sky-400\/40,
+html:not([data-accent='sky']) .ring-sky-400\/50,
+html:not([data-accent='sky']) .ring-sky-400\/60,
+html:not([data-accent='sky']) .ring-sky-500\/40,
+html:not([data-accent='sky']) .focus-visible\:ring-sky-400\/40:focus-visible {
+  --tw-ring-color: var(--sn-accent-ring);
+}
+
+/* —— 渐变端点：from/to/via 的 sky 侧换 accent（indigo 副端保持） —— */
+html:not([data-accent='sky']) .from-sky-500,
+html:not([data-accent='sky']) .from-sky-400 {
+  --tw-gradient-from: var(--sn-accent);
+}
+html:not([data-accent='sky']) .to-sky-400,
+html:not([data-accent='sky']) .to-sky-500 {
+  --tw-gradient-to: var(--sn-accent);
+}
+html:not([data-accent='sky']) .from-sky-500\/40 {
+  --tw-gradient-from: color-mix(in srgb, var(--sn-accent) 40%, transparent);
+}
+html:not([data-accent='sky']) .from-sky-500\/70 {
+  --tw-gradient-from: color-mix(in srgb, var(--sn-accent) 70%, transparent);
+}
+html:not([data-accent='sky']) .from-sky-500\/80 {
+  --tw-gradient-from: color-mix(in srgb, var(--sn-accent) 80%, transparent);
+}
+html:not([data-accent='sky']) .from-sky-500\/90 {
+  --tw-gradient-from: color-mix(in srgb, var(--sn-accent) 90%, transparent);
+}
+html:not([data-accent='sky']) .to-sky-500\/40 {
+  --tw-gradient-to: color-mix(in srgb, var(--sn-accent) 40%, transparent);
+}
+/* 任意透明度的 from/to 变体（选中卡 12%/16% 洗色档）→ subtle */
+html:not([data-accent='sky']) .from-sky-500\/\[0\.12\],
+html:not([data-accent='sky']) .from-sky-500\/\[0\.16\] {
+  --tw-gradient-from: var(--sn-accent-subtle);
+}
+html:not([data-accent='sky']) .to-sky-500\/\[0\.12\] {
+  --tw-gradient-to: var(--sn-accent-subtle);
+}
+html:not([data-accent='sky']) .via-sky-400\/30 {
+  --tw-gradient-via: color-mix(in srgb, var(--sn-accent) 30%, transparent);
+}
+html:not([data-accent='sky']) .via-sky-500\/\[0\.05\] {
+  --tw-gradient-via: color-mix(in srgb, var(--sn-accent) 5%, transparent);
+}
+
+/* —— 阴影染色（渐变徽章/按钮的 accent 微光）—— */
+html:not([data-accent='sky']) .shadow-sky-500\/20,
+html:not([data-accent='sky']) .shadow-sky-500\/25,
+html:not([data-accent='sky']) .shadow-sky-500\/30,
+html:not([data-accent='sky']) .shadow-sky-500\/35 {
+  --tw-shadow-color: color-mix(in srgb, var(--sn-accent) 55%, transparent);
+  --tw-shadow: var(--tw-shadow-colored);
 }

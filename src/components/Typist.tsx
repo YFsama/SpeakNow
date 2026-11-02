@@ -74,7 +74,7 @@ export default function Typist() {
     ];
     getConfig().then((cfg) => {
       if (!alive) return;
-      applyAppearance(cfg.general.theme, cfg.general.fontScale);
+      applyAppearance(cfg.general.theme, cfg.general.fontScale, cfg.general.accent);
       setPref(cfg.typist);
       setOnTop(!!cfg.typist.alwaysOnTop);
     });

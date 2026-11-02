@@ -13,24 +13,7 @@ import {
   translateSelection,
 } from '../api';
 import { Button, Segmented, Toggle } from './Controls';
-
-/* Hero 徽章里的白色麦克风：与侧栏 Logo 同形（App.tsx 的 MicLogo 未导出，
-   刻意就地复制一份，避免 Dashboard ↔ App 相互 import 形成环） */
-function MicGlyph({ size = 22 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <rect x="9" y="3" width="6" height="11" rx="3" fill="white" />
-      <path
-        d="M5 11a7 7 0 0 0 14 0"
-        stroke="white"
-        strokeWidth="2"
-        strokeLinecap="round"
-        fill="none"
-      />
-      <path d="M12 18v3" stroke="white" strokeWidth="2" strokeLinecap="round" />
-    </svg>
-  );
-}
+import { LogoBadge } from './Logo';
 
 /* 记忆速览卡的大脑图标：与侧栏「记忆」导航同形（violet→sky 双色渐变着色） */
 function BrainGlyph({ size = 20 }: { size?: number }) {
@@ -74,8 +57,9 @@ const STAGE_INFO: Record<
   transcribing: {
     label: '语音识别中',
     hint: '正在将声音转成文字…',
-    dot: 'bg-sky-400 animate-pulse',
-    text: 'text-sky-300',
+    /* 固定 cyan 语义色（与 App 侧 STAGE_LABEL 同源），不随 accent 翻转 */
+    dot: 'bg-cyan-400 animate-pulse',
+    text: 'text-cyan-300',
   },
   optimizing: {
     label: 'AI 优化中',
@@ -129,6 +113,16 @@ function relTime(ts: number): string {
 
 /** 星期缩写（getDay 下标） */
 const WEEKDAY_ABBR = ['日', '一', '二', '三', '四', '五', '六'];
+
+/** 强调色预设：id 与后端 config.general.accent 契约一致（缺省 sky）；
+    swatch 取各预设深色档 400 档实色，深浅两种主题下作为色板填充都够醒目 */
+const ACCENTS: { id: string; label: string; swatch: string }[] = [
+  { id: 'sky', label: '天青', swatch: '#38bdf8' },
+  { id: 'indigo', label: '靛蓝', swatch: '#818cf8' },
+  { id: 'violet', label: '紫罗兰', swatch: '#a78bfa' },
+  { id: 'teal', label: '青碧', swatch: '#2dd4bf' },
+  { id: 'amber', label: '琥珀', swatch: '#fbbf24' },
+];
 
 /** 最近位次分位值（nearest-rank，ceil(q·N) 取秩）：空数组返回 null */
 function percentile(sorted: number[], q: number): number | null {
@@ -410,18 +404,16 @@ export default function Dashboard({
           状态点挪到徽章右下角——一眼同时读到「产品是谁」和「现在什么状态」 */}
       <section className="sn-hero relative overflow-hidden rounded-[22px] border border-[var(--sn-border)] p-5">
         <span
-          className="aurora pointer-events-none absolute -right-14 -top-20 h-52 w-52 rounded-full bg-sky-500/15 blur-3xl"
+          className="aurora pointer-events-none absolute -right-14 -top-20 h-52 w-52 rounded-full bg-accent/15 blur-3xl"
           aria-hidden
         />
         <span
-          className="aurora-2 pointer-events-none absolute -bottom-24 -left-10 h-52 w-52 rounded-full bg-indigo-500/10 blur-3xl"
+          className="aurora-2 pointer-events-none absolute -bottom-24 -left-10 h-52 w-52 rounded-full bg-accent-2/10 blur-3xl"
           aria-hidden
         />
         <div className="relative flex flex-wrap items-center gap-4">
           <span className="relative shrink-0">
-            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shadow-sky-500/30">
-              <MicGlyph />
-            </span>
+            <LogoBadge size={48} />
             {stage === 'recording' && (
               <span
                 className="absolute inset-0 animate-ping rounded-2xl border border-red-500/40"
@@ -531,11 +523,11 @@ export default function Dashboard({
           {ocrChips.length > 0 && (
             <span className="flex items-center gap-1.5">
               {ocrChips.map((c, i) => (
-                <span key={i} className="kbd !border-sky-400/25 !text-sky-300">
+                <span key={i} className="kbd !border-accent/25 !text-accent-text">
                   {c}
                 </span>
               ))}
-              <span className="text-[10.5px] text-sky-300/80">截图取词</span>
+              <span className="text-[10.5px] text-accent-text/80">截图取词</span>
             </span>
           )}
           <span className="ml-auto text-[11px] text-slate-600">修改 ›</span>
@@ -588,7 +580,7 @@ export default function Dashboard({
               className={`shrink-0 rounded-full px-2 py-0.5 text-[10.5px] ${
                 obDone === onboard.length
                   ? 'bg-emerald-500/15 text-emerald-300'
-                  : 'bg-sky-500/15 text-sky-300'
+                  : 'bg-accent/15 text-accent-text'
               }`}
             >
               {obDone} / {onboard.length}
@@ -606,7 +598,7 @@ export default function Dashboard({
               >
                 <span
                   className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-[9px] font-bold leading-none ${
-                    o.ok ? 'bg-emerald-500/15 text-emerald-400' : 'border border-sky-400/40'
+                    o.ok ? 'bg-emerald-500/15 text-emerald-400' : 'border border-accent/40'
                   }`}
                 >
                   {o.ok ? '✓' : ''}
@@ -624,7 +616,7 @@ export default function Dashboard({
                   </span>
                 </span>
                 {!o.ok && (
-                  <span className="shrink-0 text-[11px] text-sky-400/80">{o.hint} ›</span>
+                  <span className="shrink-0 text-[11px] text-accent/80">{o.hint} ›</span>
                 )}
               </button>
             ))}
@@ -772,8 +764,8 @@ export default function Dashboard({
                           d.count === 0
                             ? 'h-[2px] bg-slate-700/60' // 无数据日 2px 底座灰柱
                             : d.isToday
-                              ? 'bg-gradient-to-t from-sky-500 to-indigo-400'
-                              : 'bg-sky-400/35'
+                              ? 'bg-gradient-to-t from-accent to-accent-2'
+                              : 'bg-accent/35'
                         }`}
                         style={
                           d.count > 0
@@ -789,7 +781,7 @@ export default function Dashboard({
                     </div>
                     <span
                       className={`text-[10px] ${
-                        d.isToday ? 'font-medium text-sky-300' : 'text-slate-600'
+                        d.isToday ? 'font-medium text-accent-text' : 'text-slate-600'
                       }`}
                     >
                       {WEEKDAY_ABBR[d.wd]}
@@ -911,13 +903,13 @@ export default function Dashboard({
                     onClick={() => set('general', { theme: o.v })}
                     className={`card-lift relative rounded-xl border px-3 py-2.5 text-left active:scale-[0.98] ${
                       active
-                        ? 'border-sky-500/70 bg-gradient-to-br from-sky-500/[0.12] to-indigo-500/[0.08]'
+                        ? 'border-accent bg-gradient-to-br from-accent/[0.12] to-accent-2/[0.08]'
                         : 'border-white/[0.08] bg-black/20 hover:border-white/20'
                     }`}
                   >
                     <span
                       className={`block text-[13px] font-medium ${
-                        active ? 'text-sky-300' : 'text-slate-200'
+                        active ? 'text-accent-text' : 'text-slate-200'
                       }`}
                     >
                       {o.label}
@@ -925,6 +917,45 @@ export default function Dashboard({
                     <span className="mt-0.5 block text-[11px] text-slate-500">
                       {o.desc}
                     </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[13px] font-medium text-slate-300/90">强调色</span>
+              <span className="text-[11px] text-slate-500">
+                按钮/焦点/高亮与界面氛围随强调色联动
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              {ACCENTS.map((a) => {
+                /* 未保存旧配置无 accent 字段：缺省按 sky 处理 */
+                const active = (cfg.general.accent ?? 'sky') === a.id;
+                return (
+                  <button
+                    key={a.id}
+                    type="button"
+                    onClick={() => set('general', { accent: a.id })}
+                    title={a.label}
+                    aria-label={a.label}
+                    aria-pressed={active}
+                    className="flex h-[22px] w-[22px] items-center justify-center rounded-full transition hover:scale-110 active:scale-95"
+                    /* 选中环用色板本色而非当前 accent（当前 sky 时选琥珀不该套天青环）；
+                       双层 box-shadow 内层用卡面底色断开，等价 ring-offset */
+                    style={
+                      active
+                        ? {
+                            background: a.swatch,
+                            boxShadow: `0 0 0 2px var(--sn-surface), 0 0 0 4px ${a.swatch}`,
+                          }
+                        : { background: a.swatch }
+                    }
+                  >
+                    {active && (
+                      <span className="h-[6px] w-[6px] rounded-full bg-white" aria-hidden />
+                    )}
                   </button>
                 );
               })}
@@ -953,7 +984,7 @@ export default function Dashboard({
                 type="button"
                 onClick={() => set('general', { fontScale: 1 })}
                 title="点击重置为 100%"
-                className="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 font-mono text-[11px] tabular-nums text-sky-300 transition hover:border-sky-400/40 hover:bg-sky-400/20 active:scale-95"
+                className="rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 font-mono text-[11px] tabular-nums text-accent-text transition hover:border-accent/40 hover:bg-accent/20 active:scale-95"
               >
                 {Math.round((cfg.general.fontScale || 1) * 100)}%
               </button>
@@ -984,7 +1015,7 @@ export default function Dashboard({
             <button
               type="button"
               onClick={() => navigate('history')}
-              className="text-xs text-sky-400 transition hover:text-sky-300"
+              className="text-xs text-accent transition hover:text-accent-text"
             >
               查看全部 ›
             </button>
@@ -1009,7 +1040,7 @@ export default function Dashboard({
                       .catch((e) => toast(`复制失败：${e}`));
                   }}
                   title="复制该条文本"
-                  className="shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] text-sky-400 opacity-0 transition hover:bg-sky-500/10 hover:text-sky-300 focus:opacity-100 group-hover:opacity-100"
+                  className="shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] text-accent opacity-0 transition hover:bg-accent/10 hover:text-accent-text focus:opacity-100 group-hover:opacity-100"
                 >
                   复制
                 </button>

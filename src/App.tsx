@@ -34,6 +34,7 @@ import type {
 } from './types';
 import { DEFAULT_DEVICE_KEY } from './types';
 import Dashboard from './components/Dashboard';
+import { LogoBadge } from './components/Logo';
 import './styles.css';
 
 /* 各设置分页按需加载（懒加载分包）；默认页 dash=总览为 Dashboard，
@@ -265,28 +266,14 @@ const STAGE_HINT: Record<string, string> = {
 const STAGE_LABEL: Record<Stage, { text: string; cls: string; dot: string }> = {
   idle: { text: '就绪', cls: 'bg-emerald-500/15 text-emerald-300', dot: 'bg-emerald-400' },
   recording: { text: '● 录音中', cls: 'bg-red-500/15 text-red-300', dot: 'bg-red-500 animate-pulse' },
-  transcribing: { text: '识别中', cls: 'bg-sky-500/15 text-sky-300', dot: 'bg-sky-400 animate-pulse' },
+  /* 识别中用固定 cyan 而非 accent：accent 若与 indigo/amber 撞档，
+     会和「AI 优化中」「待确认」难以区分（cyan 不在 sky→accent 兜底映射内） */
+  transcribing: { text: '识别中', cls: 'bg-cyan-500/15 text-cyan-300', dot: 'bg-cyan-400 animate-pulse' },
   optimizing: { text: 'AI 优化中', cls: 'bg-indigo-500/15 text-indigo-300', dot: 'bg-indigo-400 animate-pulse' },
   review: { text: '待确认', cls: 'bg-amber-500/15 text-amber-300', dot: 'bg-amber-400 animate-pulse' },
   done: { text: '完成', cls: 'bg-emerald-500/15 text-emerald-300', dot: 'bg-emerald-400' },
   error: { text: '出错', cls: 'bg-red-500/15 text-red-300', dot: 'bg-red-500' },
 };
-
-function MicLogo({ size = 17 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <rect x="9" y="3" width="6" height="11" rx="3" fill="white" />
-      <path
-        d="M5 11a7 7 0 0 0 14 0"
-        stroke="white"
-        strokeWidth="2"
-        strokeLinecap="round"
-        fill="none"
-      />
-      <path d="M12 18v3" stroke="white" strokeWidth="2" strokeLinecap="round" />
-    </svg>
-  );
-}
 
 /* ============ Toast（类型化 + 队列） ============ */
 
@@ -300,7 +287,7 @@ interface ToastItem {
 const TOAST_META: Record<ToastKind, { glyph: string; cls: string }> = {
   ok: { glyph: '✓', cls: 'text-emerald-400' },
   error: { glyph: '⚠', cls: 'text-red-400' },
-  info: { glyph: '✦', cls: 'text-sky-400' },
+  info: { glyph: '✦', cls: 'text-accent' },
 };
 
 /* kind 缺省时按文案正则推断（向后兼容旧 toast('...') 调用） */
@@ -496,10 +483,11 @@ export default function App() {
     };
   }, []);
 
-  // 主题与缩放实时应用
+  // 主题/缩放/强调色实时应用（accent 写 <html data-accent>，CSS 预设块随之翻转）
   useEffect(() => {
-    if (cfg) applyAppearance(cfg.general.theme, cfg.general.fontScale);
-  }, [cfg?.general.theme, cfg?.general.fontScale]);
+    if (cfg)
+      applyAppearance(cfg.general.theme, cfg.general.fontScale, cfg.general.accent);
+  }, [cfg?.general.theme, cfg?.general.fontScale, cfg?.general.accent]);
 
   // 序列化较重，用 useMemo 只在 cfg 变化时重算一次（dirty 判断与下方保存栏共用）
   const cfgJson = useMemo(() => (cfg ? JSON.stringify(cfg) : ''), [cfg]);
@@ -720,12 +708,11 @@ export default function App() {
       <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-[var(--sn-border)] bg-[var(--sn-sidebar)] backdrop-blur-xl">
         <div className="relative flex items-center gap-2.5 px-5 pb-7 pt-7">
           <span
-            className="aurora pointer-events-none absolute -left-6 -top-8 h-24 w-24 rounded-full bg-sky-500/20 blur-2xl"
+            className="aurora pointer-events-none absolute -left-6 -top-8 h-24 w-24 rounded-full bg-accent/20 blur-2xl"
             aria-hidden
           />
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shadow-sky-500/30">
-            <MicLogo />
-          </div>
+          {/* 品牌徽章：LogoBadge 渐变底走 --sn-accent/--sn-accent-2，随强调色联动 */}
+          <LogoBadge size={36} />
           <div>
             <div className="text-[14px] font-semibold text-slate-50">SpeakNow</div>
             <div className="text-[10px] text-slate-500">语音输入 · 记忆助手</div>
@@ -741,7 +728,7 @@ export default function App() {
               onChange={(e) => setNavQuery(e.target.value)}
               placeholder="搜索设置页…"
               spellCheck={false}
-              className="w-full rounded-lg border border-[var(--sn-border)] bg-[var(--sn-surface-2)] px-2.5 py-1.5 text-[12px] text-slate-200 placeholder:text-slate-600 outline-none transition hover:border-[var(--sn-border-strong)] focus:border-sky-500/50 focus:ring-[3px] focus:ring-sky-500/10"
+              className="w-full rounded-lg border border-[var(--sn-border)] bg-[var(--sn-surface-2)] px-2.5 py-1.5 text-[12px] text-slate-200 placeholder:text-slate-600 outline-none transition hover:border-[var(--sn-border-strong)] focus:border-accent focus:ring-[3px] focus:ring-[color:var(--sn-accent-ring)]"
             />
           </div>
           {navItems.map((n, i) => {
@@ -761,7 +748,7 @@ export default function App() {
                   onClick={() => setTab(n.id)}
                   className={`group relative flex w-full items-center gap-2.5 rounded-xl px-3 py-[7px] text-[13px] transition-all duration-200 active:scale-[0.98] ${
                     active
-                      ? 'nav-glow font-medium text-sky-300'
+                      ? 'nav-glow font-medium text-accent-text'
                       : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
                   }`}
                 >
@@ -769,7 +756,7 @@ export default function App() {
                   <span
                     className={`flex w-5 shrink-0 items-center justify-center transition-colors duration-200 ${
                       active
-                        ? 'text-sky-300'
+                        ? 'text-accent-text'
                         : 'text-slate-500 group-hover:text-slate-300'
                     }`}
                   >
@@ -791,7 +778,7 @@ export default function App() {
                     updateInfo &&
                     updateInfo.latest !== cfg.general.skipVersion && (
                       <span
-                        className="ml-auto h-1.5 w-1.5 rounded-full bg-sky-400"
+                        className="ml-auto h-1.5 w-1.5 rounded-full bg-accent"
                         title={`有新版本 v${updateInfo.latest}`}
                         aria-label={`有新版本 v${updateInfo.latest}`}
                       />
@@ -867,7 +854,7 @@ export default function App() {
             className="anim-rise mx-auto flex max-w-2xl items-center gap-3.5 px-8 pb-3.5 pt-7"
           >
             {/* 页面图标：复用侧栏 16px 线性图标，经任意子选择器放大到 20px */}
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-[var(--sn-border)] bg-gradient-to-br from-sky-500/[0.16] via-indigo-500/[0.1] to-transparent text-sky-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] [&>svg]:h-5 [&>svg]:w-5">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-[var(--sn-border)] bg-gradient-to-br from-accent/[0.16] via-accent-2/[0.1] to-transparent text-accent-text shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] [&>svg]:h-5 [&>svg]:w-5">
               {ICONS[tab]}
             </span>
             <div className="min-w-0">
@@ -924,10 +911,10 @@ export default function App() {
           </div>
         ) : (
           <div className="anim-rise fixed inset-x-0 bottom-5 z-30 flex justify-center">
-            <div className="flex items-center gap-3 rounded-full border border-sky-500/20 bg-[#17171f]/95 py-2 pl-5 pr-5 shadow-2xl shadow-sky-950/50 backdrop-blur">
+            <div className="flex items-center gap-3 rounded-full border border-accent/20 bg-[#17171f]/95 py-2 pl-5 pr-5 shadow-2xl shadow-sky-950/50 backdrop-blur">
               <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-60" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-400" />
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-60" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-accent" />
               </span>
               <span className="text-[13px] text-slate-300">
                 正在自动保存…

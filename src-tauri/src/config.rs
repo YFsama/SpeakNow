@@ -518,6 +518,14 @@ pub struct GeneralConfig {
     /// 用户选择「跳过此版本」的版本号：该版本不再提示更新（清空即恢复提示）
     #[serde(default)]
     pub skip_version: String,
+    /// 强调色主题 id（sky/indigo/violet/teal/amber）：前端 data-accent 属性驱动
+    /// 全套 --sn-accent 角色变量，深浅底色各取对应明度档
+    #[serde(default = "default_accent")]
+    pub accent: String,
+}
+
+fn default_accent() -> String {
+    "sky".into()
 }
 
 fn default_linger_mult() -> f32 {
@@ -595,6 +603,7 @@ impl Default for GeneralConfig {
             linger_mult: default_linger_mult(),
             auto_check_update: true,
             skip_version: String::new(),
+            accent: default_accent(),
         }
     }
 }

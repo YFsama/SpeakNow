@@ -366,9 +366,12 @@ function applyThemeClass() {
 /** 应用主题与缩放到当前窗口。theme === 'auto' 时跟随系统配色，
  *  系统切换实时响应；手动 dark / light 时忽略系统变化。
  *  实际解析出的外观写入 localStorage，供下次启动在配置加载前预应用
- *  （消除浅色用户首屏骨架「先深后浅」闪变）。 */
-export function applyAppearance(theme: string, fontScale: number) {
+ *  （消除浅色用户首屏骨架「先深后浅」闪变）。
+ *  accent（sky/indigo/violet/teal/amber）写入 <html data-accent>，CSS
+ *  角色变量随之翻转——旧调用方不传时保持默认 sky */
+export function applyAppearance(theme: string, fontScale: number, accent?: string) {
   curTheme = theme;
+  document.documentElement.dataset.accent = accent && accent !== 'sky' ? accent : 'sky';
   if (!mediaListenerInstalled) {
     mediaListenerInstalled = true;
     window

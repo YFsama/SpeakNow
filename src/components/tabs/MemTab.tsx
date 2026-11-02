@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Button, ConfirmButton, Field, Section, Spinner, TextArea, TextInput, Toggle } from '../Controls';
+import { EmptyArt } from '../EmptyArt';
 import { MemGraph } from './MemGraph';
 import { MemInsights } from './MemInsights';
 import {
@@ -1052,7 +1053,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
           <div className="rounded-lg border border-dashed border-white/10 px-4 py-10 text-center">
             {data.total === 0 ? (
               <>
-                <div className="text-[28px] leading-none opacity-60">🧠</div>
+                <EmptyArt name="memory" />
                 <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
                   记忆库还是空的
                 </div>
@@ -1067,7 +1068,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               </>
             ) : searching ? (
               <>
-                <div className="text-[28px] leading-none opacity-60">🔍</div>
+                <EmptyArt name="search" />
                 <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
                   没有匹配「{query.trim()}」的记忆
                 </div>
@@ -1080,7 +1081,10 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               </>
             ) : kind !== '' ? (
               <>
-                <div className="text-[28px] leading-none opacity-60">{KIND_ICON[kind]}</div>
+                {/* 类型落空用 memory 而非 search：用户点的是类型 chip 不是
+                    搜索框，主语义是「该类记忆尚无」而非「没找到」；同屏只
+                    出一张插画，与空库复用不冲突 */}
+                <EmptyArt name="memory" />
                 <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
                   该类型暂无记忆
                 </div>
@@ -1093,7 +1097,7 @@ export function MemTab({ cfg, set, toast, navigate }: TabProps) {
               </>
             ) : (
               <>
-                <div className="text-[28px] leading-none opacity-60">⭐</div>
+                <EmptyArt name="star" />
                 <div className="mt-3 text-[13px] leading-6 text-[var(--sn-text-3)]">
                   还没有置顶的记忆
                 </div>

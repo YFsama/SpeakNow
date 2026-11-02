@@ -18,11 +18,11 @@ export function Section({
     <section className="group relative overflow-hidden rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5 shadow-sm transition-colors hover:border-[var(--sn-border-strong)]">
       {/* 顶部微光渐变线：悬停时亮起，暗示整卡可交互（纯装饰） */}
       <span
-        className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-sky-400/30 to-transparent opacity-0 transition-opacity duration-500 group-hover:opacity-100"
+        className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-accent/30 to-transparent opacity-0 transition-opacity duration-500 group-hover:opacity-100"
         aria-hidden
       />
       <div className="mb-5 flex items-start gap-3">
-        <span className="card-lift relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--sn-border)] bg-gradient-to-br from-sky-500/[0.16] via-indigo-500/[0.1] to-transparent text-[16px] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+        <span className="card-lift relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--sn-border)] bg-gradient-to-br from-accent/[0.16] via-accent-2/[0.1] to-transparent text-[16px] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
           {icon}
         </span>
         <div className="min-w-0 flex-1">
@@ -69,10 +69,11 @@ export function Field({
 
 /* ============ 输入控件 ============ */
 
-/* 输入底样式：令牌化边框（浅色自动翻转）；焦点态 = 亮边 + 3px 同色低透明光环，
-   键盘与鼠标用户都能清楚看到「现在编辑的是哪个框」 */
+/* 输入底样式：令牌化边框（浅色自动翻转）；焦点态 = accent 亮边 + 3px 同色
+   低透明光环（走 --sn-accent-ring 角色变量，随强调色联动），键盘与鼠标
+   用户都能清楚看到「现在编辑的是哪个框」 */
 const inputBase =
-  'w-full rounded-xl border border-[var(--sn-border-strong)] bg-black/30 px-3.5 py-2.5 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] hover:bg-black/[0.38] focus:border-sky-500/60 focus:bg-black/[0.42] focus:ring-[3px] focus:ring-sky-500/10';
+  'w-full rounded-xl border border-[var(--sn-border-strong)] bg-black/30 px-3.5 py-2.5 text-[13px] text-slate-100 outline-none transition placeholder:text-slate-600 hover:border-white/[0.18] hover:bg-black/[0.38] focus:border-accent focus:bg-black/[0.42] focus:ring-[3px] focus:ring-[color:var(--sn-accent-ring)]';
 
 /* 密码显隐眼睛图标（线性 stroke 风格，与整体一致） */
 function EyeIcon() {
@@ -241,9 +242,9 @@ export function Toggle({
       role="switch"
       aria-checked={checked}
       onClick={() => onChange(!checked)}
-      className={`flex w-full items-center justify-between gap-4 rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 ${
+      className={`flex w-full items-center justify-between gap-4 rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--sn-accent-ring)] ${
         checked
-          ? 'border-sky-500/25 bg-sky-500/[0.05] hover:border-sky-500/40'
+          ? 'border-accent/25 bg-accent/[0.05] hover:border-accent/40'
           : 'border-[var(--sn-border)] bg-black/20 hover:border-[var(--sn-border-strong)]'
       }`}
     >
@@ -260,7 +261,7 @@ export function Toggle({
       <span
         className={`relative h-6 w-11 shrink-0 rounded-full transition-all duration-300 ${
           checked
-            ? 'bg-gradient-to-r from-sky-500 to-indigo-500 shadow-[0_0_12px_rgba(56,189,248,0.4)]'
+            ? 'bg-gradient-to-r from-accent to-accent-2 shadow-[0_0_12px_color-mix(in_srgb,var(--sn-accent)_40%,transparent)]'
             : 'bg-slate-700/90 shadow-[inset_0_1px_3px_rgba(0,0,0,0.4)]'
         }`}
       >
@@ -303,21 +304,21 @@ export function Segmented<T extends string>({
             onClick={() => onChange(o.value)}
             className={`card-lift relative overflow-hidden rounded-2xl border px-3.5 py-2.5 text-left transition active:scale-[0.98] ${
               active
-                ? 'border-sky-500/70 bg-gradient-to-br from-sky-500/[0.12] to-indigo-500/[0.08] shadow-[0_0_18px_-6px_rgba(56,189,248,0.45)]'
+                ? 'border-accent bg-gradient-to-br from-accent/[0.12] to-accent-2/[0.08] shadow-[0_0_18px_-6px_color-mix(in_srgb,var(--sn-accent)_45%,transparent)]'
                 : 'border-white/[0.08] bg-black/20 hover:border-white/20 hover:bg-black/[0.3]'
             }`}
           >
             {active && (
               <span
-                className="absolute right-2.5 top-2.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-sky-400/20"
+                className="absolute right-2.5 top-2.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent/20"
                 aria-hidden
               >
-                <span className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.9)]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-accent shadow-[0_0_8px_color-mix(in_srgb,var(--sn-accent)_90%,transparent)]" />
               </span>
             )}
             <span
               className={`block text-[13px] font-medium ${
-                active ? 'text-sky-300' : 'text-slate-200'
+                active ? 'text-accent-text' : 'text-slate-200'
               }`}
             >
               {o.label}
@@ -418,7 +419,7 @@ export function RadioCard({
         }
       }}
       title={title}
-      className={`cursor-pointer focus-visible:ring-2 focus-visible:ring-sky-400/60 focus-visible:outline-none ${className}`}
+      className={`cursor-pointer focus-visible:ring-2 focus-visible:ring-[color:var(--sn-accent-ring)] focus-visible:outline-none ${className}`}
     >
       {children}
     </div>
@@ -444,10 +445,12 @@ export function Button({
   title?: string;
 }) {
   const base =
-    'inline-flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100';
+    'inline-flex items-center justify-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--sn-accent-ring)] disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100';
   const kinds = {
+    /* 主按钮：accent→accent-2 渐变；文字走 --sn-accent-fg（深色档亮底配深墨、
+       浅色档深底配白），保证 5 个预设下对比度都达标 */
     primary:
-      'bg-gradient-to-r from-sky-500 to-indigo-500 text-white shadow-lg shadow-sky-500/20 hover:brightness-110 hover:shadow-sky-500/35',
+      'bg-gradient-to-r from-accent to-accent-2 text-[color:var(--sn-accent-fg)] shadow-lg shadow-accent/20 hover:brightness-110 hover:shadow-accent/35',
     ghost:
       'border border-[var(--sn-border-strong)] bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35',
     subtle:
@@ -522,7 +525,7 @@ export function ConfirmButton({
       type="button"
       onClick={onClick}
       title={title}
-      className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/50 ${
+      className={`inline-flex items-center justify-center gap-1.5 rounded-full border px-4 py-2 text-[13px] font-medium transition active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--sn-accent-ring)] ${
         arming
           ? 'border-red-400/30 bg-red-500/15 text-red-300'
           : 'border-[var(--sn-border-strong)] bg-black/20 text-slate-200 hover:border-white/25 hover:bg-black/35'
@@ -536,7 +539,7 @@ export function ConfirmButton({
 export function Spinner({ size = 16 }: { size?: number }) {
   return (
     <span
-      className="inline-block animate-spin rounded-full border-2 border-sky-400/30 border-t-sky-400"
+      className="inline-block animate-spin rounded-full border-2 border-accent/30 border-t-accent"
       style={{ width: size, height: size }}
     />
   );
