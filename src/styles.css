@@ -1239,3 +1239,47 @@ html:not([data-accent='sky']) .shadow-sky-500\/35 {
   --tw-shadow-color: color-mix(in srgb, var(--sn-accent) 55%, transparent);
   --tw-shadow: var(--tw-shadow-colored);
 }
+
+/* ============ 品牌区（侧栏左上角） ============ */
+/* 徽章悬停：弹性放大 + 涟漪弧呼吸（两弧错峰，回声涟漪的动效呼应） */
+.logo-badge {
+  transition:
+    transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.25s ease;
+}
+.logo-badge:hover {
+  transform: translateY(-1px) scale(1.06);
+}
+.logo-badge .logo-arc {
+  transform-origin: 12px 16px;
+  transform-box: view-box;
+}
+.logo-badge:hover .logo-arc-1 {
+  animation: logoPulse 1.15s ease-in-out infinite;
+}
+.logo-badge:hover .logo-arc-2 {
+  animation: logoPulse 1.15s 0.22s ease-in-out infinite;
+}
+@keyframes logoPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.16);
+    opacity: 0.55;
+  }
+}
+
+/* 品牌标题：白 → 强调色的渐变字（浅色主题由浅色覆盖组提供更深的 text-1） */
+.brand-title {
+  background: linear-gradient(
+    105deg,
+    var(--sn-text-1, #f8fafc) 42%,
+    var(--sn-accent-text, #7dd3fc)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}

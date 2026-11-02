@@ -12,6 +12,7 @@ import type { ReactNode } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   applyAppearance,
+  appVersion,
   builtinModels,
   checkUpdate,
   getConfig,
@@ -335,6 +336,8 @@ export default function App() {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [localModels, setLocalModels] = useState<LocalModelStatus[]>([]);
   const [stage, setStage] = useState<Stage>('idle');
+  // 品牌区版本徽标（mock 返回 dev 版本号；真机为当前发版号）
+  const [version, setVersion] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
   // Toast 队列：同屏最多渲染 2 条，其余在数组中排队，前面的过期后依次补位
@@ -398,6 +401,7 @@ export default function App() {
       }
     });
     listDevices().then(setDevices);
+    appVersion().then(setVersion);
     getHistory().then(setHistory);
     builtinModels().then(setLocalModels);
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -706,16 +710,41 @@ export default function App() {
     <div className="sn-shell-bg flex min-h-screen">
       {/* 侧边栏 */}
       <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-[var(--sn-border)] bg-[var(--sn-sidebar)] backdrop-blur-xl">
-        <div className="relative flex items-center gap-2.5 px-5 pb-7 pt-7">
+        <div className="relative flex items-center gap-3 px-5 pb-7 pt-7">
+          {/* 双色氛围光：主/副强调色各一团（几何常量，颜色随主题），回声涟漪的「余波」 */}
           <span
-            className="aurora pointer-events-none absolute -left-6 -top-8 h-24 w-24 rounded-full bg-accent/20 blur-2xl"
+            className="aurora pointer-events-none absolute -left-7 -top-9 h-28 w-28 rounded-full blur-2xl"
+            style={{
+              background:
+                'color-mix(in srgb, var(--sn-accent, #38bdf8) 20%, transparent)',
+            }}
             aria-hidden
           />
-          {/* 品牌徽章：LogoBadge 渐变底走 --sn-accent/--sn-accent-2，随强调色联动 */}
-          <LogoBadge size={36} />
-          <div>
-            <div className="text-[14px] font-semibold text-slate-50">SpeakNow</div>
-            <div className="text-[10px] text-slate-500">语音输入 · 记忆助手</div>
+          <span
+            className="aurora-2 pointer-events-none absolute -left-2 -top-4 h-16 w-16 rounded-full blur-xl"
+            style={{
+              background:
+                'color-mix(in srgb, var(--sn-accent-2, #6366f1) 18%, transparent)',
+            }}
+            aria-hidden
+          />
+          {/* 品牌徽章：渐变随强调色联动，玻璃光泽 + 悬停涟漪呼吸见 .logo-badge */}
+          <LogoBadge size={40} />
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="brand-title text-[14.5px] font-semibold leading-tight">
+                SpeakNow
+              </span>
+              {version && (
+                <span
+                  className="rounded-full px-1.5 py-px font-mono text-[9px] leading-[14px] text-slate-500"
+                  style={{ border: '1px solid var(--sn-border, rgba(255,255,255,0.08))' }}
+                >
+                  {version}
+                </span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[10px] text-slate-500">语音输入 · 记忆助手</div>
           </div>
         </div>
 
