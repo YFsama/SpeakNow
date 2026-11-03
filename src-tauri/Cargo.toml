@@ -37,6 +37,8 @@ candle-nn = "0.11"
 candle-transformers = "0.11"
 enigo = "0.6"
 rand = "0.9"
+# 更新包 sha256 校验（GitHub Release 资产 digest 比对，镜像/网络损坏兜底）
+sha2 = "0.10"
 # 记忆库 v3 导入：dom_smoothie（Mozilla Readability 移植，抽网页正文）、
 # encoding_rs + chardetng（WHATWG 编码探测，网页字节流 → UTF-8）——全纯 Rust
 dom_smoothie = "0.19"

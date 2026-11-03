@@ -2,7 +2,10 @@
 //! （借鉴 Nowledge Mem 的「记忆层」理念：输入即记忆、检索即回忆）。
 //!
 //! 存储：app_config_dir/mem.json，与 history.rs 同模式——全局读-改-写锁 +
-//! 原子写 + 变更广播（事件名 sn-mem-changed）。检索语义与 src/dev/mock-tauri.ts
+//! 原子写 + 变更广播（事件名 sn-mem-changed）。读取带写穿透内存缓存
+//! （见 [`CACHE`]）：一次 sn-mem-changed 会让前端连发 4-6 个 invoke
+//! （mem_list / storage_stats / recall / 徽标），旧实现每个都整库读盘解析，
+//! 现在命中时零 IO 零解析。检索语义与 src/dev/mock-tauri.ts
 //! 的 mockMemSearch 逐字对齐：前端浏览器 mock 预览与真机行为完全一致。
 //!
 //! v2（召回链路，借鉴开源记忆层的成熟做法）：多因子排序（Generative Agents
@@ -17,7 +20,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
@@ -37,6 +40,36 @@ const MAX_CAPTURE_CHARS: usize = 20_000;
 /// 清空，Tauri 线程池）与蒸馏回写可能并发进入，无锁时后写者覆盖先写者
 /// （丢一条记忆）——history.rs 的 STORE_LOCK 同教训
 static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 内存缓存（写穿透 + mtime 校验）：items 快照与磁盘身份 (mtime, len)。
+/// 动机：一次 sn-mem-changed 事件触发前端 4-6 个 invoke（mem_list /
+/// storage_stats / recall / 徽标），旧实现每个都 read_to_string + 整库
+/// serde 解析——库到几百条后是毫秒级×次数的纯浪费，批量导入逐条广播的
+/// 事件风暴下更明显。
+///
+/// 失效协议：
+/// - 本进程内一切写路径都经 write_at（写穿透：落盘成功即用新 stat 刷新
+///   缓存），读命中零 IO 零解析；
+/// - 进程外改盘（examples/memimport 离线导入写同一 mem.json）没有事件可
+///   依赖，靠 stat 出的 (mtime,len) 失配兜底重读；
+/// - mem_clear 删文件后显式失效（文件没了就没有 mtime 可比对）。
+///
+/// 锁纪律：运行时所有 load/write 调用方都已持 STORE_LOCK 才进来，CACHE
+/// 的 Mutex 只是数据容器——临界区是字段比较 + Arc 引用计数（纳秒级），
+/// 且任何代码路径都不会在持有 CACHE 时反向去拿 STORE_LOCK，STORE_LOCK→
+/// CACHE 的单向嵌套不构成死锁面
+struct CachedStore {
+    /// 缓存对应的 mem.json 路径：运行时（app_config_dir）与测试（tempdir）
+    /// 路径不同，路径失配一律按 miss 处理。用单槽而非 HashMap：运行时全局
+    /// 只有一条 mem.json，多路径并存只出现在串行测试里，单槽即正确
+    path: std::path::PathBuf,
+    items: Arc<Vec<MemEntry>>,
+    mtime: SystemTime,
+    len: u64,
+}
+
+/// 见 [`CachedStore`]。Mutex 仅作数据容器，不加业务锁语义
+static CACHE: Mutex<Option<CachedStore>> = Mutex::new(None);
 
 /// 蒸馏并发闸：一次只跑一个蒸馏任务，采集时若已有蒸馏在途则本次跳过——
 /// 库中下一条新记忆入库会再触发，只丢即时性不丢功能；长文本连发时防止
@@ -117,17 +150,99 @@ pub(crate) fn path_at(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn load(app: &AppHandle) -> Vec<MemEntry> {
+    // 独立 Vec 拷贝：读-改-写调用方要在返回值上做变异。500 条的浅 clone
+    // （每条 3-4 个字符串分配）是微秒级，仍比整库解析快两个数量级
     match path(app) {
-        Ok(p) => load_at(&p),
+        Ok(p) => (*load_arc_at(&p)).clone(),
         Err(_) => Vec::new(),
     }
 }
 
-pub(crate) fn load_at(p: &std::path::Path) -> Vec<MemEntry> {
-    fs::read_to_string(p)
+/// Arc 版读取（AppHandle 路径）：只读调用方（统计 / 工作记忆 / 召回快照 /
+/// 按条取正文）直接借用，连整库 clone 都省掉
+fn load_arc(app: &AppHandle) -> Arc<Vec<MemEntry>> {
+    match path(app) {
+        Ok(p) => load_arc_at(&p),
+        Err(_) => Arc::new(Vec::new()),
+    }
+}
+
+/// 缓存感知的读取核心：stat → (path, mtime, len) 全等 → 返回缓存 Arc 的
+/// 引用计数副本（纳秒级）；否则读盘解析并回填缓存。stat 必须在 read 之前
+/// 取：若外部进程恰好在 stat 与 read 之间改盘，缓存会以「旧 mtime 记住新
+/// 内容」，下次 load 因 mtime 失配再读一次盘自愈；反序（先读后 stat）才会
+/// 把「新 mtime 配旧内容」真正驻留成脏缓存
+fn load_arc_at(p: &std::path::Path) -> Arc<Vec<MemEntry>> {
+    let ident = stat_identity(p);
+    {
+        let cached = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some(c), Some((mtime, len))) = (cached.as_ref(), ident) {
+            if c.path == p && c.mtime == mtime && c.len == len {
+                return Arc::clone(&c.items);
+            }
+        }
+    }
+    // miss：读盘解析。文件不存在 / 解析失败都按空库，与旧 load_at 口径一致；
+    // 解析失败也回填缓存（带上坏文件的 mtime/len）——重复读同一坏文件结果
+    // 恒为空，与每次重新解析的行为等价，却省掉反复的无效解析
+    let items: Vec<MemEntry> = fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let arc = Arc::new(items);
+    if let Some((mtime, len)) = ident {
+        *CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedStore {
+            path: p.to_path_buf(),
+            items: Arc::clone(&arc),
+            mtime,
+            len,
+        });
+    } else {
+        // 文件不存在：清掉同路径陈旧槽位（无 mtime 可校验，留着必脏）
+        invalidate_cache(p);
+    }
+    arc
+}
+
+/// stat 文件取磁盘身份 (mtime, len)。len 参与校验是给 mtime 粒度粗的
+/// 文件系统加的一道保险：同 tick 内等长改写极难同时骗过两个维度
+fn stat_identity(p: &std::path::Path) -> Option<(SystemTime, u64)> {
+    let m = fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// 缓存失效：仅当槽位路径就是 p 时清除——别的路径的槽位与 p 的增删无关，
+/// 误清只会白白损失一次命中
+fn invalidate_cache(p: &std::path::Path) {
+    let mut c = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if c.as_ref().is_some_and(|cs| cs.path == p) {
+        *c = None;
+    }
+}
+
+/// 写穿透：落盘成功后立刻用新 stat 刷新缓存，下一次读免去「stat 失配 →
+/// 整库重解析」的绕路；stat 不到（异常文件系统状态）就失效兜底，宁可下次
+/// 多读一次盘也不留脏缓存
+fn refresh_cache(p: &std::path::Path, items: &[MemEntry]) {
+    match stat_identity(p) {
+        Some((mtime, len)) => {
+            *CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedStore {
+                path: p.to_path_buf(),
+                // 写路径本就在做序列化 + 落盘（毫秒级 IO），这一次整库 clone
+                // 是噪声级的开销，换来读路径全部零解析
+                items: Arc::new(items.to_vec()),
+                mtime,
+                len,
+            });
+        }
+        None => invalidate_cache(p),
+    }
+}
+
+pub(crate) fn load_at(p: &std::path::Path) -> Vec<MemEntry> {
+    // 公开签名保持返回 owned Vec：离线导入（mem_import）与测试在其上做
+    // 读-改-写或相等断言，clone 成本见 load() 注释
+    (*load_arc_at(p)).clone()
 }
 
 /// 落盘 + 广播 sn-mem-changed。只会在已持 STORE_LOCK 的后台/命令线程调用
@@ -139,14 +254,19 @@ fn write(app: &AppHandle, items: &[MemEntry]) {
     let _ = app.emit("sn-mem-changed", ());
 }
 
-/// 显式路径版落盘（离线导入用；不广播——没有 AppHandle 也就没有监听者）
+/// 显式路径版落盘（离线导入用；不广播——没有 AppHandle 也就没有监听者）。
+/// 成功即写穿透刷新缓存；失败则失效缓存（宁可下次多读一次盘）
 pub(crate) fn write_at(p: &std::path::Path, items: &[MemEntry]) {
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(items) {
-        let _ = crate::config::atomic_write(p, json.as_bytes());
+        if crate::config::atomic_write(p, json.as_bytes()).is_ok() {
+            refresh_cache(p, items);
+            return;
+        }
     }
+    invalidate_cache(p);
 }
 
 fn now_ms_i64() -> i64 {
@@ -737,10 +857,11 @@ fn spawn_distill(app: &AppHandle, ts: i64, base_cfg: &crate::config::LlmConfig) 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _busy = DistillBusyGuard;
-        // ① 锁内快照：正文、候选集（排除自身与已作废——在世记忆才可被取代）
+        // ① 锁内快照：正文、候选集（排除自身与已作废——在世记忆才可被取代）。
+        // 借用 Arc 只取需要的字段，不整库 clone
         let snapshot = {
             let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let items = load(&app);
+            let items = load_arc(&app);
             items
                 .iter()
                 .find(|e| e.ts == ts)
@@ -842,7 +963,10 @@ pub fn mem_set_pinned(app: AppHandle, ts: i64, pinned: bool) -> Result<(), Strin
 pub fn mem_clear(app: AppHandle) {
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Ok(p) = path(&app) {
-        let _ = fs::remove_file(p);
+        let _ = fs::remove_file(&p);
+        // 删文件后立即失效缓存：文件已不存在、没有 mtime 可比对，留着旧
+        // 槽位会让下一次 load 误命中返回清空前的内容
+        invalidate_cache(&p);
     }
     let _ = app.emit("sn-mem-changed", ());
 }
@@ -955,7 +1079,8 @@ fn storage_counts(items: &[MemEntry]) -> (u32, u32, u32, u64) {
 #[tauri::command]
 pub fn mem_storage_stats(app: AppHandle) -> MemStorageStats {
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let items = load(&app);
+    // 只统计不改动：借用 Arc 快照即可（命中缓存时整个命令零读盘零解析）
+    let items = load_arc(&app);
     let (n, pinned, superseded, chars) = storage_counts(&items);
     let p = path(&app).ok();
     let bytes = p
@@ -1247,10 +1372,11 @@ pub fn mem_used(app: AppHandle, ts: i64) {
 /// 热键→悬浮窗→本命令的整条调用链没有任何一处会阻塞主线程
 #[tauri::command]
 pub async fn mem_recall_paste(app: AppHandle, ts: i64) -> Result<String, String> {
-    // 锁内只做文本快照，随即放锁：粘贴期间不能把采集/命令挡在锁外
+    // 锁内只做文本快照，随即放锁：粘贴期间不能把采集/命令挡在锁外。
+    // 借用 Arc 只 clone 命中那一条的 text，不整库拷贝
     let text = {
         let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        load(&app).into_iter().find(|e| e.ts == ts).map(|e| e.text)
+        load_arc(&app).iter().find(|e| e.ts == ts).map(|e| e.text.clone())
     };
     let text = text.ok_or("未找到该条记忆")?;
     let cfg = app
@@ -1280,9 +1406,10 @@ pub async fn mem_recall_paste(app: AppHandle, ts: i64) -> Result<String, String>
 /// spawn_blocking——剪贴板被占用时 copy_only 内部有重试，不能占着调用线程
 #[tauri::command]
 pub async fn mem_copy_used(app: AppHandle, ts: i64) -> Result<(), String> {
+    // 同 mem_recall_paste：借用 Arc 只取一条的 text
     let text = {
         let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        load(&app).into_iter().find(|e| e.ts == ts).map(|e| e.text)
+        load_arc(&app).iter().find(|e| e.ts == ts).map(|e| e.text.clone())
     };
     let text = text.ok_or("未找到该条记忆")?;
     tauri::async_runtime::spawn_blocking(move || crate::inject::copy_only(&text))
@@ -1428,11 +1555,12 @@ fn context_markdown_from(items: &[MemEntry], now_ms: i64) -> String {
 }
 
 /// 工作记忆 markdown（display_api 的 GET /mem/context.md 用）：给外部 AI
-/// 工具会话开场注入用。调用方是 HTTP 工作线程，这里仍走锁保证快照一致性
+/// 工具会话开场注入用。调用方是 HTTP 工作线程，这里仍走锁保证快照一致性；
+/// 纯读取，借用 Arc 快照不整库 clone
 pub fn context_markdown(app: &AppHandle) -> String {
     let items = {
         let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        load(app)
+        load_arc(app)
     };
     context_markdown_from(&items, now_ms_i64())
 }
@@ -2138,6 +2266,12 @@ mod tests {
         p
     }
 
+    /// 文件级测试的串行锁：CACHE 是进程级单槽全局状态，cargo test 默认并行
+    /// 跑测试时，一个测试的 write_at 会把另一个测试刚填充的缓存槽踢掉，
+    /// 命中/哨兵断言会互相打架——所有触及 write_at/load_at/CACHE 的测试
+    /// 都持本锁串行执行
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn apply_restore_clears_superseded_only_when_needed() {
         let mut items = vec![
@@ -2173,6 +2307,7 @@ mod tests {
 
     #[test]
     fn restore_backup_at_three_step_sequence() {
+        let _cache_guard = CACHE_TEST_LOCK.lock().unwrap();
         let dir = temp_dir_for("restore");
         let p = path_at(&dir);
         // ① bak 缺席：Err 且不产生任何文件（连 pre-restore 都不该有）
@@ -2212,6 +2347,7 @@ mod tests {
     fn restore_backup_without_main_library_still_restores() {
         // 极端情形：主库不存在（换机后手工放置 bak）。无 pre-restore 可存，
         // 恢复仍要成功——bak 里就是全部家当
+        let _cache_guard = CACHE_TEST_LOCK.lock().unwrap();
         let dir = temp_dir_for("restore-empty");
         let p = path_at(&dir);
         let e = entry(7, "note", "t", "x", &[]);
@@ -2281,5 +2417,121 @@ mod tests {
             vec![800, 50],
             "导入 ts 保留 + 降序重排"
         );
+    }
+
+    /* ---- v5：内存缓存（写穿透 + mtime 校验） ---- */
+
+    /// 外部改盘并确保 mtime 真的变化：文件系统时间戳粒度从 FAT 的 2s 到
+    /// NTFS 的 100ns 不等，同一粒度 tick 内重写不会换 mtime——循环重写直到
+    /// mtime 与 old 不同，上限约 2s 防死等（正常文件系统首轮即过）
+    fn rewrite_until_mtime_changes(p: &std::path::Path, json: &str, old: SystemTime) {
+        for _ in 0..1000 {
+            fs::write(p, json).unwrap();
+            if fs::metadata(p).unwrap().modified().unwrap() != old {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("外部重写 2s 内未能改变 mtime，文件系统时间戳粒度过粗");
+    }
+
+    #[test]
+    fn cache_write_through_then_hit_without_reparse() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = temp_dir_for("cache-hit");
+        let p = path_at(&dir);
+        let a = entry(10, "dictation", "a", "aa", &[]);
+        write_at(&p, &[a.clone()]);
+        // 写穿透：缓存槽 = 刚写入的路径与内容，mtime/len 与磁盘当前值一致
+        {
+            let c = CACHE.lock().unwrap();
+            let cs = c.as_ref().expect("write_at 成功后必须已写入缓存");
+            assert_eq!(cs.path, p);
+            assert_eq!(*cs.items, vec![a.clone()]);
+            let m = fs::metadata(&p).unwrap();
+            assert_eq!(cs.mtime, m.modified().unwrap(), "缓存 mtime 与磁盘一致");
+            assert_eq!(cs.len, m.len(), "缓存 len 与磁盘一致");
+        }
+        // 命中零重解析：把缓存内容篡改成哨兵（mtime/len 不动），load 必须
+        // 原样返回哨兵——若该路径偷读了盘，返回的会是磁盘上的 a
+        let sentinel = entry(999, "note", "哨兵", "只存在于缓存里的内容", &[]);
+        {
+            let mut c = CACHE.lock().unwrap();
+            c.as_mut().unwrap().items = Arc::new(vec![sentinel.clone()]);
+        }
+        assert_eq!(load_at(&p), vec![sentinel], "stat 未变 → 命中缓存，零 IO 零解析");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_external_write_invalidates() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = temp_dir_for("cache-ext");
+        let p = path_at(&dir);
+        let a = entry(10, "dictation", "a", "aa", &[]);
+        write_at(&p, &[a.clone()]);
+        // 场景一（模拟 memimport 离线写盘）：外部直接 fs::write，内容长度
+        // 也变了——(mtime,len) 任一失配即失效重读
+        let b = entry(20, "ocr", "b", "甲甲甲", &[]);
+        fs::write(&p, serde_json::to_string(&[b.clone()]).unwrap()).unwrap();
+        assert_eq!(load_at(&p), vec![b.clone()], "外部改盘后必须重读磁盘");
+        // 场景二：等长改写（len 相同、内容不同），只能靠 mtime 变化兜底。
+        // 「甲甲甲」与「乙乙乙」同为 9 字节 UTF-8，其余字段全同 → 两条
+        // compact JSON 的字节长度完全相等
+        let c_new = entry(20, "ocr", "b", "乙乙乙", &[]);
+        let json_c = serde_json::to_string(&[c_new.clone()]).unwrap();
+        assert_eq!(
+            json_c.len(),
+            serde_json::to_string(&[b]).unwrap().len(),
+            "前置：两份 JSON 必须等长，否则没测到 mtime 维度"
+        );
+        let cached_mtime = fs::metadata(&p).unwrap().modified().unwrap();
+        rewrite_until_mtime_changes(&p, &json_c, cached_mtime);
+        assert_eq!(load_at(&p), vec![c_new], "等长改写靠 mtime 失配重读");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_clear_yields_empty_library() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = temp_dir_for("cache-clear");
+        let p = path_at(&dir);
+        let a = entry(10, "dictation", "a", "aa", &[]);
+        write_at(&p, &[a.clone()]);
+        // mem_clear 的两步（无 AppHandle，直接驱动同款逻辑）：删文件 + 失效
+        fs::remove_file(&p).unwrap();
+        invalidate_cache(&p);
+        assert_eq!(load_at(&p), Vec::<MemEntry>::new(), "清库后读到空库");
+        assert!(CACHE.lock().unwrap().is_none(), "槽位已清空");
+        // 失效别的路径不误伤本路径：重新填充后失效 other，本路径仍命中
+        write_at(&p, &[a.clone()]);
+        let other_dir = dir.join("other");
+        fs::create_dir_all(&other_dir).unwrap();
+        let other = path_at(&other_dir);
+        invalidate_cache(&other);
+        assert!(
+            CACHE.lock().unwrap().as_ref().is_some_and(|cs| cs.path == p),
+            "失效 other 不得清掉 p 的槽位"
+        );
+        assert_eq!(load_at(&p), vec![a], "p 仍命中");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_paths_do_not_cross_pollute() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        let dir1 = temp_dir_for("cache-p1");
+        let dir2 = temp_dir_for("cache-p2");
+        let p1 = path_at(&dir1);
+        let p2 = path_at(&dir2);
+        let a = entry(10, "dictation", "a", "aa", &[]);
+        let b = entry(20, "ocr", "b", "bb", &[]);
+        write_at(&p1, &[a.clone()]);
+        write_at(&p2, &[b.clone()]); // 单槽被 p2 顶替
+        assert_eq!(load_at(&p2), vec![b.clone()], "p2 命中");
+        assert_eq!(load_at(&p1), vec![a], "p1 路径失配 → 重读盘，不被 p2 的缓存污染");
+        assert_eq!(load_at(&p2), vec![b], "回到 p2 仍正确");
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir2);
     }
 }

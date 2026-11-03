@@ -522,6 +522,14 @@ pub struct GeneralConfig {
     /// 全套 --sn-accent 角色变量，深浅底色各取对应明度档
     #[serde(default = "default_accent")]
     pub accent: String,
+    /// 更新包下载镜像前缀（默认空 = GitHub 直连；如 https://gh-proxy.com/）。
+    /// 仅做「前缀 + 官方 URL」拼接，白名单仍校验官方路径，内容过 sha256 校验
+    #[serde(default)]
+    pub download_mirror: String,
+    /// 发现新版本后后台静默预下载（就绪后提示安装；失败静默重试不打扰）。
+    /// 受 auto_check_update 总开关约束
+    #[serde(default = "default_true")]
+    pub auto_download_update: bool,
 }
 
 fn default_accent() -> String {
@@ -604,6 +612,8 @@ impl Default for GeneralConfig {
             auto_check_update: true,
             skip_version: String::new(),
             accent: default_accent(),
+            download_mirror: String::new(),
+            auto_download_update: true,
         }
     }
 }

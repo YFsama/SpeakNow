@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { Button, ConfirmButton, Field, Section, Segmented, TextArea, Toggle } from '../Controls';
+import { Button, ConfirmButton, Field, Section, Segmented, TextArea, TextInput, Toggle } from '../Controls';
 import { LogoBadge } from '../Logo';
 import { SoundFadeLine } from '../EmptyArt';
 import {
@@ -178,27 +178,54 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
     busy: boolean;
     downloaded: number;
     total: number;
+    /** 后端 2s 滑动窗口平均速度（B/s；0 = 尚无样本） */
+    speed: number;
+    /** 预计剩余秒数（总量/速度可知时才有） */
+    etaSec: number | null;
     path?: string;
     err?: string;
-  }>({ busy: false, downloaded: 0, total: 0 });
+  }>({ busy: false, downloaded: 0, total: 0, speed: 0, etaSec: null });
   const [showAllNotes, setShowAllNotes] = useState(false);
 
   useEffect(() => {
-    const un = listen<{ downloaded: number; total: number }>(
-      'sn-update-progress',
-      (e) => {
-        setDl((d) => ({ ...d, downloaded: e.payload.downloaded, total: e.payload.total }));
-      },
-    );
+    // 手动下载与后台预下载共用同一组事件：进度事件置 busy，进度条对两者都生效；
+    // ready 事件直接落就绪态（全局 toast 由 App.tsx 负责，这里只驱动界面）
+    const un1 = listen<{
+      downloaded: number;
+      total: number;
+      speed?: number;
+      etaSec?: number | null;
+      /** 失败终态（后台预下载失败也广播）：复位 busy 并给出可重试提示 */
+      error?: string;
+    }>('sn-update-progress', (e) => {
+      // 失败终态与进度是同一事件的两种载荷：有 error 即收尾（数值字段缺省 0）
+      if (e.payload.error) {
+        setDl((d) => ({ ...d, busy: false, err: e.payload.error }));
+        return;
+      }
+      setDl((d) => ({
+        ...d,
+        busy: true,
+        err: undefined,
+        downloaded: e.payload.downloaded,
+        total: e.payload.total,
+        speed: e.payload.speed ?? 0,
+        etaSec: e.payload.etaSec ?? null,
+      }));
+    });
+    const un2 = listen<{ version: string; path: string }>('sn-update-ready', (e) => {
+      setDl((d) => ({ ...d, busy: false, path: e.payload.path, err: undefined }));
+    });
     return () => {
-      un.then((f) => f());
+      un1.then((f) => f());
+      un2.then((f) => f());
     };
   }, []);
 
   const onCheck = async () => {
     setChecking(true);
     setCheckErr('');
-    setDl({ busy: false, downloaded: 0, total: 0 });
+    setDl({ busy: false, downloaded: 0, total: 0, speed: 0, etaSec: null });
     try {
       const r = await checkUpdate();
       setInfo(r);
@@ -212,12 +239,14 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
 
   const onDownload = async () => {
     if (!info?.downloadUrl) return;
-    setDl({ busy: true, downloaded: 0, total: 0 });
+    setDl({ busy: true, downloaded: 0, total: info.assetSize || 0, speed: 0, etaSec: null });
     try {
       const path = await downloadUpdate(info.downloadUrl);
       setDl((d) => ({ ...d, busy: false, path }));
       toast('更新包下载完成 ✓');
     } catch (e) {
+      // 后台预下载已在进行（single-flight 拒绝并发）：不打扰，进度事件接管 UI
+      if (String(e).includes('正在下载')) return;
       setDl((d) => ({ ...d, busy: false, err: String(e) }));
       toast(`下载失败：${e}`, 'error');
     }
@@ -239,6 +268,23 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
     const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('zh-CN');
   };
+
+  /** B/s → 人类可读速度（下载进度行），如 12.3 MB/s */
+  const fmtSpeed = (bps: number) => {
+    if (bps >= 1024 * 1024) return `${(bps / 1024 / 1024).toFixed(1)} MB/s`;
+    if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
+    return `${bps} B/s`;
+  };
+
+  /** 速度与剩余时间合为一行（如「12.3 MB/s · 约 40 秒」）；无样本时为空 */
+  const speedText =
+    dl.speed > 0
+      ? ` ${fmtSpeed(dl.speed)}${
+          dl.etaSec != null && dl.etaSec > 0 && dl.etaSec < 3600
+            ? ` · 约 ${dl.etaSec < 60 ? `${Math.ceil(dl.etaSec)} 秒` : `${Math.ceil(dl.etaSec / 60)} 分钟`}`
+            : ''
+        }`
+      : '';
 
   /* ---- 配置备份：导出 / 导入 ---- */
   const [importText, setImportText] = useState('');
@@ -426,7 +472,7 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
         {dl.busy ? (
           <div>
             <div className="mb-1 flex justify-between font-mono text-[10.5px] text-slate-500">
-              <span>正在下载更新包…</span>
+              <span>正在下载更新包…{speedText}</span>
               <span>
                 {fmtBytes(dl.downloaded)}
                 {dl.total > 0 ? ` / ${fmtBytes(dl.total)}` : ''}
@@ -446,7 +492,7 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
         ) : dl.path ? (
           <div className="flex flex-wrap items-center gap-2">
             <Button kind="primary" onClick={onInstall}>
-              ⟳ 重启并安装 v{info.latest}
+              已下载就绪 · 安装并重启 v{info.latest}
             </Button>
             <Button onClick={() => void onDownload()}>重新下载</Button>
             <span className="text-[11px] leading-4 text-slate-500">
@@ -543,9 +589,28 @@ export function AboutTab({ cfg, set, toast, updateInfo }: TabProps) {
       <Toggle
         checked={cfg.general.autoCheckUpdate !== false}
         onChange={(autoCheckUpdate) => set('general', { autoCheckUpdate })}
-        label="启动时自动检查更新"
-        desc="仅在启动时查询一次 GitHub 最新版本并提示，绝不自动下载安装；可通过上方「跳过此版本」屏蔽特定版本"
+        label="自动检查更新"
+        desc="启动时与之后每 6 小时查询一次 GitHub 最新版本并提示，绝不自动安装；可通过上方「跳过此版本」屏蔽特定版本"
       />
+
+      <Toggle
+        checked={cfg.general.autoDownloadUpdate !== false}
+        onChange={(autoDownloadUpdate) => set('general', { autoDownloadUpdate })}
+        label="发现新版本自动后台下载"
+        desc="后台静默下载安装包（断点续传、失败静默重试），就绪后可到本页一键安装，或退出应用时自动安装（不自动重启）；受「自动检查更新」总开关约束"
+      />
+
+      <Field
+        label="下载镜像"
+        hint="直连 GitHub 慢时可填加速前缀，如 https://gh-proxy.com/；留空 = 官方直连。镜像内容仍逐字节过官方 SHA-256 校验，官方未提供校验值时自动直连"
+      >
+        <TextInput
+          value={cfg.general.downloadMirror ?? ''}
+          onChange={(downloadMirror) => set('general', { downloadMirror })}
+          placeholder="https://gh-proxy.com/"
+          mono
+        />
+      </Field>
 
       <Field label="配置与数据" hint="API Key、模型与历史仅保存在本机，不会上传到任何服务器">
         <div className="flex flex-wrap gap-2">

@@ -1206,6 +1206,9 @@ async fn restart_elevated(app: AppHandle) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("启动提权中继失败：{e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(250));
+        // 提权中继即将拉起新实例：退出钩子此刻绝不能同时开装更新——
+        // 安装器会覆盖正在启动的提权实例文件
+        crate::update::suppress_exit_install();
         app.exit(0);
         Ok(())
     }
@@ -1318,6 +1321,14 @@ pub fn run() {
             {
                 let ext = cfg.external_display.clone();
                 std::thread::spawn(move || display_api::apply(&ext));
+            }
+            // 更新周期检查（6h ± 抖动 + 失败退避 + tag 免限额预检）：独立线程
+            // sleep 循环，进程退出即随之终止（无需优雅退出协议）；发现新版本
+            // 且开关全开时后台预下载，就绪后托盘出现「新版本」入口、退出时
+            // 自动装载（见下方 RunEvent::Exit 钩子）
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || update::periodic_check_loop(h));
             }
             // 常驻后台维护线程（30s 一拍）：
             // ① 截图选区窗闲置回收——隐藏保活的 WebView2 每屏 50~150MB，
@@ -1491,6 +1502,9 @@ pub fn run() {
             // 应用退出时收掉 llama-server 子进程（识别 + 翻译两个引擎），避免孤儿进程
             // 占着数 GB 内存；强杀/崩溃路径由 Job Object（KILL_ON_JOB_CLOSE）兜底
             if let tauri::RunEvent::Exit = event {
+                // 就绪态更新：退出时拉起安装器（内部单飞，与手动安装互斥；
+                // 安装器 detached 延迟 2s，先让下面的退出收尾走完防文件占用）
+                update::install_on_exit_if_ready(app);
                 qwen_asr::shutdown(app);
                 local_llm::shutdown(app);
             }

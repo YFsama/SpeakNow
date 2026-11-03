@@ -475,6 +475,16 @@ export default function App() {
     const un7 = listen<{ error: string | null }>('sn-hotkey-status', (e) => {
       if (e.payload?.error) setToast(`快捷键注册失败：${e.payload.error}`, 'error');
     });
+    // 后台预下载就绪：提示安装入口；顺带补一次检查点亮侧栏红点（启动检查
+    // 失败/被跳过时 updateInfo 可能为空，复用同一状态而不是另起炉灶）
+    const un8 = listen<{ version: string; path: string }>('sn-update-ready', (e) => {
+      setToast(`新版本 v${e.payload.version} 已就绪，到「关于」页安装`, 'info');
+      checkUpdate()
+        .then((r) => {
+          if (r.updateAvailable) setUpdateInfo(r);
+        })
+        .catch(() => {});
+    });
     return () => {
       if (idleTimer) clearTimeout(idleTimer);
       un1.then((f) => f());
@@ -484,6 +494,7 @@ export default function App() {
       un5.then((f) => f());
       un6.then((f) => f());
       un7.then((f) => f());
+      un8.then((f) => f());
     };
   }, []);
 

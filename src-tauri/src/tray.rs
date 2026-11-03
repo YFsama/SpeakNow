@@ -114,10 +114,25 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    Menu::with_items(
-        app,
-        &[&record, &record_quick, &translate_sel, &translate_input, &ocr_item, &typist_menu, &show, &sep1, &mode_menu, &lang_menu, &review, &sep2, &quit],
-    )
+
+    // 有新版本且未跳过：常驻入口直达「关于」页更新面板（版本来自 update
+    // 模块最近一次检查/预下载就绪态；检查完成时 update 侧会派发主线程重建）
+    let upd = crate::update::tray_badge_version(app)
+        .map(|v| MenuItem::with_id(app, "update", format!("⬆️ 新版本 v{v}"), true, None::<&str>))
+        .transpose()?;
+
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
+        vec![&record, &record_quick, &translate_sel, &translate_input, &ocr_item, &typist_menu, &show];
+    if let Some(u) = &upd {
+        items.push(u);
+    }
+    items.push(&sep1);
+    items.push(&mode_menu);
+    items.push(&lang_menu);
+    items.push(&review);
+    items.push(&sep2);
+    items.push(&quit);
+    Menu::with_items(app, &items)
 }
 
 /// 重建托盘菜单（模式/翻译目标的 ● 标记随配置变化）。托盘自身与设置页
@@ -176,6 +191,8 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             });
         }
         "show" => open_main_window(app),
+        // 新版本入口：开主窗并切到关于页（复用 open_settings 的 sn-navigate 通道）
+        "update" => crate::open_settings(app.clone(), Some("about".into())),
         "quit" => app.exit(0),
         // 预览编辑快切：与模式/语言同为持久配置项，落盘 + 通知设置页刷新
         "review" => {

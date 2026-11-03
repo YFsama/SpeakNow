@@ -218,6 +218,10 @@ export interface GeneralConfig {
   skipVersion?: string;
   /** 强调色主题 id（sky/indigo/violet/teal/amber）：驱动 data-accent 与全套强调色变量 */
   accent?: string;
+  /** 更新包下载镜像前缀（空 = GitHub 直连；仅前缀拼接，内容仍过 sha256 校验） */
+  downloadMirror?: string;
+  /** 发现新版本后后台静默预下载（受 autoCheckUpdate 约束；就绪后提示安装） */
+  autoDownloadUpdate?: boolean;
 }
 
 /** 外接显示（硬件字幕屏）API */

@@ -136,6 +136,8 @@ const mockConfig = {
     autoCheckUpdate: true,
     skipVersion: '',
     accent: 'sky',
+    downloadMirror: '',
+    autoDownloadUpdate: true,
   },
   mem: {
     enabled: true,
