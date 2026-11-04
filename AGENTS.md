@@ -23,7 +23,7 @@ npm run contracts           # 前后端契约对账（见下），CI 同款
 npm test                    # 前端纯逻辑单测（vitest：键位徽章/凭据组解析）
 cd src-tauri
 cargo check --lib --examples  # Rust 编译（含 5 个诊断 examples）
-cargo test                    # 96 个单测（纯逻辑层：提示词/结构化翻译/文本清洗/CCC 状态机…）
+cargo test                    # 217 个单测（纯逻辑层：提示词/结构化翻译/文本清洗/CCC 状态机/记忆检索/本地优先模式…）
 ```
 
 前端 UI 可在纯浏览器迭代（无 Tauri、无 Rust）：`npm run dev` 后访问
@@ -110,4 +110,4 @@ memimport 可离线把文档喂进真实 mem.json（不启动应用）。
 
 ## 版本
 
-SpeakNow v0.6.0 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
+SpeakNow v0.7.0 · Windows 优先（macOS 部分功能受限，见 docs/macos.md）
