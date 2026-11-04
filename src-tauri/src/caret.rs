@@ -51,7 +51,9 @@ mod imp {
         CoCreateInstance, CoInitializeEx, CoUninitialize, SAFEARRAY, CLSCTX_ALL,
         COINIT_MULTITHREADED,
     };
-    use windows::Win32::System::Ole::{SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound};
+    use windows::Win32::System::Ole::{
+        SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    };
     use windows::Win32::UI::Accessibility::{
         IUIAutomation, IUIAutomationTextPattern, IUIAutomationTextPattern2, CUIAutomation,
         UIA_TextPatternId, UIA_PATTERN_ID,
@@ -114,7 +116,10 @@ mod imp {
         }
     }
 
-    /// SAFEARRAY<f64> → 首个非空矩形
+    /// SAFEARRAY<f64> → 首个非空矩形。读毕销毁数组：GetBoundingRectangles
+    /// 返回的裸 SAFEARRAY 归调用方所有，不销毁则每次光标探测都泄漏一块 COM
+    /// 内存（悬浮窗跟随高频调用，泄漏持续累积）。销毁放在数据复制完成之后、
+    /// 一切结果判定之前，成功与错误路径都必然经过
     fn parse_rect(psa: *mut SAFEARRAY) -> Option<(f64, f64, f64, f64)> {
         unsafe {
             if psa.is_null() {
@@ -129,9 +134,6 @@ mod imp {
                 ub = u;
             }
             let n = (ub - lb + 1) as usize;
-            if n < 4 {
-                return None;
-            }
             let mut vals = Vec::with_capacity(n);
             for i in 0..n.min(16) {
                 let idx = lb + i as i32;
@@ -143,6 +145,9 @@ mod imp {
                 }
                 vals.push(v);
             }
+            // 数据已复制进 vals，销毁原始数组（销毁失败只影响内存回收，
+            // 不影响本次探测结果，静默即可）
+            let _ = SafeArrayDestroy(psa);
             for q in vals.chunks_exact(4) {
                 if q[2] > 0.0 && q[3] > 0.0 {
                     return Some((q[0], q[1], q[2], q[3]));

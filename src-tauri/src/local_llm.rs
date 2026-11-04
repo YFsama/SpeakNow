@@ -277,7 +277,25 @@ fn kill_leftover_runtimes(_app: &AppHandle) -> usize {
     0
 }
 
+/// 停止本地翻译引擎。全程持 SPAWN_LOCK：不持锁的旧写法可与 ensure_server
+/// 的启动等待期交错——kill_leftover 会杀掉刚拉起、尚未登记进 SERVER 的
+/// 进程，ensure_server 的健康探测只能傻等到超时（qwen_asr::shutdown 同修）
 pub fn shutdown(app: &AppHandle) {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    shutdown_locked(app);
+}
+
+/// 退出专用：不等待 SPAWN_LOCK——冷启动期 ensure_server 持锁最长数分钟，
+/// 退出回调（主线程）等锁会让窗口已关、进程僵留。退出场景无需保序
+/// （「不杀刚拉起进程」的顾虑只存在于继续运行的场景），启动线程随
+/// 进程消亡，Job Object 兜底回收。常规路径（删模型/空闲释放）走 shutdown
+pub fn shutdown_fast(app: &AppHandle) {
+    shutdown_locked(app);
+}
+
+/// shutdown 的实现体（调用方已持 SPAWN_LOCK）。idle_shutdown 持锁后直接
+/// 复用本函数；Mutex 不可重入，故不能让 shutdown 在锁内再调自己
+fn shutdown_locked(app: &AppHandle) {
     if let Some(st) = SERVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
         if let Some(mut c) = st.child {
             let _ = c.kill();
@@ -301,7 +319,8 @@ pub fn idle_shutdown(app: &AppHandle, idle: Duration) {
             "[speaknow] 本地翻译引擎空闲超过 {} 分钟，自动释放内存",
             idle.as_secs() / 60
         );
-        shutdown(app);
+        // 已持 SPAWN_LOCK，直接走实现体（Mutex 不可重入，不能再调 shutdown）
+        shutdown_locked(app);
     }
 }
 

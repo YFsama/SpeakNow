@@ -128,7 +128,7 @@ pub struct MemEntry {
 
 /// mem_list 命令返回：条目 + 概览统计。统计不受 query/kind 过滤影响
 /// （「共 N 条 / 今日 / 累计字符」永远是对整库的口径，与 mock 一致）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemListResult {
     pub items: Vec<MemEntry>,
@@ -621,13 +621,19 @@ pub fn capture(app: &AppHandle, kind: &str, app_name: &str, text: &str) {
     let spawned = std::thread::Builder::new()
         .name("speaknow-mem-capture".into())
         .spawn(move || {
-            let ts = now_ms_i64();
             let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut items = load(&app);
             if bump_near_duplicate(&mut items, &kind, &entry_app, &text) {
                 // 近重复：旧条 hits+1 即视为「又出现了一次」，不新建条目
                 write(&app, &items);
                 return;
+            }
+            // 同毫秒撞主键防护（import_batch_core 同款手法）：ts 在本库兼作
+            // 主键（删除/置顶/裁决都按 ts 寻址），同一毫秒完成的两条采集会
+            // 共享 ts 而多块同生同死——取现值后若库首不比它旧就 +1 防撞
+            let mut ts = now_ms_i64();
+            if items.first().is_some_and(|e| e.ts >= ts) {
+                ts = items[0].ts + 1;
             }
             items.insert(
                 0,
@@ -912,63 +918,96 @@ fn spawn_distill(app: &AppHandle, ts: i64, base_cfg: &crate::config::LlmConfig) 
 /* ---------- Tauri 命令（lib.rs generate_handler 注册） ---------- */
 
 /// 记忆检索：query 空格分词 AND（keywords>title>text 加权），kind 过滤，
-/// limit 截断；统计（total/todayCount/totalChars）对整库口径，不受过滤影响
+/// limit 截断；统计（total/todayCount/totalChars）对整库口径，不受过滤影响。
+/// 命令层包 spawn_blocking（cache miss 时 load 是读盘 + 整库解析，同步
+/// 命令会占主线程）；同步实现体保留给 display_api 的 /mem/search 复用
+/// （它已在阻塞线程池里执行）
 #[tauri::command]
-pub fn mem_list(app: AppHandle, query: String, kind: Option<String>, limit: u32) -> MemListResult {
+pub async fn mem_list(
+    app: AppHandle,
+    query: String,
+    kind: Option<String>,
+    limit: u32,
+) -> MemListResult {
+    tauri::async_runtime::spawn_blocking(move || mem_list_impl(&app, &query, kind.as_deref(), limit))
+        .await
+        .unwrap_or_default()
+}
+
+/// mem_list 的同步实现（display_api 的 GET /mem/search 直接复用）
+pub(crate) fn mem_list_impl(
+    app: &AppHandle,
+    query: &str,
+    kind: Option<&str>,
+    limit: u32,
+) -> MemListResult {
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let items = load(&app);
+    let items = load(app);
     let (total, today_count, total_chars) = stats(&items, now_ms_i64());
     MemListResult {
-        items: search(items, &query, kind.as_deref(), limit as usize),
+        items: search(items, query, kind, limit as usize),
         total,
         today_count,
         total_chars,
     }
 }
 
-/// 批量删除（多选）：锁内一次 load→retain→write，返回实际删除条数
+/// 批量删除（多选）：锁内一次 load→retain→write，返回实际删除条数。
+/// 读写盘在阻塞线程池执行（同步命令会占主线程）
 #[tauri::command]
-pub fn mem_delete_batch(app: AppHandle, ts: Vec<i64>) -> usize {
-    let set: HashSet<i64> = ts.iter().copied().collect();
-    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut items = load(&app);
-    let before = items.len();
-    items.retain(|i| !set.contains(&i.ts));
-    let removed = before - items.len();
-    if removed > 0 {
-        write(&app, &items);
-    }
-    removed
+pub async fn mem_delete_batch(app: AppHandle, ts: Vec<i64>) -> usize {
+    tauri::async_runtime::spawn_blocking(move || {
+        let set: HashSet<i64> = ts.iter().copied().collect();
+        let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut items = load(&app);
+        let before = items.len();
+        items.retain(|i| !set.contains(&i.ts));
+        let removed = before - items.len();
+        if removed > 0 {
+            write(&app, &items);
+        }
+        removed
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// 收藏 / 取消收藏一条记忆（置顶显示，不占保留名额；置顶上限 20，
-/// 挤出最旧置顶——history.rs 同款口径）
+/// 挤出最旧置顶——history.rs 同款口径）。读写盘在阻塞线程池执行
 #[tauri::command]
-pub fn mem_set_pinned(app: AppHandle, ts: i64, pinned: bool) -> Result<(), String> {
-    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut items = load(&app);
-    let Some(item) = items.iter_mut().find(|i| i.ts == ts) else {
-        return Err("未找到该条记忆".into());
-    };
-    item.pinned = pinned;
-    if pinned {
-        evict_pinned_overflow(&mut items, ts);
-    }
-    write(&app, &items);
-    Ok(())
+pub async fn mem_set_pinned(app: AppHandle, ts: i64, pinned: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut items = load(&app);
+        let Some(item) = items.iter_mut().find(|i| i.ts == ts) else {
+            return Err("未找到该条记忆".into());
+        };
+        item.pinned = pinned;
+        if pinned {
+            evict_pinned_overflow(&mut items, ts);
+        }
+        write(&app, &items);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// 清空记忆库（不影响使用统计；确认弹窗在前端）
+/// 清空记忆库（不影响使用统计；确认弹窗在前端）。删文件挪到阻塞线程池
 #[tauri::command]
-pub fn mem_clear(app: AppHandle) {
-    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Ok(p) = path(&app) {
-        let _ = fs::remove_file(&p);
-        // 删文件后立即失效缓存：文件已不存在、没有 mtime 可比对，留着旧
-        // 槽位会让下一次 load 误命中返回清空前的内容
-        invalidate_cache(&p);
-    }
-    let _ = app.emit("sn-mem-changed", ());
+pub async fn mem_clear(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(p) = path(&app) {
+            let _ = fs::remove_file(&p);
+            // 删文件后立即失效缓存：文件已不存在、没有 mtime 可比对，留着旧
+            // 槽位会让下一次 load 误命中返回清空前的内容
+            invalidate_cache(&p);
+        }
+        let _ = app.emit("sn-mem-changed", ());
+    })
+    .await
+    .unwrap_or(());
 }
 
 /* ---------- v3：导入入库通道 / 存储统计 / REST 令牌 ---------- */
@@ -1051,7 +1090,7 @@ pub(crate) fn import_batch_core(
 /// 存储统计（记忆页存储卡与容量管理用）。软作废条目的保留策略 = Obsidian
 /// 模式：永不清——滚动清理与普通条目同规则（在世与否不影响保留名额），
 /// 「作废优先于删除」让误判可逆，真要腾空间由用户显式删除
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemStorageStats {
     pub items: u32,
@@ -1075,14 +1114,22 @@ fn storage_counts(items: &[MemEntry]) -> (u32, u32, u32, u64) {
     )
 }
 
-/// 存储统计命令：锁内 load 统计 + mem.json / mem.bak 的 fs::metadata 字节数
+/// 存储统计命令：锁内 load 统计 + mem.json / mem.bak 的 fs::metadata 字节数。
+/// load 与 metadata 都是文件系统调用，挪到阻塞线程池（同步命令会占主线程）
 #[tauri::command]
-pub fn mem_storage_stats(app: AppHandle) -> MemStorageStats {
+pub async fn mem_storage_stats(app: AppHandle) -> MemStorageStats {
+    tauri::async_runtime::spawn_blocking(move || mem_storage_stats_impl(&app))
+        .await
+        .unwrap_or_default()
+}
+
+/// mem_storage_stats 的同步实现
+pub(crate) fn mem_storage_stats_impl(app: &AppHandle) -> MemStorageStats {
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // 只统计不改动：借用 Arc 快照即可（命中缓存时整个命令零读盘零解析）
-    let items = load_arc(&app);
+    let items = load_arc(app);
     let (n, pinned, superseded, chars) = storage_counts(&items);
-    let p = path(&app).ok();
+    let p = path(app).ok();
     let bytes = p
         .as_deref()
         .and_then(|p| fs::metadata(p).ok())
@@ -1118,29 +1165,42 @@ fn token_body(rng: &mut impl Rng) -> String {
 /// 生成记忆 REST 访问令牌（sn- + 24 位 base62）。必须走 config::save 正规
 /// 落盘链路（与 save_config 同款三步：写文件 → 更新 Ctx 内存 → 广播
 /// sn-config-changed）——display_api 的局域网鉴权读的就是这份配置，
-/// 只改内存不落盘会在重启后「令牌失效」
+/// 只改内存不落盘会在重启后「令牌失效」。
+/// 旧实现的竞态：先 clone 整份旧配置 → await 落盘 → 用旧 clone 整体覆盖
+/// Ctx——await 期间任何并发 save_config 写入的改动都会被这份过期快照
+/// 抹掉。现改为：落盘任务内取「当时的现值」只改令牌字段；await 结束后
+/// 重新锁 Ctx 读现值-改一个字段-写回，其他字段永不被旧快照覆盖
 #[tauri::command]
 pub async fn mem_gen_token(app: AppHandle) -> Result<String, String> {
     let token = format!("sn-{}", token_body(&mut rand::rng()));
-    let mut new_cfg = app
-        .state::<crate::Ctx>()
-        .config
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .unwrap_or_default();
-    new_cfg.mem.api_token = token.clone();
-    // config::save 是同步文件 IO：挪到阻塞线程池，不占 tokio worker
     let app2 = app.clone();
-    let cfg2 = new_cfg.clone();
-    tauri::async_runtime::spawn_blocking(move || crate::config::save(&app2, &cfg2).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())??;
-    *app
-        .state::<crate::Ctx>()
-        .config
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_cfg);
+    let token2 = token.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut cfg = app2
+            .state::<crate::Ctx>()
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        cfg.mem.api_token = token2;
+        // config::save 是同步文件 IO：整个任务已在阻塞线程池，不占 tokio worker
+        crate::config::save(&app2, &cfg).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    // 只更新内存里的 mem.api_token 一个字段（读现值-改字段-写回）：
+    // 整体覆盖会丢掉 await 期间其他命令（save_config 等）写入 Ctx 的改动
+    {
+        let state = app.state::<crate::Ctx>();
+        let mut guard = state
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Ctx 尚未装入配置（极早期）时补默认骨架，保持「Some 且令牌正确」
+        let cfg = guard.get_or_insert_with(crate::config::Config::default);
+        cfg.mem.api_token = token.clone();
+    }
     let _ = app.emit("sn-config-changed", ());
     Ok(token)
 }
@@ -1161,18 +1221,23 @@ fn apply_restore(items: &mut [MemEntry], ts: i64) -> bool {
 }
 
 /// v4 恢复一条软作废记忆（superseded_by 清零即重回召回与 context）。
-/// 条目不存在时静默（并发删除不是错误，前端无需 toast）
+/// 条目不存在时静默（并发删除不是错误，前端无需 toast）。读写盘在阻塞
+/// 线程池执行（同步命令会占主线程）
 #[tauri::command]
-pub fn mem_restore(app: AppHandle, ts: i64) {
-    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut items = load(&app);
-    if apply_restore(&mut items, ts) {
-        write(&app, &items);
-    } else {
-        // 未命中也广播：前端点按钮时已乐观清零徽章，这次广播把列表拉回
-        // 真实状态（条目确实不存在时刷新一次也无害）
-        let _ = app.emit("sn-mem-changed", ());
-    }
+pub async fn mem_restore(app: AppHandle, ts: i64) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut items = load(&app);
+        if apply_restore(&mut items, ts) {
+            write(&app, &items);
+        } else {
+            // 未命中也广播：前端点按钮时已乐观清零徽章，这次广播把列表拉回
+            // 真实状态（条目确实不存在时刷新一次也无害）
+            let _ = app.emit("sn-mem-changed", ());
+        }
+    })
+    .await
+    .unwrap_or(());
 }
 
 /// 物理清理的纯逻辑：删除全部软作废条目，返回删除数。置顶不作豁免——
@@ -1185,16 +1250,20 @@ fn apply_purge(items: &mut Vec<MemEntry>) -> u32 {
 
 /// v4 物理清理全部软作废条目，返回清除条数（不可恢复，二次确认在前端）。
 /// v3 的「作废优先于删除」让裁决误判可逆，本命令是用户腾空间的显式最终
-/// 一步——删掉的是确认无用的过时记忆
+/// 一步——删掉的是确认无用的过时记忆。读写盘在阻塞线程池执行
 #[tauri::command]
-pub fn mem_purge_superseded(app: AppHandle) -> u32 {
-    let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut items = load(&app);
-    let removed = apply_purge(&mut items);
-    if removed > 0 {
-        write(&app, &items);
-    }
-    removed
+pub async fn mem_purge_superseded(app: AppHandle) -> u32 {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut items = load(&app);
+        let removed = apply_purge(&mut items);
+        if removed > 0 {
+            write(&app, &items);
+        }
+        removed
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// 整库恢复的路径版（命令层补锁与广播；单测直接驱动三步序）。三步顺序
@@ -1348,22 +1417,33 @@ fn mark_used(app: &AppHandle, ts: i64) {
     }
 }
 
-/// 召回检索（display_api 的 GET /mem/search 直接复用本函数的命令形态）。
-/// 与 mem_list 的 v1 排序不同：这是给「快速取用」场景的多因子排序
-/// （见 recall_rank），两套语义并存——mem_list 服务管理页浏览，本命令
-/// 服务召回卡片
+/// 召回检索（display_api 的 GET /mem/search 直接复用本函数命令形态下的
+/// 同步实现体）。与 mem_list 的 v1 排序不同：这是给「快速取用」场景的
+/// 多因子排序（见 recall_rank），两套语义并存——mem_list 服务管理页浏览，
+/// 本命令服务召回卡片。命令层包 spawn_blocking：cache miss 时 load 是
+/// 读盘 + 整库解析，同步命令会占主线程
 #[tauri::command]
-pub fn mem_recall(app: AppHandle, query: String, limit: u32) -> Vec<MemEntry> {
+pub async fn mem_recall(app: AppHandle, query: String, limit: u32) -> Vec<MemEntry> {
+    tauri::async_runtime::spawn_blocking(move || mem_recall_impl(&app, &query, limit))
+        .await
+        .unwrap_or_default()
+}
+
+/// mem_recall 的同步实现（display_api 的 /mem/search 已在阻塞线程池里执行）
+pub(crate) fn mem_recall_impl(app: &AppHandle, query: &str, limit: u32) -> Vec<MemEntry> {
     let _guard = STORE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let items = load(&app);
-    recall_rank(items, &query, limit as usize, now_ms_i64())
+    let items = load(app);
+    recall_rank(items, query, limit as usize, now_ms_i64())
 }
 
 /// 记录一次实际使用（uses+1、lastUsedAt=now、广播）。条目不存在时静默
-/// 忽略（mock 同口径：并发删除不是错误，前端无需 toast）
+/// 忽略（mock 同口径：并发删除不是错误，前端无需 toast）。读写盘挪到
+/// 阻塞线程池（同步命令会占主线程）
 #[tauri::command]
-pub fn mem_used(app: AppHandle, ts: i64) {
-    mark_used(&app, ts);
+pub async fn mem_used(app: AppHandle, ts: i64) {
+    tauri::async_runtime::spawn_blocking(move || mark_used(&app, ts))
+        .await
+        .unwrap_or(());
 }
 
 /// 召回卡「输入到光标处」：注入成功才计一次使用（仅实际使用计数，

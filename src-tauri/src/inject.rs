@@ -915,31 +915,57 @@ fn send_paste_key(paste_key: &str) -> Result<()> {
     // 系统标准粘贴键（下方 default 分支的 ⌘V）
     #[cfg(target_os = "windows")]
     if paste_key == "shift+insert" {
-        e.key(Key::Shift, Direction::Press)?;
-        e.key(Key::Insert, Direction::Click)?;
-        e.key(Key::Shift, Direction::Release)?;
-        return Ok(());
+        let r = (|| -> Result<()> {
+            e.key(Key::Shift, Direction::Press)?;
+            e.key(Key::Insert, Direction::Click)?;
+            e.key(Key::Shift, Direction::Release)?;
+            Ok(())
+        })();
+        // Click/Release 失败时 Shift 还按着：不补发 Release 的话用户后续
+        // 每个键都变组合键（send_select_all_key 同款补偿）
+        if r.is_err() {
+            let _ = e.key(Key::Shift, Direction::Release);
+        }
+        return r;
     }
     match paste_key {
         "ctrl+shift+v" => {
             // Windows Terminal / WSL / Unix 风格终端的标准粘贴键
-            e.key(Key::Control, Direction::Press)?;
-            e.key(Key::Shift, Direction::Press)?;
-            e.key(Key::Unicode('v'), Direction::Click)?;
-            e.key(Key::Shift, Direction::Release)?;
-            e.key(Key::Control, Direction::Release)?;
+            let r = (|| -> Result<()> {
+                e.key(Key::Control, Direction::Press)?;
+                e.key(Key::Shift, Direction::Press)?;
+                e.key(Key::Unicode('v'), Direction::Click)?;
+                e.key(Key::Shift, Direction::Release)?;
+                e.key(Key::Control, Direction::Release)?;
+                Ok(())
+            })();
+            // 任一步失败都要把两个修饰键都抬起来：序列中途回传错误会
+            // 让 Ctrl/Shift 永远保持按下，用户此后每个键都变组合键；
+            // 多抬一个未按下的修饰键是无害空操作，漏抬一个才是事故
+            if r.is_err() {
+                let _ = e.key(Key::Shift, Direction::Release);
+                let _ = e.key(Key::Control, Direction::Release);
+            }
+            r
         }
         _ => {
             #[cfg(target_os = "macos")]
             let modifier = Key::Meta;
             #[cfg(not(target_os = "macos"))]
             let modifier = Key::Control;
-            e.key(modifier, Direction::Press)?;
-            e.key(Key::Unicode('v'), Direction::Click)?;
-            e.key(modifier, Direction::Release)?;
+            let r = (|| -> Result<()> {
+                e.key(modifier, Direction::Press)?;
+                e.key(Key::Unicode('v'), Direction::Click)?;
+                e.key(modifier, Direction::Release)?;
+                Ok(())
+            })();
+            // 同上：失败分支补发 Release 再返回错误（send_select_all_key 先例）
+            if r.is_err() {
+                let _ = e.key(modifier, Direction::Release);
+            }
+            r
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

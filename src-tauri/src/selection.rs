@@ -404,10 +404,18 @@ fn send_copy_key() -> anyhow::Result<()> {
     let modifier = Key::Meta;
     #[cfg(not(target_os = "macos"))]
     let modifier = Key::Control;
-    e.key(modifier, Direction::Press)?;
-    e.key(Key::Unicode('c'), Direction::Click)?;
-    e.key(modifier, Direction::Release)?;
-    Ok(())
+    let r = (|| -> anyhow::Result<()> {
+        e.key(modifier, Direction::Press)?;
+        e.key(Key::Unicode('c'), Direction::Click)?;
+        e.key(modifier, Direction::Release)?;
+        Ok(())
+    })();
+    // Click/Release 失败时 Ctrl/⌘ 还按着：不补发 Release 的话用户后续
+    // 每个键都变组合键（inject::send_paste_key 同款补偿）
+    if r.is_err() {
+        let _ = e.key(modifier, Direction::Release);
+    }
+    r
 }
 
 /* ---------- 文本规整 ---------- */

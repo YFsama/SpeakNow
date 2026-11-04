@@ -119,6 +119,11 @@ async fn save_config(app: AppHandle, config: config::Config) -> Result<String, S
         .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .unwrap_or_default();
+    // mem.api_token 的唯一权威写者是后端（mem_gen_token 直接改 Ctx+落盘，
+    // 不经过前端状态）：前端快照里的 token 可能是旧值，落盘前用 Ctx 现值
+    // 回填，否则这次保存会把刚生成的 API Key 静默写丢（外接显示直接失联）
+    let mut config = config;
+    config.mem.api_token = old.mem.api_token.clone();
     if let Err(e) = config::save(&app, &config) {
         trace_save(&app, &format!("写文件失败 {e:#}"));
         return Err(e.to_string());
@@ -734,6 +739,15 @@ async fn test_asr(
         };
     }
     let samples = vec![0i16; 8000];
+    // 本地优先模式下云端连通性测试一并停用（mimo 恒为云；http 档放行本机
+    // 自建 whisper.cpp 服务——与听写链路 resolved_llm 的口径一致）
+    let local_only = crate::translate::current_config(&app).general.local_only;
+    if local_only && config.provider != "local" {
+        let cloud = config.provider == "mimo" || !crate::http::is_local_base(&config.base_url);
+        if cloud {
+            return Err("本地优先模式已开启：云端识别接口已停用（可在「通用」页关闭该模式）".into());
+        }
+    }
     match asr::transcribe(&app, &config, &samples).await {
         Ok(t) => Ok(format!(
             "连接成功 ✓ 服务返回：{}",
@@ -743,15 +757,21 @@ async fn test_asr(
     }
 }
 
-/// 内置本地模型列表与下载状态（Whisper 系列 + Qwen3-ASR + 本地翻译模型 + PP-OCR 质量档）
+/// 内置本地模型列表与下载状态（Whisper 系列 + Qwen3-ASR + 本地翻译模型 + PP-OCR 质量档）。
+/// 状态判定要遍历模型目录逐个 stat + 读 backend.txt（数十次文件系统调用），
+/// 挪到阻塞线程池，不占主线程（async 命令跑在 tokio 池，generate_handler 同名注册）
 #[tauri::command]
-fn builtin_models(app: AppHandle) -> Vec<local_whisper::LocalModelStatus> {
-    let mut v = local_whisper::status(&app);
-    v.push(qwen_asr::status(&app));
-    v.extend(local_llm::status(&app));
-    #[cfg(target_os = "windows")]
-    v.push(ocr::ppocr_status(&app));
-    v
+async fn builtin_models(app: AppHandle) -> Vec<local_whisper::LocalModelStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut v = local_whisper::status(&app);
+        v.push(qwen_asr::status(&app));
+        v.extend(local_llm::status(&app));
+        #[cfg(target_os = "windows")]
+        v.push(ocr::ppocr_status(&app));
+        v
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// 下载内置本地模型（进度经 sn-model-progress 事件推送）
@@ -775,45 +795,61 @@ async fn download_builtin(app: AppHandle, id: String, mirror: String) -> Result<
     }
 }
 
-/// 删除已下载的本地模型（释放磁盘空间）
+/// 删除已下载的本地模型（释放磁盘空间）。停引擎（含 kill_leftover 的全
+/// 进程扫描）+ remove_dir_all 数 GB 模型目录全是重 IO/系统调用，可达秒级
+/// ——挪到阻塞线程池，不占主线程（async 命令同名注册，前端调用不变）
 #[tauri::command]
-fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
-    let known = local_whisper::LOCAL_MODELS.iter().any(|d| d.id == id)
-        || id == qwen_asr::MODEL_ID
-        || local_llm::find(&id).is_some();
-    #[cfg(target_os = "windows")]
-    let known = known || id == ocr::PPOCR_ID;
-    if !known {
-        return Err("未知模型".into());
-    }
-    if id == qwen_asr::MODEL_ID {
-        // 服务进程占着 gguf 文件，必须先停
-        qwen_asr::shutdown(&app);
-    }
-    if local_llm::find(&id).is_some() {
-        local_llm::shutdown(&app);
-    }
-    #[cfg(target_os = "windows")]
-    if id == ocr::PPOCR_ID {
-        ocr::ppocr_unload();
-    }
-    let root = local_whisper::models_root(&app).map_err(|e| e.to_string())?;
-    let dir = root.join(&id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
-    }
-    // 模型集变化：asr 的本地引擎解析缓存须失效（否则继续选用已删除的模型）
-    bump_models_gen();
-    let _ = app.emit("sn-models-changed", ());
-    Ok(())
+async fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let known = local_whisper::LOCAL_MODELS.iter().any(|d| d.id == id)
+            || id == qwen_asr::MODEL_ID
+            || local_llm::find(&id).is_some();
+        #[cfg(target_os = "windows")]
+        let known = known || id == ocr::PPOCR_ID;
+        if !known {
+            return Err("未知模型".into());
+        }
+        if id == qwen_asr::MODEL_ID {
+            // 服务进程占着 gguf 文件，必须先停
+            qwen_asr::shutdown(&app);
+        }
+        if local_llm::find(&id).is_some() {
+            local_llm::shutdown(&app);
+        }
+        #[cfg(target_os = "windows")]
+        if id == ocr::PPOCR_ID {
+            ocr::ppocr_unload();
+        }
+        let root = local_whisper::models_root(&app).map_err(|e| e.to_string())?;
+        let dir = root.join(&id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
+        }
+        // 模型集变化：asr 的本地引擎解析缓存须失效（否则继续选用已删除的模型）
+        bump_models_gen();
+        let _ = app.emit("sn-models-changed", ());
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 获取 OpenAI 兼容接口（Ollama / LM Studio / 云端）的模型列表
 #[tauri::command]
-async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+async fn list_models(
+    app: AppHandle,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("未配置接口地址".into());
+    }
+    // 本地优先模式下只放行本机端点的模型列表拉取（Ollama/LM Studio 等）
+    if crate::translate::current_config(&app).general.local_only
+        && !crate::http::is_local_base(base)
+    {
+        return Err("本地优先模式已开启：云端接口已停用（可在「通用」页关闭该模式）".into());
     }
     // 共享客户端（连接复用）；超时按请求覆盖
     let client = &*crate::http::CLIENT;
@@ -851,10 +887,17 @@ async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, S
 /// 侧通 AI 优化接口（providers：凭据组，providerId 命中时以凭据组为准）
 #[tauri::command]
 async fn test_llm(
+    app: AppHandle,
     config: config::LlmConfig,
     providers: Vec<config::ProviderProfile>,
 ) -> Result<String, String> {
     let config = config.resolved(&providers);
+    // 本地优先模式下云端 LLM 连通性测试停用；本机端点（Ollama 等）照常可测
+    if crate::translate::current_config(&app).general.local_only
+        && !crate::http::is_local_base(&config.base_url)
+    {
+        return Err("本地优先模式已开启：云端接口已停用（可在「通用」页关闭该模式）".into());
+    }
     match llm::optimize(&config, "这是一句用于侧连通性测试的语音转写文本，请原样纠错后输出。").await {
         Ok(t) => Ok(format!("连接成功 ✓ 模型返回：{t}")),
         Err(e) => Err(format!("{e:#}")),
@@ -862,8 +905,12 @@ async fn test_llm(
 }
 
 #[tauri::command]
-fn get_history(app: AppHandle) -> Vec<history::HistoryItem> {
-    history::load(&app)
+async fn get_history(app: AppHandle) -> Vec<history::HistoryItem> {
+    // history::load 是读盘 + 整库 JSON 解析：历史积累到保留上限（数百条）时
+    // 毫秒~几十毫秒级，同步命令跑在主线程会卡 UI，挪到阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || history::load(&app))
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -1082,15 +1129,53 @@ fn overlay_pin(app: AppHandle, pinned: bool) {
         .store(pinned, Ordering::SeqCst);
 }
 
+/// export_text 的文件名校验（纯函数，便于单测）：只放行「纯文件名 + 白名单
+/// 后缀」。导出目标固定在配置目录内，前端传来的 filename 若含路径分隔符 /
+/// ".." / 绝对路径前缀，join 会逃出配置目录写任意文件（路径穿越）
+fn valid_export_filename(name: &str) -> bool {
+    use std::path::{Component, Path};
+    // 「恰好一个 Normal 分量」= 纯文件名：路径分隔符会拆出多个分量，绝对
+    // 路径带盘符/根分量，"."/".." 是专用分量——全部拦下；"a..b.txt" 这类
+    // 含连续句点的合法文件名仍是单个 Normal 分量，不受误伤
+    let mut comps = Path::new(name).components();
+    if !matches!(comps.next(), Some(Component::Normal(_))) || comps.next().is_some() {
+        return false;
+    }
+    // 后缀白名单：导出的都是文本产物（历史/记忆/配置备份），不认可的
+    // 后缀一律拒绝，filename 被篡改时也写不出可被利用的文件类型
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase()),
+        Some(ref ext) if matches!(ext.as_str(), "txt" | "md" | "json")
+    )
+}
+
 /// 通用文本导出：写入配置目录下指定文件，返回完整路径
 #[tauri::command]
 fn export_text(app: AppHandle, filename: String, content: String) -> Result<String, String> {
+    if !valid_export_filename(&filename) {
+        return Err("文件名不合法：仅支持配置目录内的 .txt / .md / .json 纯文件名".into());
+    }
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("无法定位配置目录: {e}"))?;
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(filename);
+    let path = dir.join(&filename);
+    // 第二道闸：join 后断言最终落点仍在配置目录内。文件名校验已挡住分隔符
+    // 与 ".."，这层 canonicalize 断言防的是校验逻辑被绕过/改坏时的越界写。
+    // 目标文件尚不存在时 canonicalize 会失败，改用「父目录规范路径 + 文件名」
+    // 判定；两个分支都带 \\?\ 前缀（canonicalize 的 Windows 语义），可比
+    let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let canon_target = path.canonicalize().unwrap_or_else(|_| {
+        // 不存在：以父目录规范路径为基底重建（filename 已验过纯文件名）
+        canon_dir.join(&filename)
+    });
+    if !canon_target.starts_with(&canon_dir) {
+        return Err("导出路径越界：目标必须位于配置目录内".into());
+    }
     std::fs::write(&path, content).map_err(|e| format!("写入失败: {e}"))?;
     Ok(path.display().to_string())
 }
@@ -1098,16 +1183,21 @@ fn export_text(app: AppHandle, filename: String, content: String) -> Result<Stri
 /// 配置导入：读取用户在文件对话框里选中的备份 JSON。只放行 .json 且限
 /// 5MB——配置全量不过几十 KB，误选的大文件不该整串灌进前端状态
 #[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
-    let p = std::path::PathBuf::from(&path);
-    if p.extension().and_then(|x| x.to_str()) != Some("json") {
-        return Err("请选择 .json 备份文件".into());
-    }
-    let meta = std::fs::metadata(&p).map_err(|e| format!("读取失败：{e}"))?;
-    if meta.len() > 5 * 1024 * 1024 {
-        return Err("文件过大（>5MB），不像 SpeakNow 配置备份".into());
-    }
-    std::fs::read_to_string(&p).map_err(|e| format!("读取失败：{e}"))
+async fn read_text_file(path: String) -> Result<String, String> {
+    // metadata + 5MB 限内整读是文件 IO：挪到阻塞线程池，不占主线程
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = std::path::PathBuf::from(&path);
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            return Err("请选择 .json 备份文件".into());
+        }
+        let meta = std::fs::metadata(&p).map_err(|e| format!("读取失败：{e}"))?;
+        if meta.len() > 5 * 1024 * 1024 {
+            return Err("文件过大（>5MB），不像 SpeakNow 配置备份".into());
+        }
+        std::fs::read_to_string(&p).map_err(|e| format!("读取失败：{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 「另存为」导出：写入对话框选定的路径（同样只认 .json）
@@ -1505,15 +1595,53 @@ pub fn run() {
                 // 就绪态更新：退出时拉起安装器（内部单飞，与手动安装互斥；
                 // 安装器 detached 延迟 2s，先让下面的退出收尾走完防文件占用）
                 update::install_on_exit_if_ready(app);
-                qwen_asr::shutdown(app);
-                local_llm::shutdown(app);
+                // shutdown_fast 不等 SPAWN_LOCK：冷启动期（ensure_server 持锁
+                // 最长 240s）退出的等锁会让窗口已关、进程僵留
+                qwen_asr::shutdown_fast(app);
+                local_llm::shutdown_fast(app);
             }
         });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_private_host;
+    use super::{is_private_host, valid_export_filename};
+
+    #[test]
+    fn export_filename_rejects_traversal_and_absolute() {
+        // 路径穿越三件套：目录上跳、子路径、当前目录别名
+        assert!(!valid_export_filename("../config.json"));
+        assert!(!valid_export_filename("a/b.txt"));
+        assert!(!valid_export_filename(".."));
+        assert!(!valid_export_filename("."));
+        // 绝对路径（unix 根分量；跨平台一致）
+        assert!(!valid_export_filename("/etc/passwd.txt"));
+        // 空串 / 无后缀 / 白名单外后缀
+        assert!(!valid_export_filename(""));
+        assert!(!valid_export_filename("noext"));
+        assert!(!valid_export_filename("evil.exe"));
+    }
+
+    #[test]
+    fn export_filename_rejects_windows_absolute_and_backslash() {
+        // 反斜杠/盘符只在 Windows 是路径语义：单独用例断言，macOS CI 不受
+        // 「反斜杠是合法文件名字符」的平台差异影响
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!valid_export_filename("C:\\Users\\evil.txt"));
+            assert!(!valid_export_filename("..\\config.json"));
+            assert!(!valid_export_filename("a\\b.txt"));
+        }
+    }
+
+    #[test]
+    fn export_filename_accepts_plain_whitelisted_names() {
+        assert!(valid_export_filename("history-export.txt"));
+        assert!(valid_export_filename("mem.md"));
+        assert!(valid_export_filename("config-backup.json"));
+        assert!(valid_export_filename("Report.TXT"), "后缀大小写不敏感");
+        assert!(valid_export_filename("a..b.txt"), "连续句点是合法文件名，不误伤");
+    }
 
     #[test]
     fn private_host_accepts_loopback_and_private_ranges() {

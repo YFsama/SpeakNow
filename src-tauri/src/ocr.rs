@@ -348,6 +348,11 @@ fn recognize_region(
             "cloud" => {
                 let llm = cfg.resolved_llm();
                 if !llm.enabled || llm.base_url.trim().is_empty() {
+                    // resolved_llm 在本地优先模式下会把云端端点置为停用——
+                    // 此时提示用户去配置页只会一头雾水，指明真正原因
+                    if cfg.general.local_only {
+                        anyhow::bail!("本地优先模式已开启：云端 OCR 已停用，请换用系统或 PP-OCR 档（可在「通用」页关闭该模式）");
+                    }
                     anyhow::bail!("云端 OCR 复用「AI 优化」接口：请先在「AI 优化」页启用并配置（GLM-4.6V-Flash 免费）");
                 }
                 cloud_ocr_region(&llm, x, y, w, h)
@@ -904,8 +909,10 @@ pub async fn ppocr_download(app: &AppHandle) -> anyhow::Result<()> {
         }
         tokio::fs::rename(&part, &dest).await?;
     }
-    // 模型文件集变化：丢弃旧引擎实例（下次识别按新文件重建）
-    ppocr_unload();
+    // 模型文件集变化：丢弃旧引擎实例（下次识别按新文件重建）。
+    // 识别全程持 PPOCR_ENGINE（秒级），async 上下文直接 lock 会把 tokio
+    // worker 卡满整个识别期——挪到阻塞线程池再卸载
+    let _ = tauri::async_runtime::spawn_blocking(ppocr_unload).await;
     crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     Ok(())
@@ -922,12 +929,15 @@ pub fn ppocr_unload() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
-/// 惰性构建引擎（首次识别时加载三模型，此后常驻）
+/// 惰性构建引擎（首次识别时加载三模型，此后常驻）。调用方必须已持有
+/// PPOCR_ENGINE 锁——构建与取引用要在同一临界区：旧写法先 ensure 释放锁、
+/// 截屏后重锁取引用，两次加锁之间并发的 ppocr_unload（删除/重下模型触发）
+/// 会把引擎拆成 None，重锁后的 expect 直接把进程 panic 掉
 #[cfg(target_os = "windows")]
-fn ppocr_ensure_engine(app: &AppHandle) -> anyhow::Result<()> {
-    let mut guard = PPOCR_ENGINE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn ppocr_ensure_engine_locked(
+    app: &AppHandle,
+    guard: &mut Option<oar_ocr::oarocr::OAROCR>,
+) -> anyhow::Result<()> {
     if guard.is_some() {
         return Ok(());
     }
@@ -946,10 +956,27 @@ fn ppocr_ensure_engine(app: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 质量档识别：截屏 → RgbImage → oar-ocr（det+rec）→ 按坐标排序的行文本
+/// 从锁内守卫取引擎引用：无实例时返回可读错误而非 panic——单临界区改造
+/// 后正常流程不可能走到 None 分支，这层 ok_or 是给未来代码改动留的安全网
+/// （生产禁 expect，且引擎被卸载对用户是可重试的瞬时态而非崩溃态）
+#[cfg(target_os = "windows")]
+fn ppocr_engine_ref(
+    guard: &Option<oar_ocr::oarocr::OAROCR>,
+) -> anyhow::Result<&oar_ocr::oarocr::OAROCR> {
+    guard.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("PP-OCR 引擎已被卸载（模型可能在识别期间被删除或更新），请重试")
+    })
+}
+
+/// 质量档识别：截屏 → RgbImage → oar-ocr（det+rec）→ 按坐标排序的行文本。
+/// 引擎构建、截屏、推理全程单次持锁：与 ppocr_unload 严格互斥，用户删模型
+/// 的卸载请求会排队等待本次识别完成，识别过程也不会遇到引擎被拆
 #[cfg(target_os = "windows")]
 fn ppocr_region(app: &AppHandle, x: i32, y: i32, w: i32, h: i32) -> anyhow::Result<Vec<String>> {
-    ppocr_ensure_engine(app)?;
+    let mut guard = PPOCR_ENGINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ppocr_ensure_engine_locked(app, &mut guard)?;
     // 质量档自带 max_side_len 缩放，按原始物理像素截取即可
     let frame = capture_region(x, y, w, h, None)?;
     let img = image::RgbImage::from_fn(frame.width, frame.height, |px, py| {
@@ -957,10 +984,7 @@ fn ppocr_region(app: &AppHandle, x: i32, y: i32, w: i32, h: i32) -> anyhow::Resu
         // BGRA → RGB
         image::Rgb([frame.pixels[i + 2], frame.pixels[i + 1], frame.pixels[i]])
     });
-    let guard = PPOCR_ENGINE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let engine = guard.as_ref().expect("引擎已在上文构建");
+    let engine = ppocr_engine_ref(&guard)?;
     let results = engine
         .predict(vec![img])
         .map_err(|e| anyhow::anyhow!("PP-OCR 识别失败: {e}"))?;
@@ -1023,6 +1047,17 @@ mod tests {
             strip_cjk_spaces("中文 and English 混排"),
             "中文 and English 混排"
         );
+    }
+
+    /// 引擎缺失必须是可读错误而不是 panic：旧实现持锁间隙被 ppocr_unload
+    /// 拆掉引擎后 expect 直接崩进程（生产禁 expect 的原因之一）
+    #[test]
+    fn missing_engine_is_error_not_panic() {
+        let none: Option<oar_ocr::oarocr::OAROCR> = None;
+        let err = super::ppocr_engine_ref(&none).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("已被卸载"), "错误文案应说明引擎被卸载可重试：{msg}");
+        assert!(msg.contains("重试"), "{msg}");
     }
 
     /// 实机冒烟：GDI 截屏 → Buffer 互操作 → Windows.Media.Ocr 全链路。

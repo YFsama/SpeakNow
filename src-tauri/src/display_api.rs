@@ -318,6 +318,35 @@ const UNAUTHORIZED_KEY_MSG: &str = "unauthorized: missing or invalid X-SN-API-Ke
 const UNAUTHORIZED_NO_TOKEN_MSG: &str = "unauthorized: no API token generated; \
 generate one in SpeakNow settings (Memory page), then send it as X-SN-API-Key";
 
+/// 从 Host 头提取主机名（去端口、剥 IPv6 方括号）：
+/// "127.0.0.1:8866"→"127.0.0.1"、"[::1]:8866"→"::1"、裸 "::1" 原样。
+/// 旧写法 `split(':').next()` 对 "[::1]:8866" 会截出 "["——合法的 IPv6
+/// 回环请求被误判成远程（fail-closed 误伤可用性）。残缺/陌生形态原样
+/// 返回，交由调用方白名单拒绝，保持 fail-closed
+fn host_header_name(h: &str) -> &str {
+    let h = h.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        // 规范 IPv6 形态：主机名在 [ ] 内，端口（若有）跟在 ] 之后一并丢弃
+        return match rest.find(']') {
+            Some(end) => &rest[..end],
+            // 残缺方括号：原样返回 → 白名单不匹配 → 走令牌校验
+            None => h,
+        };
+    }
+    // 单个冒号且右侧全是数字才是 host:port；含多个冒号的是裸 IPv6 字面量
+    // （HTTP 规范里裸 IPv6 不带端口），必须整体保留
+    if let Some((host, port)) = h.rsplit_once(':') {
+        if !host.is_empty()
+            && !port.is_empty()
+            && !host.contains(':')
+            && port.bytes().all(|b| b.is_ascii_digit())
+        {
+            return host;
+        }
+    }
+    h
+}
+
 /// /mem/* 鉴权判定（两个 handler 顶部调用）。
 /// Ok = 放行；Err(文案) = 401 纯文本拒绝。
 ///
@@ -337,11 +366,11 @@ fn mem_authorized(
         match headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) {
             None => return Ok(()),
             Some(h) => {
-                // "127.0.0.1:8866"→"127.0.0.1"、"[::1]:8866"→"[::1]"；
-                // 裸 "::1"（无端口）单独比对
-                let host = h.split(':').next().unwrap_or("");
-                if matches!(host, "127.0.0.1" | "localhost" | "[::1]") || h == "::1" {
-                    return Ok(());
+                // 提取主机名后比对回环白名单（IPv6 归一化为 "::1"）；残缺或
+                // 陌生形态提不出回环名 → 落到令牌校验（fail-closed）
+                match host_header_name(h) {
+                    "127.0.0.1" | "localhost" | "::1" => return Ok(()),
+                    _ => {}
                 }
             }
         }
@@ -421,12 +450,12 @@ async fn mem_search(
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(10)
         .clamp(1, 50);
-    // mem_recall / mem_list 都是同步文件 IO（读 mem.json 反序列化），转
-    // 阻塞线程池：axum 与 sn-* 事件共享 tauri::async_runtime 的 worker，
-    // 大库检索不能占住它们
+    // mem_recall / mem_list 的同步实现体是文件 IO（读 mem.json 反序列化），
+    // 转阻塞线程池：axum 与 sn-* 事件共享 tauri::async_runtime 的 worker，
+    // 大库检索不能占住它们（命令层已改成 async 命令，这里须用 _impl 版本）
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let items = crate::mem::mem_recall(app.clone(), q, k);
-        let total = crate::mem::mem_list(app, String::new(), None, 0).total;
+        let items = crate::mem::mem_recall_impl(&app, &q, k);
+        let total = crate::mem::mem_list_impl(&app, "", None, 0).total;
         serde_json::to_string(&serde_json::json!({ "items": items, "total": total }))
     })
     .await;
@@ -624,4 +653,35 @@ fn mem_add_bad_request(msg: &str) -> Response {
 /// /mem/* 统一错误出口：500 + 纯文本
 fn mem_error(msg: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_header_name;
+
+    /// Host 提取的回环白名单口径：IPv6 带方括号/裸形态都要归一化为 "::1"，
+    /// 否则合法的 IPv6 回环请求会被误判成远程（落到令牌校验）
+    #[test]
+    fn host_name_strips_port_and_normalizes_ipv6() {
+        assert_eq!(host_header_name("127.0.0.1:8866"), "127.0.0.1");
+        assert_eq!(host_header_name("localhost:8866"), "localhost");
+        assert_eq!(host_header_name("[::1]:8866"), "::1", "旧 split(':') 写法这里截出 \"[\"");
+        assert_eq!(host_header_name("[::1]"), "::1");
+        assert_eq!(host_header_name("::1"), "::1", "裸 IPv6 字面量整体保留");
+        assert_eq!(host_header_name("127.0.0.1"), "127.0.0.1", "无端口原样");
+    }
+
+    /// 非回环与畸形形态：提取结果不等于白名单成员 → 调用方走令牌校验
+    #[test]
+    fn host_name_non_loopback_and_malformed_fail_closed() {
+        assert_eq!(host_header_name("evil.com:8866"), "evil.com");
+        assert_eq!(host_header_name("[::1"), "[::1", "残缺方括号原样返回");
+        assert_eq!(
+            host_header_name("::1:8866"),
+            "::1:8866",
+            "裸 IPv6 带端口是非法形态，不拆端口（整体保留 → 白名单不匹配）"
+        );
+        // host:port 的 port 非纯数字时不得误拆（拆出 "::1:8866" 之类反被判回环）
+        assert_eq!(host_header_name("a:b"), "a:b");
+    }
 }
