@@ -358,6 +358,10 @@ export default function App() {
   // dev StrictMode 双挂载会把下面的启动检查跑两次（两条 toast、两次请求）：
   // 仅对这一副作用防重，effect 其余初始化保持原语义（挂载-清理-再挂载）
   const updateCheckedRef = useRef(false);
+  /* 首屏配置加载失败（getConfig reject）：骨架会永久停留，转为可重试的
+     错误卡；reloadKey 递增后重启整个挂载 effect（listen 有清理，可安全重跑） */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   /* 记忆徽标计数：只取 total（limit=1 不拉正文），与历史徽章同一交互语言。
      后端采集/删除/清空都广播 sn-mem-changed，监听刷新保持侧栏数字实时 */
@@ -384,26 +388,40 @@ export default function App() {
   useEffect(() => {
     const updateGuarded = updateCheckedRef.current;
     updateCheckedRef.current = true;
-    getConfig().then((c) => {
-      setCfg(c);
-      savedRef.current = JSON.stringify(c);
-      // 启动自动检查更新（可在关于页关闭）：只提示不下载安装；
-      // 已「跳过此版本」的不再打扰。失败静默——网络受限不该开屏报错
-      if (!updateGuarded && c.general.autoCheckUpdate !== false) {
-        checkUpdate()
-          .then((r) => {
-            if (r.updateAvailable && r.latest !== c.general.skipVersion) {
-              setUpdateInfo(r);
-              setToast(`发现新版本 v${r.latest}，前往「关于」页更新`, 'info');
-            }
-          })
-          .catch(() => {});
-      }
-    });
-    listDevices().then(setDevices);
-    appVersion().then(setVersion);
-    getHistory().then(setHistory);
-    builtinModels().then(setLocalModels);
+    getConfig()
+      .then((c) => {
+        setCfg(c);
+        savedRef.current = JSON.stringify(c);
+        // 启动自动检查更新（可在关于页关闭）：只提示不下载安装；
+        // 已「跳过此版本」的不再打扰。失败静默——网络受限不该开屏报错
+        if (!updateGuarded && c.general.autoCheckUpdate !== false) {
+          checkUpdate()
+            .then((r) => {
+              if (r.updateAvailable && r.latest !== c.general.skipVersion) {
+                setUpdateInfo(r);
+                setToast(`发现新版本 v${r.latest}，前往「关于」页更新`, 'info');
+              }
+            })
+            .catch(() => {});
+        }
+      })
+      .catch((e) => {
+        // 配置加载失败是致命的（首屏骨架永久停留）：转成可重试的错误卡
+        setLoadError(String(e));
+      });
+    // 其余挂载请求失败只缺对应数据（列表空 / 版本号空），不拦首屏
+    listDevices()
+      .then(setDevices)
+      .catch((e) => console.error('设备列表加载失败', e));
+    appVersion()
+      .then(setVersion)
+      .catch((e) => console.error('版本号读取失败', e));
+    getHistory()
+      .then(setHistory)
+      .catch((e) => console.error('历史记录加载失败', e));
+    builtinModels()
+      .then(setLocalModels)
+      .catch((e) => console.error('本地模型列表加载失败', e));
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const un1 = listen<{ stage: Stage; message: string }>('sn-status', (e) => {
       setStage(e.payload.stage);
@@ -496,7 +514,8 @@ export default function App() {
       un7.then((f) => f());
       un8.then((f) => f());
     };
-  }, []);
+    // reloadKey：错误卡「重试」递增后重启整套挂载初始化
+  }, [reloadKey]);
 
   // 主题/缩放/强调色实时应用（accent 写 <html data-accent>，CSS 预设块随之翻转）
   useEffect(() => {
@@ -627,6 +646,32 @@ export default function App() {
   /* 首屏骨架：配置未就绪时渲染完整侧栏 + 页头占位 + 主区 skeleton 卡，
      降低白屏 / 孤零 Spinner 感；结构与正式外壳一致（含 sticky 页头占位） */
   if (!cfg) {
+    // 配置加载失败：骨架会让用户永远等下去，换成带重试的错误卡
+    if (loadError) {
+      return (
+        <div className="sn-shell-bg flex min-h-screen items-center justify-center p-6">
+          <div className="w-full max-w-md rounded-[20px] border border-red-500/25 bg-[#17171f]/95 p-6 text-center shadow-2xl">
+            <div className="text-[26px] leading-none">⚠️</div>
+            <div className="mt-2.5 text-[15px] font-semibold text-slate-100">
+              配置加载失败
+            </div>
+            <div className="mt-2 break-all text-[12px] leading-5 text-red-300/80">
+              {loadError}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setLoadError(null);
+                setReloadKey((k) => k + 1);
+              }}
+              className="mt-4 rounded-lg border border-white/15 bg-white/[0.06] px-4 py-1.5 text-[12.5px] text-slate-200 transition hover:border-white/30 hover:bg-white/[0.1] active:scale-95"
+            >
+              ↻ 重试
+            </button>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="sn-shell-bg flex min-h-screen">
         <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-[var(--sn-border)] bg-[var(--sn-sidebar)] backdrop-blur-xl">

@@ -599,6 +599,10 @@ export default function Overlay() {
   const zoomRef = useRef(1);
   /* 悬浮窗本地缩放乘子（Ctrl+滚轮调整，与全局 fontScale 相乘） */
   const overlayMultRef = useRef(1);
+  /* 缩放版本号：滚轮 / 配置到达改变了上述两个 ref 后递增，驱动文末的集中
+     resize effect 按当前在场卡片重设窗口——ref 变化不触发渲染，没有这个
+     版本号的话在场卡片的窗口尺寸不会跟着缩放重算（卡片被裁切的根源） */
+  const [zoomVersion, setZoomVersion] = useState(0);
   /* 卡片驻留时长乘子（general.lingerMult，进度条动画与后端 hide 同步缩放） */
   const [lingerMult, setLingerMult] = useState(1);
   /* 双击复制豁免：双击的第二次 mousedown 会先摧毁已有手动选区并自动选中
@@ -611,8 +615,13 @@ export default function Overlay() {
   useEffect(() => {
     transRef.current = trans;
   }, [trans]);
-  const winSize = (w: number, h: number) =>
-    new LogicalSize(Math.round(w * zoomRef.current), Math.round(h * zoomRef.current));
+  /* 窗口逻辑尺寸必须乘「全局缩放 × 悬浮窗本地乘子」：body.zoom 实际生效的
+     是两者乘积（见下方 apply 与 Ctrl+滚轮 handler），只乘全局的话 Ctrl+滚轮
+     放大后的卡片会被窗口边缘裁切 */
+  const winSize = (w: number, h: number) => {
+    const k = (zoomRef.current || 1) * (overlayMultRef.current || 1);
+    return new LogicalSize(Math.round(w * k), Math.round(h * k));
+  };
 
   /* 悬浮窗固定深色玻璃风（不随浅色主题变白）；仅缩放跟随配置 */
   useEffect(() => {
@@ -626,6 +635,8 @@ export default function Overlay() {
     const apply = (c: Config) => {
       zoomRef.current = c.general.fontScale || 1;
       document.body.style.zoom = String(zoomRef.current * overlayMultRef.current);
+      // 缩放乘子变了：让集中 resize effect 按当前在场卡片同步窗口尺寸
+      setZoomVersion((v) => v + 1);
       soundRef.current = c.general.soundFeedback !== false;
       // 后端凭据组迁移会清空内联 llm.baseUrl，须按解析后的生效凭据判断
       // LLM 是否可用，否则迁移后审阅编辑器的「重新优化」会莫名消失
@@ -635,8 +646,11 @@ export default function Overlay() {
       // 卡片驻留乘子：进度条动画与后端 hide_later 同步缩放
       setLingerMult(c.general.lingerMult || 1);
     };
-    getConfig().then(apply);
-    const un = listen('sn-config-changed', () => getConfig().then(apply));
+    // 配置拉取失败只记日志：悬浮窗有自身错误卡机制，这里不引入新 UI
+    getConfig().then(apply).catch((e) => console.error('悬浮窗配置加载失败', e));
+    const un = listen('sn-config-changed', () => {
+      getConfig().then(apply).catch((e) => console.error('悬浮窗配置刷新失败', e));
+    });
     return () => {
       un.then((f) => f());
     };
@@ -652,6 +666,8 @@ export default function Overlay() {
       if (next === cur) return;
       overlayMultRef.current = next;
       document.body.style.zoom = String((zoomRef.current || 1) * next);
+      // 窗口尺寸同步跟上新乘子：body.zoom 已变而逻辑尺寸未变时卡片被裁切
+      setZoomVersion((v) => v + 1);
       try {
         localStorage.setItem('sn:overlayZoom', String(next));
       } catch {
@@ -1037,10 +1053,14 @@ export default function Overlay() {
     const bodyLines = estimateDisplayLines(transBody || '…', 430);
     return Math.min(Math.max(232 + Math.round((srcLines + bodyLines) * 25), WIN_NORMAL.h), 620);
   }, [!!trans, trans?.status, trans?.text, transBody]);
+  /* 翻译卡窗口高度按 25px 档位节流：流式期间 transH 随译文逐字攀升，逐次
+     setSize 会让窗口高频 resize；量化到档位后高度阶梯式增长（档位向上取整，
+     略高不裁切）。不拆组件，节流只在触发条件上做 */
+  const transTier = Math.round(transH / 25);
   useEffect(() => {
     if (!trans) return;
-    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, transH));
-  }, [!!trans, transH]);
+    void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, transTier * 25));
+  }, [!!trans, transTier]);
 
   /* 操作反馈自动消退 */
   useEffect(() => {
@@ -1184,14 +1204,22 @@ export default function Overlay() {
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 300)}px`;
   }, [!!ocrCard, ocrEdit]);
+  /* OCR 卡从有到无（清场 / 被翻译、听写接管）时交还尺寸控制权。跟踪前值只
+     在 true→false 沿触发：原实现把 stage 放进依赖，每次阶段切换都会把窗口
+     重设 320——它在同 commit 里晚于 done 卡的自适应 effect 执行，长文本完成
+     卡的放大高度被打回 320 裁切。trans/stage 经 ref 读最新值，不入依赖 */
+  const ocrShownRef = useRef(false);
   useEffect(() => {
-    if (!ocrCard && !ocrErr) {
-      // 卡片清场（听写/翻译接管）后交还尺寸控制权；翻译卡片在场时由它接管高度
-      if (!trans && stage !== 'review') {
+    const shown = !!ocrCard || !!ocrErr;
+    const was = ocrShownRef.current;
+    ocrShownRef.current = shown;
+    if (was && !shown) {
+      // 翻译卡在场时由它接管高度；审阅窗自有固定尺寸
+      if (!transRef.current && stageRef.current !== 'review') {
         void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
       }
     }
-  }, [!!ocrCard, !!ocrErr, !!trans, stage]);
+  }, [!!ocrCard, !!ocrErr]);
 
   useEffect(() => {
     if (!ocrCopied) return;
@@ -1338,6 +1366,26 @@ export default function Overlay() {
     if (!mem) return;
     void getCurrentWindow().setSize(winSize(WIN_NORMAL.w, memH));
   }, [!!mem, memH]);
+
+  /* 缩放变化（Ctrl+滚轮 / 配置 fontScale 到达）后按当前在场卡片重设窗口：
+     各卡的尺寸 effect 依赖各自状态，缩放改的是 ref 不会触发它们重跑，集中
+     在此按渲染互斥优先级（trans > mem > OCR > 审阅 > done > 其余阶段）补
+     一次 setSize，数值与各卡自身 effect 同一套 */
+  useEffect(() => {
+    if (!zoomVersion) return; // 挂载首轮跳过：配置未到达前乘子未定，动了反而错
+    const win = getCurrentWindow();
+    if (trans) void win.setSize(winSize(WIN_NORMAL.w, transTier * 25));
+    else if (mem) void win.setSize(winSize(WIN_NORMAL.w, memH));
+    else if (ocrBusy || ocrCard || ocrErr)
+      void win.setSize(winSize(WIN_NORMAL.w, ocrH));
+    else if (stage === 'review') void win.setSize(winSize(WIN_REVIEW.w, WIN_REVIEW.h));
+    else if (stage === 'done' && result)
+      void win.setSize(
+        winSize(WIN_NORMAL.w, Math.min(Math.max(196 + doneTextH, WIN_NORMAL.h), 560)),
+      );
+    else if (stage !== 'idle') void win.setSize(winSize(WIN_NORMAL.w, WIN_NORMAL.h));
+    // idle：窗口隐藏，无需处理
+  }, [zoomVersion]);
 
   /* 关卡后交还尺寸控制权：无其他卡片接管时还原默认窗口，避免下一次以
      idle 态打开的悬浮内容顶着本卡遗留的放大窗口（与 OCR 卡清场同款守卫） */

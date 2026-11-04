@@ -46,18 +46,20 @@ export function HotkeyTab({ cfg, set }: TabProps) {
   const [regError, setRegError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    hotkeyStatus().then((e) => {
-      if (alive) setRegError(e ?? null);
-    });
-    let un: (() => void) | undefined;
-    void listen<{ error: string | null }>('sn-hotkey-status', (e) => {
+    hotkeyStatus()
+      .then((e) => {
+        if (alive) setRegError(e ?? null);
+      })
+      .catch(() => {
+        /* 状态探测失败保持 null：不误报「注册失败」横幅 */
+      });
+    // 清理经 Promise 注销（un 变量式在卸载早于 resolve 时漏注销，StrictMode 必现）
+    const un = listen<{ error: string | null }>('sn-hotkey-status', (e) => {
       setRegError(e.payload?.error ?? null);
-    }).then((f) => {
-      un = f;
     });
     return () => {
       alive = false;
-      un?.();
+      un.then((f) => f());
     };
   }, []);
 

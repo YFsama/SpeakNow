@@ -1286,8 +1286,8 @@ export function MemGraph({
     const d = dragRef.current;
     dragRef.current = null;
     const s = simRef.current;
-    if (!e.currentTarget.hasPointerCapture(e.pointerId))
-      e.currentTarget.releasePointerCapture(e.pointerId);
+    // pointerup / pointercancel 派发后浏览器会隐式释放指针捕获，无需（也不应）
+    // 在此显式 release——原分支条件写反（无捕获时才 release），留着反成隐患
     e.currentTarget.style.cursor = 'grab';
     if (!d || !s) return;
     if (d.kind === 'node') {

@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import './styles.css';
 
 // 浏览器视觉验证：dev 下带 ?mock=1 时先装上 Tauri API mock 再渲染。
@@ -21,6 +22,9 @@ try {
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    {/* 渲染崩溃兜底：设置窗白屏是不可自愈的终点，收敛成可重试的降级卡 */}
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 );

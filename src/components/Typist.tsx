@@ -72,23 +72,31 @@ export default function Typist() {
         setLastDone(e.payload);
       }),
     ];
-    getConfig().then((cfg) => {
-      if (!alive) return;
-      applyAppearance(cfg.general.theme, cfg.general.fontScale, cfg.general.accent);
-      setPref(cfg.typist);
-      setOnTop(!!cfg.typist.alwaysOnTop);
-    });
+    // 挂载请求失败只记日志：窗口有 startErr / lastDone 等既有错误位，
+    // 不为加载失败引入新 UI（对应数据缺省即功能降级，窗口仍可用）
+    getConfig()
+      .then((cfg) => {
+        if (!alive) return;
+        applyAppearance(cfg.general.theme, cfg.general.fontScale, cfg.general.accent);
+        setPref(cfg.typist);
+        setOnTop(!!cfg.typist.alwaysOnTop);
+      })
+      .catch((e) => console.error('Typist 配置加载失败', e));
     // 草稿恢复：只在输入框仍为空时填入，不覆盖用户抢先输入的内容
-    typistReadDraft().then((d) => {
-      if (alive && d) setText((t) => t || d);
-    });
-    typingStatus().then((s) => {
-      if (alive && s.active) {
-        setActive(true);
-        setProgress({ done: s.done, total: s.total });
-        setTarget(s.target || '');
-      }
-    });
+    typistReadDraft()
+      .then((d) => {
+        if (alive && d) setText((t) => t || d);
+      })
+      .catch((e) => console.error('Typist 草稿读取失败', e));
+    typingStatus()
+      .then((s) => {
+        if (alive && s.active) {
+          setActive(true);
+          setProgress({ done: s.done, total: s.total });
+          setTarget(s.target || '');
+        }
+      })
+      .catch((e) => console.error('Typist 输入状态读取失败', e));
     return () => {
       alive = false;
       for (const p of unlisteners) p.then((f) => f());

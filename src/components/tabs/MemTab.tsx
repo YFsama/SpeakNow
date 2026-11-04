@@ -94,6 +94,23 @@ function dayLabel(ts: number, now: Date): string {
 /** 正则元字符转义（搜索词按字面匹配）——与历史页同款 */
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/* 搜索词表 → 分割正则的模块级缓存：列表里每个条目每次渲染都要一份同样的
+   正则（几十条 × 勾选/展开等高频重渲染），逐条 new RegExp 是纯浪费；split
+   不依赖正则的 lastIndex，可跨条目安全共享。key 用 NUL 分隔——搜索词本身
+ * 可能含 '|'，直接 join('|') 会碰撞出错误的词表 */
+const HL_RE_CACHE = new Map<string, RegExp>();
+function hlSplitRe(terms: string[]): RegExp {
+  const key = terms.join('\u0000');
+  let re = HL_RE_CACHE.get(key);
+  if (!re) {
+    re = new RegExp(`(${terms.map(escapeRe).join('|')})`, 'gi');
+    // 长会话下词表组合会累积，超过阈值整体清空重建（缓存只是省工，无正确性依赖）
+    if (HL_RE_CACHE.size > 64) HL_RE_CACHE.clear();
+    HL_RE_CACHE.set(key, re);
+  }
+  return re;
+}
+
 /** 与后端 llm::llm_ready 同口径：enabled 且地址非空，且（Key 非空或本机端点免 Key）。
  *  只看 enabled 会漏报「开关开了但凭据没填」——那正是蒸馏静默跳过的场景 */
 function llmReady(c: TabProps['cfg']): boolean {
@@ -111,7 +128,7 @@ function llmReady(c: TabProps['cfg']): boolean {
 function Highlight({ text, q }: { text: string; q: string }) {
   const terms = q.trim().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return <>{text}</>;
-  const parts = text.split(new RegExp(`(${terms.map(escapeRe).join('|')})`, 'gi'));
+  const parts = text.split(hlSplitRe(terms));
   return (
     <>
       {parts.map((p, i) =>

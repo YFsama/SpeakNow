@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button, Field, Section, Segmented, Select, TextArea, Toggle } from '../Controls';
 import { isElevated, isMac, restartElevated } from '../../api';
 import type { Config, TabProps } from '../../types';
@@ -14,6 +14,43 @@ export function OutputTab({ cfg, set }: TabProps) {
       .then(setElevated)
       .catch(() => setElevated(null));
   }, []);
+
+  /* 回车黑名单草稿：onChange 即时 split+trim+filter 会吞掉行尾空格与末行的
+     回车（打一半就「回弹」）。草稿保存原始文本，300ms 防抖先提交清洗结果、
+     失焦再回落归一化显示；外部配置变化时若未在编辑则丢弃草稿跟随外部值 */
+  const [blDraft, setBlDraft] = useState<string | null>(null);
+  const blFocusedRef = useRef(false);
+  const blText = blDraft ?? cfg.output.autoSubmitBlocklist.join('\n');
+  const commitBl = () => {
+    if (blDraft === null) return;
+    const cleaned = blDraft
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    setBlDraft(null);
+    // 与当前配置同值不写：避免无谓 dirty 触发自动保存
+    if (cleaned.join('\n') !== cfg.output.autoSubmitBlocklist.join('\n')) {
+      set('output', { autoSubmitBlocklist: cleaned });
+    }
+  };
+  useEffect(() => {
+    if (blDraft === null) return;
+    // 防抖只提交不清草稿：textarea 仍显示原始文本，正在打字不回弹
+    const t = setTimeout(() => {
+      const cleaned = blDraft
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (cleaned.join('\n') !== cfg.output.autoSubmitBlocklist.join('\n')) {
+        set('output', { autoSubmitBlocklist: cleaned });
+      }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [blDraft, cfg.output.autoSubmitBlocklist, set]);
+  useEffect(() => {
+    // 外部配置变化：编辑中（聚焦）保留草稿，否则丢弃跟随外部值
+    if (blDraft !== null && !blFocusedRef.current) setBlDraft(null);
+  }, [cfg.output.autoSubmitBlocklist]);
 
   return (
     <Section
@@ -126,19 +163,24 @@ export function OutputTab({ cfg, set }: TabProps) {
           label="回车黑名单（每行一个关键字）"
           hint="前台进程名包含关键字时只输入文本、不模拟回车——微信 / QQ 等聊天工具里回车会把还没改完的话直接发送。已预置常见 IM，可增删"
         >
-          <TextArea
-            rows={3}
-            value={cfg.output.autoSubmitBlocklist.join('\n')}
-            onChange={(v) =>
-              set('output', {
-                autoSubmitBlocklist: v
-                  .split('\n')
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              })
-            }
-            placeholder={'wechat\nqq\ntelegram'}
-          />
+          {/* TextArea 不透传 onBlur：在外层用冒泡版 focus/blur（focusin/focusout）
+              捕获编辑态，组件树不动 */}
+          <div
+            onFocus={() => {
+              blFocusedRef.current = true;
+            }}
+            onBlur={() => {
+              blFocusedRef.current = false;
+              commitBl();
+            }}
+          >
+            <TextArea
+              rows={3}
+              value={blText}
+              onChange={setBlDraft}
+              placeholder={'wechat\nqq\ntelegram'}
+            />
+          </div>
         </Field>
       )}
     </Section>
