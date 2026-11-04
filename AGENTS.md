@@ -70,7 +70,8 @@ memimport 可离线把文档喂进真实 mem.json（不启动应用）。
    前端 `listen('sn-xxx', …)`。纯字符串、编译期不查拼写，脚本对账。
 3. **命令名**：前端 `invoke('xxx')` ↔ `lib.rs` 的 `generate_handler![...]`
    列表。新增命令：写 `#[tauri::command]` → 注册进列表 → `api.ts` 加类型化
-  封装 → mock 补 case。
+  封装 → mock 补 case（脚本的第四类检查会拦住漏补的：前端 invoke 但
+  `mock-tauri.ts` 无同名 case 直接报错）。
 
 ## 危险区（改动前停一秒）
 

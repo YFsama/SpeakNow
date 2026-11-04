@@ -138,6 +138,7 @@ const mockConfig = {
     accent: 'sky',
     downloadMirror: '',
     autoDownloadUpdate: true,
+    localOnly: false,
   },
   mem: {
     enabled: true,
@@ -546,6 +547,10 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
         case 'start_recording':
         case 'stop_recording':
         case 'cancel_review':
+        case 'set_mic_volume':
+        case 'translate_replace':
+        case 'ocr_paste':
+        case 'confirm_edit':
           resolve('ok');
           return;
         case 'list_devices':
@@ -556,6 +561,20 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
           return;
         case 'get_history':
           resolve(mockHistory);
+          return;
+        case 'delete_history_batch': {
+          // 真实后端按 ts 批删并返回删除数；mock 同步裁剪 mockHistory 让批量删除可走查
+          const { ts } = args as { ts: number[] };
+          const set = new Set<number>(ts ?? []);
+          const before = mockHistory.length;
+          for (let i = mockHistory.length - 1; i >= 0; i--) {
+            if (set.has(mockHistory[i].ts)) mockHistory.splice(i, 1);
+          }
+          resolve(before - mockHistory.length);
+          return;
+        }
+        case 'retry_last':
+          resolve('（mock 重试结果）');
           return;
         case 'get_stats': {
           // 从 mock 历史推算（与后端播种口径一致），days 覆盖近 7 天
@@ -939,6 +958,32 @@ function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknow
               copyFailed: false,
             });
           }, 600);
+          resolve('ok');
+          return;
+        }
+        case 'translate_announce':
+        case 'translate_retarget': {
+          // OCR 卡片「翻译」与语言条换语言重译：广播 start→result 事件供悬浮窗卡片走查；
+          // retarget 模拟目标语言即时切换生效
+          const gen = ++mockTranslateGen;
+          const target =
+            cmd === 'translate_retarget' ? String(args?.target ?? 'en') : mockConfig.llm.translateTarget;
+          emit('sn-translate-start', {
+            gen,
+            text: String(args?.text ?? ''),
+            target,
+            second: mockConfig.llm.translateSecondTarget,
+          });
+          setTimeout(() => {
+            emit('sn-translate-result', {
+              gen,
+              final: '（mock 译文）',
+              ms: 500,
+              firstMs: 160,
+              autoCopied: false,
+              copyFailed: false,
+            });
+          }, 500);
           resolve('ok');
           return;
         }

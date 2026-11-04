@@ -92,9 +92,11 @@ fn llm_ready(cfg: &Config) -> Result<(), String> {
     }
 }
 
-/// 翻译引擎就绪检查：本地引擎查模型/运行时文件，云端查 LLM 配置
+/// 翻译引擎就绪检查：本地引擎查模型/运行时文件，云端查 LLM 配置。
+/// 生效引擎与 session() 的 engine_local 同口径：local_only 时一律本地
+///（macOS 无本地引擎会在此报错引导，不回落云端——回落即数据出网）
 pub(crate) fn engine_ready(app: &AppHandle, cfg: &Config) -> Result<(), String> {
-    if cfg.translate.engine == "local" {
+    if effective_engine_local(cfg) {
         let id = crate::local_llm::resolve(&cfg.translate.local_model).id;
         if !crate::local_llm::model_files_ok(app, id) {
             Err("本地翻译模型未下载：请在「翻译」页的「本地翻译引擎」下载（或切回云端引擎）".into())
@@ -104,6 +106,14 @@ pub(crate) fn engine_ready(app: &AppHandle, cfg: &Config) -> Result<(), String> 
     } else {
         llm_ready(cfg)
     }
+}
+
+/// 生效引擎是否本地（llama.cpp sidecar，离线）。除用户显式选 local 外，
+/// 本地优先模式（general.local_only）也强制本地——云端翻译会把划词文本
+/// 发给 AI 接口，与「数据不出本机」的开关承诺冲突。macOS 无本地引擎，
+/// 仅「用户选 local」保留回落云端的旧兜底（local_only 下宁可报错也不出网）
+fn effective_engine_local(cfg: &Config) -> bool {
+    cfg.general.local_only || (cfg.translate.engine == "local" && !cfg!(target_os = "macos"))
 }
 
 /// 黑名单命中：前台窗口标题或进程名包含任一关键字（大小写不敏感）
@@ -284,11 +294,12 @@ async fn session(
         crate::pipeline::cancel_hide();
         guard_overlay_hide();
     }
-    // 引擎选择：本地（llama.cpp sidecar，离线）或云端（用户配置的 OpenAI 兼容接口）
+    // 引擎选择：本地（llama.cpp sidecar，离线）或云端（用户配置的 OpenAI 兼容接口）。
+    // 口径收口在 effective_engine_local：local_only 隐私开关同样强制本地；
     // macOS 无本地引擎（llama.cpp sidecar 仅 Windows）：旧配置/迁移配置里的
     // local 档在 mac 上回落云端，避免每次翻译都报「引擎启动失败」。设置页
     // 「翻译」Tab 打开时前端也会持久化回落并提示一次，这里是未打开页的兜底
-    let engine_local = cfg.translate.engine == "local" && !cfg!(target_os = "macos");
+    let engine_local = effective_engine_local(&cfg);
     let mut llm = if engine_local {
         let h = app.clone();
         let base = tauri::async_runtime::spawn_blocking(move || crate::local_llm::ensure_server(&h))

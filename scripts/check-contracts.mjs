@@ -2,13 +2,15 @@
 /**
  * 前后端契约对账：把「靠记忆同步」变成「靠机器门禁」。
  *
- * 检查三类契约（详见 AGENTS.md「三条契约」）：
+ * 检查四类契约（前三类详见 AGENTS.md「三条契约」，第 4 类为本脚本扩展）：
  *   1. 事件：前端 listen 的 sn-* 事件，Rust 侧必须真的有同名发射
  *      （错误级——拼错/改名漏一侧，运行期表现为功能静默失效）
  *   2. 命令：前端 invoke 的命令名，必须出现在 lib.rs generate_handler! 列表
  *      （错误级——未注册的命令 invoke 会直接 reject）
  *   3. 反向：Rust 注册但前端从未 invoke 的命令、发射但前端从未 listen 的事件
  *      （警告级——可能是预留或遗漏，人工判断）
+ *   4. mock 覆盖：前端 invoke 的命令，浏览器 mock 层（src/dev/mock-tauri.ts）
+ *      必须有同名 case（错误级——缺失时 ?mock=1 迭代下该命令静默 resolve(null)，功能不可走查）
  *
  * 用法：node scripts/check-contracts.mjs   （CI 与 npm run contracts 同款）
  */
@@ -77,6 +79,11 @@ const feCommands = new Set(
   ),
 );
 
+// mock 层已实现的命令（case 'xxx':）。switch 以外同名 case 理论上会放宽集合，
+// 但方向是「只漏报不误报」，与事件超集同策略
+const mockText = read(join(ROOT, 'src/dev/mock-tauri.ts'));
+const mockCases = new Set([...mockText.matchAll(/case\s+'([a-z0-9_]+)'/g)].map((m) => m[1]));
+
 /* ---------- 3. 对账 ---------- */
 
 const errors = [];
@@ -91,6 +98,9 @@ for (const cmd of [...feCommands].sort()) {
   if (!rustCommands.has(cmd)) {
     errors.push(`命令 ${cmd}：前端在 invoke，但未注册进 generate_handler!（运行期必 reject）`);
   }
+  if (!mockCases.has(cmd)) {
+    errors.push(`命令 ${cmd}：前端在 invoke，但 mock 层无同名 case（?mock=1 迭代下静默失效）`);
+  }
 }
 for (const cmd of [...rustCommands].sort()) {
   if (!feCommands.has(cmd)) {
@@ -103,7 +113,9 @@ for (const ev of [...rustEvents].sort()) {
   }
 }
 
-console.log(`契约对账：事件 Rust ${rustEvents.size} / 前端 ${feEvents.size}，命令 Rust ${rustCommands.size} / 前端 ${feCommands.size}`);
+console.log(
+  `契约对账：事件 Rust ${rustEvents.size} / 前端 ${feEvents.size}，命令 Rust ${rustCommands.size} / 前端 ${feCommands.size}，mock 覆盖 ${[...feCommands].filter((c) => mockCases.has(c)).length}/${feCommands.size}`,
+);
 for (const w of warnings) console.log(`::warning::${w}`);
 if (errors.length) {
   for (const e of errors) console.error(`::error::${e}`);

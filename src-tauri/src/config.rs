@@ -429,12 +429,26 @@ impl Default for TypistConfig {
 impl Config {
     /// ASR 配置展开凭据组后的快照（识别链路入口使用）
     pub fn resolved_asr(&self) -> AsrConfig {
-        self.asr.resolved(&self.providers)
+        let mut c = self.asr.resolved(&self.providers);
+        // 本地优先模式：强制走内置本地识别（asr::transcribe 的 local 分派
+        // 自带「未下载模型」的报错引导）。只改链路快照——设置页仍展示
+        // 用户配置的原始 provider，关掉开关即恢复，不破坏配置本身
+        if self.general.local_only {
+            c.provider = "local".into();
+        }
+        c
     }
 
     /// LLM 配置展开凭据组后的快照（优化/翻译链路入口使用）
     pub fn resolved_llm(&self) -> LlmConfig {
-        self.llm.resolved(&self.providers)
+        let mut c = self.llm.resolved(&self.providers);
+        // 本地优先模式：LLM 指向云端（非本机自建服务）时直接停用——
+        // pipeline 对 enabled=false 会跳过优化直接输出 ASR 原文；
+        // Ollama / llama-server 等 loopback 端点数据不出本机，保持可用
+        if self.general.local_only && !crate::http::is_local_base(&c.base_url) {
+            c.enabled = false;
+        }
+        c
     }
 }
 
@@ -530,6 +544,12 @@ pub struct GeneralConfig {
     /// 受 auto_check_update 总开关约束
     #[serde(default = "default_true")]
     pub auto_download_update: bool,
+    /// 本地优先模式（隐私开关，对标 Spokenly Local Only）：强制使用本地
+    /// 识别/优化/翻译引擎，语音与文字数据绝不出本机——云端 ASR 一律改走
+    /// 内置本地模型、云端 LLM 停用（本机自建 Ollama 等端点不受影响）、
+    /// 翻译强制本地引擎。只影响链路快照（resolved_*），不回写用户配置
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 fn default_accent() -> String {
@@ -614,6 +634,7 @@ impl Default for GeneralConfig {
             accent: default_accent(),
             download_mirror: String::new(),
             auto_download_update: true,
+            local_only: false,
         }
     }
 }
@@ -907,5 +928,52 @@ mod tests {
         assert_eq!(lang_name_zh("es"), "西班牙语");
         assert_eq!(lang_name_zh("zh"), "中文");
         assert_eq!(lang_name_zh("xx"), "xx");
+    }
+
+    /* ---- 本地优先模式（local_only）---- */
+
+    #[test]
+    fn local_only_forces_local_asr_and_disables_cloud_llm() {
+        let mut cfg = Config::default();
+        cfg.asr.provider = "http".into();
+        cfg.llm.enabled = true;
+        cfg.llm.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
+        cfg.general.local_only = true;
+        // ASR 快照强制本地；LLM 云端端点停用（pipeline 据此跳过优化）
+        assert_eq!(cfg.resolved_asr().provider, "local");
+        assert!(!cfg.resolved_llm().enabled);
+        // 只改快照不动原始配置：关掉开关立即恢复
+        assert_eq!(cfg.asr.provider, "http");
+        assert!(cfg.llm.enabled);
+        cfg.general.local_only = false;
+        assert_eq!(cfg.resolved_asr().provider, "http");
+        assert!(cfg.resolved_llm().enabled);
+    }
+
+    #[test]
+    fn local_only_keeps_loopback_llm_enabled() {
+        let mut cfg = Config::default();
+        cfg.llm.base_url = "http://127.0.0.1:11434/v1".into();
+        cfg.general.local_only = true;
+        // 本机自建端点（Ollama 等）数据不出本机，保持可用
+        let llm = cfg.resolved_llm();
+        assert!(llm.enabled);
+        assert_eq!(llm.base_url, "http://127.0.0.1:11434/v1");
+        // localhost 形态同理；仿冒域名不得放行
+        cfg.llm.base_url = "http://localhost:1234".into();
+        assert!(cfg.resolved_llm().enabled);
+        cfg.llm.base_url = "https://localhost.evil.com/api".into();
+        assert!(!cfg.resolved_llm().enabled);
+    }
+
+    #[test]
+    fn local_only_off_keeps_existing_resolution() {
+        // 开关关闭（含旧配置缺省 false）：resolve 行为与改动前完全一致
+        let mut cfg = Config::default();
+        cfg.asr.provider = "http".into();
+        cfg.llm.enabled = true;
+        cfg.llm.base_url = "https://api.deepseek.com".into();
+        assert_eq!(cfg.resolved_asr().provider, "http");
+        assert!(cfg.resolved_llm().enabled);
     }
 }

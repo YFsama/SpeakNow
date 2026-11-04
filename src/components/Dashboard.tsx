@@ -149,7 +149,6 @@ export default function Dashboard({
   const [usage, setUsage] = useState<UsageStats | null>(null);
   useEffect(() => {
     let alive = true;
-    let un: (() => void) | undefined;
     const pull = () => {
       getStats()
         .then((s) => {
@@ -160,12 +159,12 @@ export default function Dashboard({
         });
     };
     pull();
-    void listen('sn-history-changed', pull).then((f) => {
-      un = f;
-    });
+    // 清理走「持有 Promise 再 then 注销」：卸载早于 listen resolve 时，
+    // un 变量式写法会漏掉注销（StrictMode 必现的监听器泄漏）
+    const un = listen('sn-history-changed', pull);
     return () => {
       alive = false;
-      un?.();
+      un.then((f) => f());
     };
   }, []);
 
@@ -174,7 +173,6 @@ export default function Dashboard({
   const [mem, setMem] = useState<MemListResult | null>(null);
   useEffect(() => {
     let alive = true;
-    let un: (() => void) | undefined;
     const pull = () => {
       memList('', null, 1)
         .then((r) => {
@@ -185,12 +183,11 @@ export default function Dashboard({
         });
     };
     pull();
-    void listen('sn-mem-changed', pull).then((f) => {
-      un = f;
-    });
+    // 同上：清理必须经 Promise 注销，防卸载早于 resolve 的泄漏
+    const un = listen('sn-mem-changed', pull);
     return () => {
       alive = false;
-      un?.();
+      un.then((f) => f());
     };
   }, []);
 
@@ -842,6 +839,12 @@ export default function Dashboard({
       <section className="rounded-[20px] border border-[var(--sn-border)] bg-[var(--sn-surface)] p-5">
         <h2 className="mb-3 text-[15px] font-semibold text-slate-100">⚡ 快速开关</h2>
         <div className="space-y-2">
+          <Toggle
+            checked={cfg.general.localOnly === true}
+            onChange={(localOnly) => set('general', { localOnly })}
+            label="本地优先模式"
+            desc="开启后强制使用本地识别、优化与翻译引擎，语音与文字数据不出本机。云端引擎与 API 将被暂时停用，需要已下载的本地模型"
+          />
           <Toggle
             checked={cfg.llm.enabled}
             onChange={(enabled) => set('llm', { enabled })}

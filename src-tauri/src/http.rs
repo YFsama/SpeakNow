@@ -27,12 +27,59 @@ pub static CLIENT_BLOCKING: LazyLock<reqwest::blocking::Client> =
     });
 
 /// 是否本机自建服务（whisper.cpp server / Ollama / LM Studio / llama.cpp，
-/// 无需 API Key）。ASR 的「是否可本地回退」与 LLM 的「空 Key 是否跳过」
-/// 共用同一口径，避免两处判定漂移
+/// 无需 API Key）。ASR 的「是否可本地回退」、LLM 的「空 Key 是否跳过」与
+/// 本地优先模式（local_only）的「LLM 是否出网」共用同一口径，避免判定漂移
 pub fn is_local_base(base: &str) -> bool {
-    let b = base.trim().to_lowercase();
-    b.contains("localhost")
-        || b.contains("127.0.0.1")
-        || b.contains("0.0.0.0")
-        || b.contains("[::1]")
+    let raw = base.trim().trim_end_matches('/');
+    // 解析 URL 后对主机名精确匹配：旧的子串包含会把
+    // "https://localhost.evil.com"、"https://user@127.0.0.1.evil.com"
+    // 误判本机——local_only 据此放行 LLM 的话就是隐私破口。
+    // 缺 scheme 的手填地址（"127.0.0.1:11434"、"localhost:8080"，后者
+    // localhost 会被当成 scheme 而解析出空 host）补 http:// 再解析，
+    // 保持旧实现的宽容；仍解析不出的一律按非本机——方向安全：至多
+    // 多要求一次 Key / local_only 下多停一个端点，不会把数据放出网
+    let host = reqwest::Url::parse(raw)
+        .ok()
+        .filter(|u| u.host_str().is_some())
+        .or_else(|| reqwest::Url::parse(&format!("http://{raw}")).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+    matches!(
+        host.as_deref(),
+        // "::1" 与 "[::1]"：url crate 对 IPv6 host_str 保留方括号
+        Some("localhost")
+            | Some("127.0.0.1")
+            | Some("0.0.0.0")
+            | Some("::1")
+            | Some("[::1]")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_base;
+
+    #[test]
+    fn local_hosts_match_exactly() {
+        // 旧用例口径：四种本机写法 + 缺 scheme 的手填地址都识别
+        assert!(is_local_base("http://127.0.0.1:11434/v1"));
+        assert!(is_local_base("http://localhost:8080"));
+        assert!(is_local_base("http://[::1]:8080/v1"));
+        assert!(is_local_base("http://0.0.0.0:9000"));
+        assert!(is_local_base("  https://LocalHost:443/api  "));
+        assert!(is_local_base("127.0.0.1:11434"));
+        assert!(is_local_base("localhost:8080/v1"));
+    }
+
+    #[test]
+    fn lookalike_and_public_hosts_rejected() {
+        // 子串命中但主机不同：不得放行（local_only 隐私判定共用此口径）
+        assert!(!is_local_base("https://localhost.evil.com/api"));
+        assert!(!is_local_base("http://127.0.0.1.evil.com/v1"));
+        assert!(!is_local_base("http://[::1].evil.com"));
+        assert!(!is_local_base("https://user@127.0.0.1.evil.com/v1"));
+        assert!(!is_local_base("https://open.bigmodel.cn/api/paas/v4"));
+        assert!(!is_local_base("https://api.deepseek.com"));
+        assert!(!is_local_base(""));
+        assert!(!is_local_base("not a url"));
+    }
 }

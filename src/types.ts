@@ -222,6 +222,10 @@ export interface GeneralConfig {
   downloadMirror?: string;
   /** 发现新版本后后台静默预下载（受 autoCheckUpdate 约束；就绪后提示安装） */
   autoDownloadUpdate?: boolean;
+  /** 本地优先模式（隐私开关）：强制本地识别/优化/翻译引擎，语音与文字数据
+   *  不出本机——云端 ASR 与 LLM 暂停（本机自建 Ollama 等端点不受影响），
+   *  翻译强制本地引擎；需要已下载的本地模型 */
+  localOnly?: boolean;
 }
 
 /** 外接显示（硬件字幕屏）API */
