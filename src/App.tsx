@@ -503,6 +503,12 @@ export default function App() {
         })
         .catch(() => {});
     });
+    // 词典自动学习：同一改法修正满 2 次，后端已把新词写进术语表（顺带广播
+    // 过 sn-config-changed，本窗 glossary 已刷新）；误学的词可到「AI 优化」
+    // 页术语表删除
+    const un9 = listen<{ word: string }>('sn-dict-learned', (e) => {
+      setToast(`已根据你的修正学习新词「${e.payload.word}」，已加入 AI 优化页术语表`, 'info');
+    });
     return () => {
       if (idleTimer) clearTimeout(idleTimer);
       un1.then((f) => f());
@@ -513,6 +519,7 @@ export default function App() {
       un6.then((f) => f());
       un7.then((f) => f());
       un8.then((f) => f());
+      un9.then((f) => f());
     };
     // reloadKey：错误卡「重试」递增后重启整套挂载初始化
   }, [reloadKey]);
