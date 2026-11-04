@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::asr::truncate;
-use crate::local_whisper::LocalModelStatus;
+use crate::local_whisper::{LocalModelStatus, ResetOnDrop};
 use crate::wav;
 
 pub const MODEL_ID: &str = "qwen3-asr-1.7b";
@@ -95,6 +95,10 @@ pub async fn download(app: &AppHandle) -> Result<()> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         bail!("已有模型下载任务进行中");
     }
+    // Drop 守卫复位（local_whisper 同款）：下载线程 panic 等任意退出路径
+    // 都要复位标志——旧写法只在正常错误路径手动 store(false)，panic 一次
+    // 标志就永久卡 true，用户被「已有模型下载任务进行中」卡死直到重启
+    let _reset = ResetOnDrop(&DOWNLOADING);
     let emit_app = app.clone();
     let progress = move |file: &str, dl: u64, total: u64| {
         let _ = emit_app.emit(
@@ -103,7 +107,6 @@ pub async fn download(app: &AppHandle) -> Result<()> {
         );
     };
     let res = download_inner(app, &progress).await;
-    DOWNLOADING.store(false, Ordering::SeqCst);
     crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     res

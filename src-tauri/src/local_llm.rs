@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::asr::truncate;
-use crate::local_whisper::LocalModelStatus;
+use crate::local_whisper::{LocalModelStatus, ResetOnDrop};
 
 /// 本地翻译模型目录。首选 Index-Translate（B 站开源翻译专项模型，Qwen3.5 底座，
 /// 150 语种、原生支持只译值的结构化任务，提示词走 llm.rs 的官方原生配方）；
@@ -125,8 +125,11 @@ pub async fn download(app: &AppHandle, id: &str) -> Result<()> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         bail!("已有模型下载任务进行中");
     }
+    // Drop 守卫复位（local_whisper 同款）：下载线程 panic 等任意退出路径
+    // 都要复位标志——旧写法只在正常错误路径手动 store(false)，panic 一次
+    // 标志就永久卡 true，用户被「已有模型下载任务进行中」卡死直到重启
+    let _reset = ResetOnDrop(&DOWNLOADING);
     let res = download_inner(app, id).await;
-    DOWNLOADING.store(false, Ordering::SeqCst);
     crate::bump_models_gen();
     let _ = app.emit("sn-models-changed", ());
     res

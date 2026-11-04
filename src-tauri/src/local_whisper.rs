@@ -84,11 +84,13 @@ pub const LOCAL_MODELS: &[LocalModelDef] = &[
     },
 ];
 
+/// 按 id 查内置 Whisper 模型定义（delete_builtin 删目录前据此先 evict 缓存）
+pub fn find(id: &str) -> Option<&'static LocalModelDef> {
+    LOCAL_MODELS.iter().find(|d| d.id == id)
+}
+
 fn def(id: &str) -> Result<&'static LocalModelDef> {
-    LOCAL_MODELS
-        .iter()
-        .find(|d| d.id == id)
-        .ok_or_else(|| anyhow!("未知本地模型: {id}"))
+    find(id).ok_or_else(|| anyhow!("未知本地模型: {id}"))
 }
 
 pub fn models_root(app: &AppHandle) -> Result<PathBuf> {
@@ -152,18 +154,25 @@ fn status_in(root: Option<&Path2>) -> Vec<LocalModelStatus> {
 
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
+/// 下载互斥标志的 Drop 守卫：创建后无论正常返回、提前出错还是 panic
+/// unwinding，离开作用域都会复位标志。只在成功/正常错误路径手动
+/// store(false) 的旧写法一旦下载线程 panic，标志永久卡 true，此后每次
+/// 下载都报「已有模型下载任务进行中」直到重启。三个本地引擎的下载
+/// 入口（whisper/qwen_asr/local_llm）共用
+pub(crate) struct ResetOnDrop<'a>(pub(crate) &'a AtomicBool);
+
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub async fn download(app: &AppHandle, id: &str, mirror: &str) -> Result<()> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         bail!("已有模型下载任务进行中");
     }
     // Drop 守卫复位：models_root 等提前出错（或下载中 panic）也不能让标志
     // 卡在 true——否则此后每次下载都报「已有任务进行中」直到重启
-    struct ResetOnDrop<'a>(&'a AtomicBool);
-    impl Drop for ResetOnDrop<'_> {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
     let _reset = ResetOnDrop(&DOWNLOADING);
     let root = models_root(app)?;
     let emit_app = app.clone();
@@ -342,6 +351,23 @@ fn load_cached(root: &Path2, id: &str) -> Result<Arc<Mutex<Cached>>> {
         cache.insert(id.to_string(), cached.clone());
     }
     Ok(cached)
+}
+
+/// CACHE 剔除核心：删掉 key 与 id 匹配的条目。独立成泛型纯函数是为了
+/// 可测——真实 CACHE 的值是含 candle 权重的 Arc<Mutex<Cached>>，单测里
+/// 无法构造，只能对同构的简单 map 验证剔除语义
+fn evict_matching<V>(cache: &mut HashMap<String, V>, id: &str) {
+    cache.retain(|k, _| k != id);
+}
+
+/// 剔除指定 Whisper 模型的常驻缓存。非 q80 模型经 mmap 加载，Arc 驻留
+/// CACHE 期间 Windows 把权重文件视为被占用，remove_dir_all 报「删除失败」，
+/// 且权重（最大约 1GB 提交内存）一直占着不释放——delete_builtin 删模型
+/// 目录前必须先调用。正在识别中的会话仍持 Arc 副本，其映射随会话结束
+/// 自然释放（删模型时通常无会话在跑，不影响删除结果）
+pub fn evict(id: &str) {
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    evict_matching(&mut cache, id);
 }
 
 /* ---------- 解码器（移植自 candle 示例，简化：不带时间戳模式） ---------- */
@@ -685,6 +711,43 @@ pub fn transcribe_in(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// evict 剔除语义：只删 id 匹配的条目，其余原样保留（已加载 id 的
+    /// 场景因 CACHE 值含真实权重无法构造，改在同构 map 上验证逻辑本体）
+    #[test]
+    fn evict_drops_only_matching_id() {
+        let mut m: HashMap<String, u32> =
+            HashMap::from([("base".into(), 1), ("small".into(), 2)]);
+        evict_matching(&mut m, "base");
+        assert!(!m.contains_key("base"), "已加载的 id 应被剔除");
+        assert_eq!(m.len(), 1, "无关模型须原样保留");
+    }
+
+    /// evict 未加载的 id：CACHE 空转不得 panic（delete_builtin 对未加载
+    /// 模型也会调用）
+    #[test]
+    fn evict_missing_id_is_noop() {
+        evict("no-such-model");
+        let cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(cache.get("no-such-model").is_none());
+    }
+
+    /// ResetOnDrop 必须覆盖 panic 路径：unwinding 也走 Drop，标志不得卡
+    /// true——这正是 qwen_asr / local_llm 此前缺守卫会踩的坑
+    #[test]
+    fn reset_on_drop_covers_panic() {
+        use std::panic;
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(|_| {})); // 静音预期 panic 的输出噪音
+        let flag = AtomicBool::new(true);
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _g = ResetOnDrop(&flag);
+            panic!("模拟下载线程崩溃");
+        }));
+        panic::set_hook(prev);
+        assert!(r.is_err(), "守卫作用域内应已 panic");
+        assert!(!flag.load(Ordering::SeqCst), "unwinding 后标志必须已复位");
+    }
 
     /// 端到端：下载 tiny 量化模型 + JFK 样本，真实推理
     /// 运行：cargo test --lib local_whisper -- --ignored --nocapture

@@ -8,6 +8,7 @@ mod history;
 mod hotkey;
 mod http;
 mod inject;
+mod learn;
 mod llm;
 pub mod local_whisper;
 mod local_llm;
@@ -820,6 +821,11 @@ async fn delete_builtin(app: AppHandle, id: String) -> Result<(), String> {
         if id == ocr::PPOCR_ID {
             ocr::ppocr_unload();
         }
+        // Whisper 权重经 mmap 加载后 Arc 驻留 CACHE，Windows 视文件为被
+        // 占用，不先剔除缓存条目释放映射，remove_dir_all 必报「删除失败」
+        if local_whisper::find(&id).is_some() {
+            local_whisper::evict(&id);
+        }
         let root = local_whisper::models_root(&app).map_err(|e| e.to_string())?;
         let dir = root.join(&id);
         if dir.exists() {
@@ -1057,6 +1063,9 @@ async fn confirm_edit(app: AppHandle, text: String) -> Result<(), String> {
     // 记忆库采集：审阅模式的终稿只在确认时落历史，此处一并入库（编辑后的文本
     // 才是用户认可的产出；取消审阅则不会走到这里，不采集）
     mem::capture(&app, "dictation", &inject::foreground_process_name(), &text);
+    // 词典自动学习：同一改法累计两次即沉淀进术语表（learn 内部自过滤并转
+    // 后台线程落盘/广播，不阻塞本次输入确认）
+    learn::learn(&app, &pending.final_text, &text);
     events::emit(
         &app,
         "sn-result",
